@@ -14,7 +14,7 @@ if(MSVC)
 
 endif()
 
-add_definitions("-DV8_ENABLE_WEBASSEMBLY -DV8_ADVANCED_BIGINT_ALGORITHMS -DV8_ENABLE_WASM_SIMD256_REVEC")
+add_definitions("-DV8_ADVANCED_BIGINT_ALGORITHMS")
 if(WIN32)
   add_definitions("-DNOMINMAX -DV8_ENABLE_SYSTEM_INSTRUMENTATION")
   # todo: for zlib, need to extract zlib when refactor
@@ -61,7 +61,7 @@ set(is-msvc $<CXX_COMPILER_ID:MSVC>)
 # FIXME obviously
 set(is-arm 0)
 set(is-arm64 0)
-if (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "arm64" OR CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64")
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64.*|AARCH64.*|arm64.*|ARM64.*)")
   set(is-arm64 1)
 endif ()
 set(is-ia32 0)
@@ -85,6 +85,9 @@ string(CONCAT is-x64 $<OR:
 
 option(V8_ENABLE_CONCURRENT_MARKING "Enable concurrent marking" ON)
 option(V8_ENABLE_I18N "Enable Internationalization support")
+option(V8_ENABLE_TEMPORAL "Enable Temporal API support" OFF)
+option(V8_ENABLE_SPARKPLUG "Enable Sparkplug baseline JIT" ON)
+option(V8_ENABLE_WEBASSEMBLY "Enable WebAssembly support" OFF)
 
 set(
   v8_defines
@@ -102,6 +105,14 @@ set(
   $<$<AND:${is-win},${is-x64}>:V8_OS_WIN_X64>
   $<$<BOOL:${V8_ENABLE_CONCURRENT_MARKING}>:V8_CONCURRENT_MARKING>
   $<${is-win}:V8_OS_WIN32>
+  V8_TLS_USED_IN_LIBRARY
+  V8_ENABLE_LEAPTIERING
+  V8_ENABLE_TURBOFAN
+  V8_ENABLE_MAGLEV
+  V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  $<$<BOOL:${V8_ENABLE_WEBASSEMBLY}>:V8_ENABLE_WEBASSEMBLY>
+  $<$<BOOL:${V8_ENABLE_WEBASSEMBLY}>:V8_ENABLE_WASM_SIMD256_REVEC>
+  $<$<BOOL:${V8_ENABLE_SPARKPLUG}>:V8_ENABLE_SPARKPLUG>
 )
 
 set(disable-exceptions
@@ -124,85 +135,11 @@ set(enable-fpic
   $<$<CXX_COMPILER_ID:GNU>:-fPIC>
 )
 
-#
-# d8
-#
 
-add_executable(
-  d8
-  $<${is-posix}:v8/src/d8/d8-posix.cc>
-  $<${is-win}:v8/src/d8/d8-windows.cc>
-  v8/src/d8/async-hooks-wrapper.cc
-  v8/src/d8/d8-console.cc
-  v8/src/d8/d8-js.cc
-  v8/src/d8/d8-test.cc
-  v8/src/d8/d8-platforms.cc
-  v8/src/d8/d8.cc
+set(disable-offset-return-warnings
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-invalid-offsetof>
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-return-type>
 )
-
-target_compile_definitions(d8 PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(d8 PRIVATE ${disable-exceptions})
-if(enable-fPIC)
-  target_compile_options(d8 PRIVATE ${enable-fpic})
-endif()
-
-target_include_directories(d8
-  PUBLIC
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-  PRIVATE
-    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8>
-)
-
-target_link_libraries(d8
-  PRIVATE
-    v8_base_without_compiler
-    v8_compiler
-    v8_snapshot
-    v8_inspector
-    v8_libplatform
-)
-
-# add shell and hello-world
-add_executable(
-        shell
-        v8/samples/shell.cc
-)
-target_include_directories(shell
-        PUBLIC
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8>
-        )
-target_link_libraries(shell
-        PRIVATE
-        v8_base_without_compiler
-        v8_compiler
-        v8_snapshot
-        v8_inspector
-        v8_libplatform
-        )
-
-add_executable(
-        hello-world
-        v8/samples/hello-world.cc
-)
-target_include_directories(hello-world
-        PUBLIC
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE
-        $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8>
-        )
-target_link_libraries(hello-world
-        PRIVATE
-        v8_base_without_compiler
-        v8_compiler
-        v8_snapshot
-        v8_inspector
-        v8_libplatform
-        )
 
 # more granular library support
 add_library(v8-i18n-support OBJECT)
@@ -241,15 +178,36 @@ target_include_directories(v8-i18n-support
 )
 
 file(GLOB api-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/api/*.cc)
-file(GLOB asmjs-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/asmjs/*.cc)
+if(V8_ENABLE_WEBASSEMBLY)
+  file(GLOB asmjs-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/asmjs/*.cc)
+else()
+  set(asmjs-sources)
+endif()
 file(GLOB ast-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/ast/*.cc)
 file(GLOB builtin-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/builtins/*.cc)
+# The builtins "-gen" files are pulled explicitly into v8_initializers. Ensure
+# they are not also compiled into v8_base_without_compiler.
+list(REMOVE_ITEM builtin-sources
+  v8/src/builtins/builtins-intl-gen.cc
+  v8/src/builtins/builtins-intl.cc
+)
+# Exclude WASM builtins from the generic builtins list. These are added
+# conditionally to v8_initializers based on V8_ENABLE_WEBASSEMBLY.
+list(REMOVE_ITEM builtin-sources v8/src/builtins/builtins-wasm-gen.cc)
 file(GLOB baseline-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/baseline/*.cc)
+if(NOT V8_ENABLE_SPARKPLUG)
+  # Exclude Sparkplug baseline sources when disabled
+  set(baseline-sources)
+endif()
 file(GLOB bigint-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/bigint/*.cc)
 file(GLOB codegen-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/codegen/*.cc)
 file(GLOB debug-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/debug/*.cc)
 file(GLOB deoptimizer-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/deoptimizer/*.cc)
 file(GLOB diagnostic-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/diagnostics/*.cc)
+if(NOT WIN32)
+  # Exclude any Windows-only diagnostics sources on non-Windows
+  list(FILTER diagnostic-sources EXCLUDE REGEX ".*-win.*[.]cc$")
+endif()
 file(GLOB execution-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/execution/*.cc)
 file(GLOB extensions-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/extensions/*.cc)
 file(GLOB handles-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/handles/*.cc)
@@ -262,11 +220,24 @@ file(GLOB parsing-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/sr
 file(GLOB profiler-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/profiler/*.cc)
 file(GLOB regexp-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/regexp/*.cc v8/src/regexp/experimental/*.cc)
 file(GLOB runtime-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/runtime/*.cc)
+if(NOT V8_ENABLE_WEBASSEMBLY)
+  # Drop WASM-specific runtime and debug units when WebAssembly is disabled.
+  list(FILTER runtime-sources EXCLUDE REGEX ".*/runtime-wasm[.]cc$")
+  list(FILTER runtime-sources EXCLUDE REGEX ".*/runtime-test-wasm[.]cc$")
+  list(FILTER debug-sources EXCLUDE REGEX ".*/debug-wasm-objects[.]cc$")
+endif()
 file(GLOB snapshot-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/snapshot/*.cc)
 file(GLOB strings-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/strings/*.cc)
+file(GLOB sandbox-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/sandbox/*.cc)
+file(GLOB maglev-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/maglev/*.cc)
 file(GLOB utils-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/utils/*.cc)
-file(GLOB wasm-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/wasm/*.cc)
-file(GLOB wasm-baseline-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/wasm/baseline/*.cc)
+if(V8_ENABLE_WEBASSEMBLY)
+  file(GLOB wasm-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/wasm/*.cc)
+  file(GLOB wasm-baseline-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/wasm/baseline/*.cc)
+else()
+  set(wasm-sources)
+  set(wasm-baseline-sources)
+endif()
 file(GLOB zone-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/src/zone/*.cc)
 file(GLOB zlib-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS v8/third_party/zlib/*.c v8/third_party/zlib/google/compression_utils_portable.cc)
 
@@ -308,13 +279,26 @@ list(REMOVE_ITEM builtin-sources
   v8/src/builtins/builtins-intl-gen.cc
   v8/src/builtins/builtins-intl.cc
 )
+if(NOT V8_ENABLE_TEMPORAL)
+  list(REMOVE_ITEM builtin-sources
+    v8/src/builtins/builtins-temporal.cc
+    v8/src/builtins/builtins-temporal-gen.cc
+  )
+endif()
 
 if (NOT WIN32)
   list(REMOVE_ITEM diagnostic-sources v8/src/diagnostics/unwinding-info-win64.cc)
 endif()
 list(REMOVE_ITEM diagnostic-sources v8/src/diagnostics/etw-jit-win.cc)
+list(REMOVE_ITEM diagnostic-sources v8/src/diagnostics/etw-debug-win.cc)
 
 list(REMOVE_ITEM object-sources ${i18n-sources})
+if (NOT V8_ENABLE_TEMPORAL)
+  list(REMOVE_ITEM object-sources
+    v8/src/objects/js-temporal-objects.cc
+    v8/src/objects/js-temporal-zoneinfo64.cc
+  )
+endif()
 list(REMOVE_ITEM regexp-sources v8/src/regexp/gen-regexp-special-case.cc)
 list(REMOVE_ITEM runtime-sources v8/src/runtime/runtime-intl.cc)
 list(REMOVE_ITEM snapshot-sources
@@ -408,8 +392,8 @@ add_library(v8_base_without_compiler STATIC
   v8/src/ic/stub-cache.cc
   v8/src/init/bootstrapper.cc
   v8/src/init/icu_util.cc
-  v8/src/init/isolate-allocator.cc
   v8/src/init/startup-data-util.cc
+  v8/src/init/isolate-group.cc
   v8/src/init/v8.cc
   ${handles-sources}
   ${interpreter-sources}
@@ -420,6 +404,20 @@ add_library(v8_base_without_compiler STATIC
   ${parsing-sources}
   ${profiler-sources}
   ${regexp-sources}
+  ${sandbox-sources}
+  ${maglev-sources}
+  $<${is-x64}:v8/src/maglev/x64/maglev-assembler-x64.cc>
+  $<${is-x64}:v8/src/maglev/x64/maglev-ir-x64.cc>
+  $<${is-arm64}:v8/src/maglev/arm64/maglev-assembler-arm64.cc>
+  $<${is-arm64}:v8/src/maglev/arm64/maglev-ir-arm64.cc>
+  $<${is-arm}:v8/src/maglev/arm/maglev-assembler-arm.cc>
+  $<${is-arm}:v8/src/maglev/arm/maglev-ir-arm.cc>
+  $<${is-ppc}:v8/src/maglev/ppc/maglev-assembler-ppc.cc>
+  $<${is-ppc}:v8/src/maglev/ppc/maglev-ir-ppc.cc>
+  $<${is-s390}:v8/src/maglev/s390/maglev-assembler-s390.cc>
+  $<${is-s390}:v8/src/maglev/s390/maglev-ir-s390.cc>
+  $<${is-mips64}:v8/src/maglev/riscv/maglev-assembler-riscv.cc>
+  $<${is-mips64}:v8/src/maglev/riscv/maglev-ir-riscv.cc>
   v8/src/roots/roots.cc
   ${runtime-sources}
   v8/src/base/sanitizer/lsan-page-allocator.cc
@@ -428,14 +426,13 @@ add_library(v8_base_without_compiler STATIC
   v8/src/tasks/cancelable-task.cc
   v8/src/tasks/operations-barrier.cc
   v8/src/tasks/task-utils.cc
-  v8/src/third_party/siphash/halfsiphash.cc
+  v8/third_party/siphash/halfsiphash.cc
   v8/src/tracing/trace-event.cc
   v8/src/tracing/traced-value.cc
   v8/src/tracing/tracing-category-observer.cc
   v8/src/trap-handler/handler-inside.cc
   v8/src/trap-handler/handler-outside.cc
   v8/src/trap-handler/handler-shared.cc
-  v8/src/temporal/temporal-parser.cc
   ${utils-sources}
   ${wasm-sources}
   ${zone-sources}
@@ -465,7 +462,7 @@ set_property(SOURCE v8/src/diagnostics/unwinding-info-win64.cc
 )
 
 target_compile_definitions(v8_base_without_compiler PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_base_without_compiler PRIVATE ${disable-exceptions})
+target_compile_options(v8_base_without_compiler PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_base_without_compiler PRIVATE ${enable-fpic})
 endif()
@@ -475,6 +472,9 @@ target_include_directories(v8_base_without_compiler
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/include>
     $<BUILD_INTERFACE:$<TARGET_PROPERTY:v8-bytecodes-builtin-list,INTERFACE_INCLUDE_DIRECTORIES>>
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
+    ${PROJECT_SOURCE_DIR}/v8/third_party/highway/src
+    ${PROJECT_SOURCE_DIR}/v8/third_party/fp16/src/include
     ${PROJECT_SOURCE_DIR}/v8/third_party/zlib
     ${PROJECT_BINARY_DIR}
 )
@@ -487,6 +487,8 @@ target_link_libraries(
     v8_torque_generated
   PUBLIC
     v8-bytecodes-builtin-list
+    v8_simdutf
+    absl::raw_hash_set
 )
 
 #
@@ -497,11 +499,29 @@ file(GLOB_RECURSE compiler-sources
   CONFIGURE_DEPENDS v8/src/compiler/*.cc
 )
 list(FILTER compiler-sources EXCLUDE REGEX ".*backend/.*/.*[.]cc$")
+# Exclude the disabled Turbofan shim when building full compiler.
+list(REMOVE_ITEM compiler-sources v8/src/compiler/turbofan-disabled.cc)
+if(NOT V8_ENABLE_WEBASSEMBLY)
+  # Drop WASM-specific compiler sources when WebAssembly is disabled.
+  # This broadly filters any compiler translation units with "wasm" in the name.
+  list(FILTER compiler-sources EXCLUDE REGEX ".*/compiler/.*wasm.*[.]cc$")
+  # Some files are WASM-only despite not containing "wasm" in their filename.
+  # - revectorizer.cc uses WASM SIMD revectorization and includes wasm headers
+  #   unconditionally.
+  list(REMOVE_ITEM compiler-sources v8/src/compiler/revectorizer.cc)
+endif()
+
+# int64-lowering is only relevant for 32-bit architectures; it includes WASM
+# headers unconditionally which breaks non-WASM builds. Do not compile it on
+# 64-bit targets.
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+  list(REMOVE_ITEM compiler-sources v8/src/compiler/int64-lowering.cc)
+endif()
 
 add_library(v8_compiler STATIC)
 target_sources(v8_compiler PRIVATE ${compiler-sources})
 target_compile_definitions(v8_compiler PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_compiler PRIVATE ${disable-exceptions})
+target_compile_options(v8_compiler PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_compiler PRIVATE ${enable-fpic})
 endif()
@@ -512,6 +532,9 @@ target_include_directories(v8_compiler
   PRIVATE
     ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
+    ${PROJECT_SOURCE_DIR}/v8/third_party/highway/src
+    ${PROJECT_SOURCE_DIR}/v8/third_party/fp16/src/include
     $<BUILD_INTERFACE:$<TARGET_PROPERTY:v8-bytecodes-builtin-list,INTERFACE_INCLUDE_DIRECTORIES>>
 )
 
@@ -539,6 +562,7 @@ add_library(
   $<${is-s390}:v8/src/builtins/s390/builtins-s390.cc>
   $<${is-x64}:v8/src/builtins/x64/builtins-x64.cc>
   $<$<BOOL:${V8_ENABLE_I18N}>:v8/src/builtins/builtins-intl-gen.cc>
+  $<$<BOOL:${V8_ENABLE_WEBASSEMBLY}>:v8/src/builtins/builtins-wasm-gen.cc>
   v8/src/builtins/builtins-array-gen.cc
   v8/src/builtins/builtins-async-function-gen.cc
   v8/src/builtins/builtins-async-gen.cc
@@ -557,7 +581,6 @@ add_library(
   v8/src/builtins/builtins-internal-gen.cc
   v8/src/builtins/builtins-interpreter-gen.cc
   v8/src/builtins/builtins-iterator-gen.cc
-  v8/src/builtins/builtins-lazy-gen.cc
   v8/src/builtins/builtins-microtask-queue-gen.cc
   v8/src/builtins/builtins-number-gen.cc
   v8/src/builtins/builtins-object-gen.cc
@@ -567,7 +590,6 @@ add_library(
   v8/src/builtins/builtins-sharedarraybuffer-gen.cc
   v8/src/builtins/builtins-string-gen.cc
   v8/src/builtins/builtins-typed-array-gen.cc
-  v8/src/builtins/builtins-wasm-gen.cc
   v8/src/builtins/growable-fixed-array-gen.cc
   v8/src/builtins/setup-builtins-internal.cc
   v8/src/codegen/code-stub-assembler.cc
@@ -582,7 +604,7 @@ add_library(
 )
 
 target_compile_definitions(v8_initializers PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_initializers PRIVATE ${disable-exceptions})
+target_compile_options(v8_initializers PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_initializers PRIVATE ${enable-fpic})
 endif()
@@ -608,8 +630,8 @@ add_library(
   v8/src/init/setup-isolate-deserialize.cc
 )
 
-target_compile_definitions(v8_snapshot PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_snapshot PRIVATE ${disable-exceptions})
+target_compile_definitions(v8_snapshot PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
+target_compile_options(v8_snapshot PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_snapshot PRIVATE ${enable-fpic})
 endif()
@@ -696,7 +718,7 @@ add_library(v8_inspector STATIC
 )
 
 target_compile_features(v8_inspector PUBLIC cxx_std_17)
-target_compile_options(v8_inspector PRIVATE ${disable-exceptions})
+target_compile_options(v8_inspector PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_inspector PRIVATE ${enable-fpic})
 endif()
@@ -769,7 +791,7 @@ target_sources(v8_libplatform
 )
 
 target_compile_definitions(v8_libplatform PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_libplatform PRIVATE ${disable-exceptions})
+target_compile_options(v8_libplatform PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_libplatform PRIVATE ${enable-fpic})
 endif()
@@ -793,10 +815,12 @@ target_include_directories(v8_libsampler
   PRIVATE
     ${PROJECT_SOURCE_DIR}/v8
     ${PROJECT_SOURCE_DIR}/v8/include
+    ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
+    ${PROJECT_SOURCE_DIR}/v8/third_party/fp16/src/include
 )
 
 target_compile_definitions(v8_libsampler PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_libsampler PRIVATE ${disable-exceptions})
+target_compile_options(v8_libsampler PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_libsampler PRIVATE ${enable-fpic})
 endif()
@@ -808,12 +832,15 @@ target_link_libraries(v8_libsampler PRIVATE v8_libbase)
 #
 
 add_library(v8_libbase STATIC
+  v8/src/base/abort-mode.cc
   v8/src/base/bits.cc
   v8/src/base/bounded-page-allocator.cc
+  v8/src/base/emulated-virtual-address-subspace.cc
   v8/src/base/cpu.cc
   v8/src/base/debug/stack_trace.cc
   v8/src/base/division-by-constant.cc
   v8/src/base/file-utils.cc
+  v8/src/base/fpu.cc
   v8/src/base/ieee754.cc
   v8/src/base/logging.cc
   v8/src/base/once.cc
@@ -847,11 +874,12 @@ set_property(SOURCE v8/src/base/utils/random-number-generator.cc
 )
 
 target_compile_definitions(v8_libbase PRIVATE $<${is-win}:UNICODE> $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_libbase PRIVATE ${disable-exceptions})
+target_compile_options(v8_libbase PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_libbase PRIVATE ${enable-fpic})
 endif()
 target_include_directories(v8_libbase PRIVATE ${PROJECT_SOURCE_DIR}/v8)
+target_include_directories(v8_libbase PRIVATE ${PROJECT_SOURCE_DIR}/v8third_party/abseil-cpp)
 target_link_libraries(v8_libbase
   PRIVATE
     Threads::Threads
@@ -859,6 +887,9 @@ target_link_libraries(v8_libbase
     $<${is-linux}:rt>
     $<${is-win}:winmm>
     $<${is-win}:dbghelp>
+  PUBLIC
+    absl::synchronization
+    absl::str_format
 )
 
 #
@@ -881,6 +912,8 @@ add_executable(
 target_include_directories(bytecode_builtins_list_generator
   PRIVATE
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/include
+    ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
 )
 
 target_link_libraries(bytecode_builtins_list_generator v8_libbase)
@@ -927,6 +960,22 @@ if(NOT V8_ENABLE_I18N)
     src/objects/js-segment-iterator.tq
     src/objects/js-segmenter.tq
     src/objects/js-segments.tq
+  )
+endif()
+if(NOT V8_ENABLE_TEMPORAL)
+  list(REMOVE_ITEM torque_files
+    src/objects/js-temporal-objects.tq
+  )
+endif()
+if(NOT V8_ENABLE_WEBASSEMBLY)
+  list(REMOVE_ITEM torque_files
+    src/wasm/wasm-objects.tq
+    src/debug/debug-wasm-objects.tq
+    src/builtins/js-to-js.tq
+    src/builtins/js-to-wasm.tq
+    src/builtins/wasm.tq
+    src/builtins/wasm-strings.tq
+    src/builtins/wasm-to-js.tq
   )
 endif()
 
@@ -981,8 +1030,8 @@ add_library(
   ${torque_outputs}
 )
 
-target_compile_definitions(v8_torque_generated PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_torque_generated PRIVATE ${disable-exceptions})
+target_compile_definitions(v8_torque_generated PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
+target_compile_options(v8_torque_generated PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 if(enable-fPIC)
   target_compile_options(v8_torque_generated PRIVATE ${enable-fpic})
 endif()
@@ -993,6 +1042,9 @@ target_include_directories(v8_torque_generated
     ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}/v8/include
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
+    ${PROJECT_SOURCE_DIR}/v8/third_party/highway/src
+    ${PROJECT_SOURCE_DIR}/v8/third_party/fp16/src/include
 )
 
 # The torque-outputs and torque_outputs variables can have too many characters
@@ -1037,7 +1089,12 @@ file(GLOB torque-program-sources
 add_executable(torque)
 target_sources(torque PRIVATE ${torque-program-sources})
 target_compile_options(torque PRIVATE ${enable-exceptions})
-target_include_directories(torque PRIVATE ${PROJECT_SOURCE_DIR}/v8)
+target_compile_definitions(torque PRIVATE ${v8_defines})
+target_include_directories(torque PRIVATE
+  ${PROJECT_SOURCE_DIR}/v8
+  ${PROJECT_SOURCE_DIR}/v8/include
+  ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
+)
 target_link_libraries(torque PRIVATE v8_libbase)
 
 #
@@ -1052,13 +1109,14 @@ add_executable(mksnapshot
   v8/src/snapshot/embedded/platform-embedded-file-writer-base.cc
   v8/src/snapshot/embedded/platform-embedded-file-writer-generic.cc
   v8/src/snapshot/embedded/platform-embedded-file-writer-mac.cc
+  v8/src/snapshot/embedded/platform-embedded-file-writer-zos.cc
   v8/src/snapshot/embedded/platform-embedded-file-writer-win.cc
   v8/src/snapshot/mksnapshot.cc
   v8/src/snapshot/snapshot-empty.cc
 )
 
-target_compile_definitions(mksnapshot PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(mksnapshot PRIVATE ${disable-exceptions})
+target_compile_definitions(mksnapshot PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
+target_compile_options(mksnapshot PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
 target_include_directories(mksnapshot PRIVATE ${PROJECT_SOURCE_DIR}/v8)
 target_link_libraries(mksnapshot
   PRIVATE
@@ -1076,3 +1134,15 @@ target_include_directories(v8-adler32
   PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/third_party/zlib>
 )
+
+add_subdirectory(v8/third_party/abseil-cpp EXCLUDE_FROM_ALL)
+add_library(v8_simdutf STATIC v8/third_party/simdutf/simdutf.cpp)
+target_include_directories(v8_simdutf PUBLIC ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf)
+set_property(TARGET v8_simdutf PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+if (is-arm64)
+set_source_files_properties(
+  v8/src/objects/simd.cc
+  PROPERTIES COMPILE_OPTIONS "-flax-vector-conversions"
+)
+endif()
