@@ -33,7 +33,10 @@ OptimizedCompilationInfo::OptimizedCompilationInfo(
   DCHECK_EQ(*shared, closure->shared());
   DCHECK(shared->is_compiled());
   DCHECK_IMPLIES(is_osr(), IsOptimizing());
+  // TODO(dmercadier): get the BytecodeArray from a trusted place rather than
+  // from the SharedFunctionInfo.
   bytecode_array_ = handle(shared->GetBytecodeArray(isolate), isolate);
+
   shared_info_ = shared;
   closure_ = closure;
   canonical_handles_ = std::make_unique<CanonicalHandlesMap>(
@@ -66,7 +69,7 @@ OptimizedCompilationInfo::OptimizedCompilationInfo(
       builtin_(builtin),
       zone_(zone),
       optimization_id_(kNoOptimizationId),
-      debug_name_(debug_name) {
+      debug_name_(debug_name.begin(), debug_name.end()) {
   DCHECK_IMPLIES(builtin_ != Builtin::kNoBuiltinId,
                  (code_kind_ == CodeKind::BUILTIN ||
                   code_kind_ == CodeKind::BYTECODE_HANDLER));
@@ -106,6 +109,7 @@ void OptimizedCompilationInfo::ConfigureFlags() {
 #endif  // V8_ENABLE_BUILTIN_JUMP_TABLE_SWITCH
       [[fallthrough]];
     case CodeKind::FOR_TESTING:
+    case CodeKind::FOR_TESTING_JS:
       if (v8_flags.turbo_splitting) set_splitting();
       if (v8_flags.enable_allocation_folding) set_allocation_folding();
 #if ENABLE_GDB_JIT_INTERFACE && DEBUG
@@ -119,6 +123,7 @@ void OptimizedCompilationInfo::ConfigureFlags() {
     case CodeKind::C_WASM_ENTRY:
     case CodeKind::JS_TO_WASM_FUNCTION:
     case CodeKind::WASM_TO_JS_FUNCTION:
+    case CodeKind::WASM_STACK_ENTRY:
       break;
     case CodeKind::BASELINE:
     case CodeKind::MAGLEV:
@@ -169,17 +174,16 @@ std::unique_ptr<char[]> OptimizedCompilationInfo::GetDebugName() const {
   if (!shared_info().is_null()) {
     return shared_info()->DebugNameCStr();
   }
-  base::Vector<const char> name_vec = debug_name_;
-  if (name_vec.empty()) name_vec = base::ArrayVector("unknown");
-  std::unique_ptr<char[]> name(new char[name_vec.length() + 1]);
-  memcpy(name.get(), name_vec.begin(), name_vec.length());
-  name[name_vec.length()] = '\0';
+  const std::string& name_str = debug_name_.empty() ? "unknown" : debug_name_;
+  std::unique_ptr<char[]> name(new char[name_str.length() + 1]);
+  memcpy(name.get(), name_str.c_str(), name_str.length() + 1);
   return name;
 }
 
 StackFrame::Type OptimizedCompilationInfo::GetOutputStackFrameType() const {
   switch (code_kind()) {
     case CodeKind::FOR_TESTING:
+    case CodeKind::FOR_TESTING_JS:
     case CodeKind::BYTECODE_HANDLER:
     case CodeKind::BUILTIN:
       return StackFrame::STUB;
@@ -194,10 +198,26 @@ StackFrame::Type OptimizedCompilationInfo::GetOutputStackFrameType() const {
       return StackFrame::WASM_TO_JS;
     case CodeKind::C_WASM_ENTRY:
       return StackFrame::C_WASM_ENTRY;
+    case CodeKind::WASM_STACK_ENTRY:
+      return StackFrame::WASM_STACK_ENTRY;
+#else
+    case CodeKind::WASM_FUNCTION:
+    case CodeKind::WASM_TO_CAPI_FUNCTION:
+    case CodeKind::JS_TO_WASM_FUNCTION:
+    case CodeKind::WASM_TO_JS_FUNCTION:
+    case CodeKind::C_WASM_ENTRY:
+    case CodeKind::WASM_STACK_ENTRY:
+      UNREACHABLE();
 #endif  // V8_ENABLE_WEBASSEMBLY
-    default:
+
+    case CodeKind::REGEXP:
+    case CodeKind::INTERPRETED_FUNCTION:
+    case CodeKind::BASELINE:
+    case CodeKind::MAGLEV:
+    case CodeKind::TURBOFAN_JS:
       UNIMPLEMENTED();
   }
+  UNREACHABLE();
 }
 
 void OptimizedCompilationInfo::SetCode(IndirectHandle<Code> code) {

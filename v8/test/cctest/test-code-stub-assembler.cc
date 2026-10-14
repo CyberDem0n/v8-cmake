@@ -21,8 +21,10 @@
 #include "src/heap/heap-inl.h"
 #include "src/heap/heap-verifier.h"
 #include "src/numbers/hash-seed-inl.h"
+#include "src/objects/dictionary-inl.h"
 #include "src/objects/js-array-inl.h"
 #include "src/objects/js-promise-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/ordered-hash-table-inl.h"
 #include "src/objects/promise-inl.h"
@@ -284,7 +286,7 @@ TEST(NumberToString) {
     DirectHandle<String> expected = factory->NumberToString(input);
 
     DirectHandle<Object> result = ft.Call(input).ToHandleChecked();
-    if (IsUndefined(*result, isolate)) {
+    if (IsUndefined(*result)) {
       // Query may fail if cache was resized, in which case the entry is not
       // added to the cache.
       if (IsSmi(*input)) {
@@ -301,7 +303,7 @@ TEST(NumberToString) {
       expected = factory->NumberToString(input);
       result = ft.Call(input).ToHandleChecked();
     }
-    CHECK(!IsUndefined(*result, isolate));
+    CHECK(!IsUndefined(*result));
     CHECK_EQ(*expected, *result);
   }
 }
@@ -422,9 +424,9 @@ void IsValidPositiveSmiCase(Isolate* isolate, intptr_t value) {
 
   bool expected = i::PlatformSmiTagging::IsValidSmi(value) && (value >= 0);
   if (expected) {
-    CHECK(IsTrue(*maybe_handle.ToHandleChecked(), isolate));
+    CHECK(IsTrue(*maybe_handle.ToHandleChecked()));
   } else {
-    CHECK(IsFalse(*maybe_handle.ToHandleChecked(), isolate));
+    CHECK(IsFalse(*maybe_handle.ToHandleChecked()));
   }
 }
 }  // namespace
@@ -637,7 +639,7 @@ TEST(ComputeIntegerHash) {
     Handle<Smi> key(Smi::FromInt(k), isolate);
     DirectHandle<Object> result = ft.Call(key).ToHandleChecked();
 
-    uint32_t hash = ComputeSeededHash(k, HashSeed(isolate));
+    uint32_t hash = ComputeSeededHash(k, HashSeed(isolate).seed());
     Tagged<Smi> expected = Smi::FromInt(hash);
     CHECK_EQ(expected, Cast<Smi>(*result));
   }
@@ -1021,7 +1023,8 @@ void TestNameDictionaryLookup() {
     DirectHandle<Object> value =
         factory->NewPropertyCell(keys[i], fake_details, keys[i]);
     dictionary =
-        Dictionary::Add(isolate, dictionary, keys[i], value, fake_details);
+        Dictionary::Add(isolate, dictionary, keys[i], value, fake_details)
+            .ToHandleChecked();
   }
 
   for (size_t i = 0; i < arraysize(keys); i++) {
@@ -1218,7 +1221,7 @@ TEST(TransitionLookup) {
     }
     keys[i] = name;
 
-    bool is_private = name->IsPrivate();
+    bool is_private = name->IsAnyPrivate();
     PropertyAttributes base_attributes = is_private ? DONT_ENUM : NONE;
 
     // Ensure that all the combinations of cases are covered:
@@ -1508,7 +1511,7 @@ TEST(TryHasOwnProperty) {
   {
     DirectHandle<JSFunction> function =
         factory->NewFunctionForTesting(factory->empty_string());
-    Handle<JSProxy> object = factory->NewJSProxy(function, objects[0]);
+    Handle<JSProxy> object = factory->NewJSProxy(function, objects[0], false);
     CHECK_EQ(JS_PROXY_TYPE, object->map()->instance_type());
     ft.CheckTrue(object, names[0], expect_bailout);
   }
@@ -1707,7 +1710,7 @@ TEST(TryGetOwnProperty) {
         Handle<Name> name = non_existing_names[key_index];
         DirectHandle<Object> expected_value =
             JSReceiver::GetProperty(isolate, object, name).ToHandleChecked();
-        CHECK(IsUndefined(*expected_value, isolate));
+        CHECK(IsUndefined(*expected_value));
         DirectHandle<Object> value = ft.Call(object, name).ToHandleChecked();
         CHECK_EQ(*not_found_symbol, *value);
       }
@@ -1717,7 +1720,7 @@ TEST(TryGetOwnProperty) {
   {
     DirectHandle<JSFunction> function =
         factory->NewFunctionForTesting(factory->empty_string());
-    Handle<JSProxy> object = factory->NewJSProxy(function, objects[0]);
+    Handle<JSProxy> object = factory->NewJSProxy(function, objects[0], false);
     CHECK_EQ(JS_PROXY_TYPE, object->map()->instance_type());
     DirectHandle<Object> value = ft.Call(object, names[0]).ToHandleChecked();
     // Proxies are not supported yet.
@@ -1954,7 +1957,7 @@ TEST(TryLookupElement) {
     DirectHandle<JSArray> handler = factory->NewJSArray(0);
     DirectHandle<JSFunction> function =
         factory->NewFunctionForTesting(factory->empty_string());
-    Handle<JSProxy> object = factory->NewJSProxy(function, handler);
+    Handle<JSProxy> object = factory->NewJSProxy(function, handler, false);
     CHECK_EQ(JS_PROXY_TYPE, object->map()->instance_type());
     ft.CheckTrue(object, smi0, expect_bailout);
   }
@@ -1992,7 +1995,7 @@ TEST(AllocateJSObjectFromMap) {
     m.GotoIfNot(m.IsJSArrayMap(map), &done);
 
     // JS array verification requires the length field to be set.
-    m.StoreObjectFieldNoWriteBarrier(result, JSArray::kLengthOffset,
+    m.StoreObjectFieldNoWriteBarrier(result, offsetof(JSArray, length_),
                                      m.SmiConstant(0));
     m.Goto(&done);
 
@@ -2057,16 +2060,15 @@ TEST(AllocationFoldingCSA) {
   Isolate* isolate(CcTest::InitIsolateOnce());
 
   const int kNumParams = 1;
-  const int kNumArrays = 7;
-  CodeAssemblerTester asm_tester(isolate, JSParameterCount(kNumParams),
-                                 CodeKind::FOR_TESTING);
+  const uint32_t kNumArrays = 7;
+  CodeAssemblerTester asm_tester(isolate, JSParameterCount(kNumParams));
   CodeStubAssembler m(asm_tester.state());
 
   {
     TNode<IntPtrT> length = m.SmiUntag(m.Parameter<Smi>(1));
     TNode<FixedArray> result = m.UncheckedCast<FixedArray>(m.AllocateFixedArray(
         PACKED_ELEMENTS, length, CodeStubAssembler::AllocationFlag::kNone));
-    for (int i = 1; i <= kNumArrays; ++i) {
+    for (uint32_t i = 1; i <= kNumArrays; ++i) {
       int array_length = i * kTaggedSize;
       TNode<ByteArray> array =
           m.AllocateByteArray(m.UintPtrConstant(array_length));
@@ -2078,24 +2080,24 @@ TEST(AllocationFoldingCSA) {
   FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
 
   {
-    auto fixed_array_length = Handle<Smi>(Smi::FromInt(kNumArrays), isolate);
+    auto fixed_array_length = Handle<Smi>(Smi::FromUInt(kNumArrays), isolate);
     DirectHandle<FixedArray> result =
         Cast<FixedArray>(ft.Call(fixed_array_length).ToHandleChecked());
-    CHECK_EQ(result->length(), kNumArrays);
+    CHECK_EQ(result->length().value(), kNumArrays);
     if (V8_COMPRESS_POINTERS_8GB_BOOL) {
       CHECK(IsAligned(result->address(), kObjectAlignment8GbHeap));
     } else {
       CHECK(IsAligned(result->address(), kTaggedSize));
     }
     Tagged<ByteArray> prev_array;
-    for (int i = 1; i <= kNumArrays; ++i) {
+    for (uint32_t i = 1; i <= kNumArrays; ++i) {
       Tagged<ByteArray> current_array = Cast<ByteArray>(result->get(i - 1));
       if (V8_COMPRESS_POINTERS_8GB_BOOL) {
         CHECK(IsAligned(current_array.address(), kObjectAlignment8GbHeap));
       } else {
         CHECK(IsAligned(current_array.address(), kTaggedSize));
       }
-      CHECK_EQ(current_array->length(), i * kTaggedSize);
+      CHECK_EQ(current_array->length().value(), i * kTaggedSize);
       if (i != 1) {
         // TODO(v8:13070): Align prev_array.AllocatedSize() to the allocation
         // size.
@@ -2302,7 +2304,7 @@ void CallFunctionWithStackPointerChecks(Isolate* isolate,
           CSA_CHECK(
               &m, m.TaggedEqual(result, MakeConstantNode(m, expected_result)));
         },
-        1, CodeStubAssembler::LoopUnrollingMode::kNo,
+        1, CodeStubAssembler::kNoLoopUnrolling,
         CodeStubAssembler::IndexAdvanceMode::kPost);
 
 #ifdef V8_CC_GNU
@@ -2673,22 +2675,21 @@ TEST(ShortBuiltinCallsThreshold) {
 
   const uint64_t kPhysicalMemoryThreshold = size_t{4} * GB;
 
-  size_t heap_size, old, young;
+  size_t old;
 
   // If the physical memory is < kPhysicalMemoryThreshold then the old space
   // size must be below the kShortBuiltinCallsOldSpaceThreshold.
-  heap_size = Heap::HeapSizeFromPhysicalMemory(kPhysicalMemoryThreshold - MB);
-  i::Heap::GenerationSizesFromHeapSize(heap_size, &young, &old);
+  const uint64_t physical_memory = kPhysicalMemoryThreshold - MB;
+  old = Heap::OldGenerationSizeFromPhysicalMemory(physical_memory);
   CHECK_LT(old, kShortBuiltinCallsOldSpaceSizeThreshold);
 
   // If the physical memory is >= kPhysicalMemoryThreshold then the old space
   // size must be below the kShortBuiltinCallsOldSpaceThreshold.
-  heap_size = Heap::HeapSizeFromPhysicalMemory(kPhysicalMemoryThreshold);
-  i::Heap::GenerationSizesFromHeapSize(heap_size, &young, &old);
+  old = Heap::OldGenerationSizeFromPhysicalMemory(kPhysicalMemoryThreshold);
   CHECK_GE(old, kShortBuiltinCallsOldSpaceSizeThreshold);
 
-  heap_size = Heap::HeapSizeFromPhysicalMemory(kPhysicalMemoryThreshold + MB);
-  i::Heap::GenerationSizesFromHeapSize(heap_size, &young, &old);
+  old =
+      Heap::OldGenerationSizeFromPhysicalMemory(kPhysicalMemoryThreshold + MB);
   CHECK_GE(old, kShortBuiltinCallsOldSpaceSizeThreshold);
 }
 #endif  // !defined(V8_OS_ANDROID)
@@ -3038,7 +3039,8 @@ TEST(CreatePromiseResolvingFunctionsContext) {
   DirectHandle<Context> context_js = Cast<Context>(result);
   CHECK_EQ(isolate->root(RootIndex::kEmptyScopeInfo), context_js->scope_info());
   CHECK_EQ(*isolate->native_context(), context_js->native_context());
-  CHECK(IsJSPromise(context_js->GetNoCell(PromiseBuiltins::kPromiseSlot)));
+  CHECK(IsJSPromise(
+      context_js->GetNoCell(PromiseBuiltins::kPromiseIfNotResolvedSlot)));
   CHECK_EQ(ReadOnlyRoots(isolate).false_value(),
            context_js->GetNoCell(PromiseBuiltins::kDebugEventSlot));
 }
@@ -3247,7 +3249,8 @@ TEST(NewPromiseCapability) {
       CHECK_EQ(*isolate->native_context(), callback_context->native_context());
       CHECK_EQ(PromiseBuiltins::kPromiseContextLength,
                callback_context->length());
-      CHECK_EQ(callback_context->GetNoCell(PromiseBuiltins::kPromiseSlot),
+      CHECK_EQ(callback_context->GetNoCell(
+                   PromiseBuiltins::kPromiseIfNotResolvedSlot),
                result->promise());
     }
   }
@@ -3727,7 +3730,7 @@ TEST(CloneEmptyFixedArray) {
   Handle<FixedArray> source(isolate->factory()->empty_fixed_array());
   DirectHandle<Object> result_raw = ft.Call(source).ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
-  CHECK_EQ(0, result->length());
+  CHECK_EQ(0u, result->length().value());
   CHECK_EQ(*(isolate->factory()->empty_fixed_array()), result);
 }
 
@@ -3745,12 +3748,12 @@ TEST(CloneFixedArray) {
   source->set(1, Smi::FromInt(1234));
   DirectHandle<Object> result_raw = ft.Call(source).ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
-  CHECK_EQ(5, result->length());
-  CHECK(IsTheHole(result->get(0), isolate));
+  CHECK_EQ(5u, result->length().value());
+  CHECK(IsTheHole(result->get(0)));
   CHECK_EQ(Cast<Smi>(result->get(1)).value(), 1234);
-  CHECK(IsTheHole(result->get(2), isolate));
-  CHECK(IsTheHole(result->get(3), isolate));
-  CHECK(IsTheHole(result->get(4), isolate));
+  CHECK(IsTheHole(result->get(2)));
+  CHECK(IsTheHole(result->get(3)));
+  CHECK(IsTheHole(result->get(4)));
 }
 
 TEST(CloneFixedArrayCOW) {
@@ -3793,12 +3796,12 @@ TEST(ExtractFixedArrayCOWForceCopy) {
   DirectHandle<Object> result_raw = ft.Call(source).ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
   CHECK_NE(*source, result);
-  CHECK_EQ(5, result->length());
-  CHECK(IsTheHole(result->get(0), isolate));
+  CHECK_EQ(5u, result->length().value());
+  CHECK(IsTheHole(result->get(0)));
   CHECK_EQ(Cast<Smi>(result->get(1)).value(), 1234);
-  CHECK(IsTheHole(result->get(2), isolate));
-  CHECK(IsTheHole(result->get(3), isolate));
-  CHECK(IsTheHole(result->get(4), isolate));
+  CHECK(IsTheHole(result->get(2)));
+  CHECK(IsTheHole(result->get(3)));
+  CHECK(IsTheHole(result->get(4)));
 }
 
 TEST(ExtractFixedArraySimple) {
@@ -3825,9 +3828,9 @@ TEST(ExtractFixedArraySimple) {
               Handle<Smi>(Smi::FromInt(2), isolate))
           .ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
-  CHECK_EQ(2, result->length());
+  CHECK_EQ(2u, result->length().value());
   CHECK_EQ(Cast<Smi>(result->get(0)).value(), 1234);
-  CHECK(IsTheHole(result->get(1), isolate));
+  CHECK(IsTheHole(result->get(1)));
 }
 
 TEST(ExtractFixedArraySimpleSmiConstant) {
@@ -3851,9 +3854,9 @@ TEST(ExtractFixedArraySimpleSmiConstant) {
   source->set(1, Smi::FromInt(1234));
   DirectHandle<Object> result_raw = ft.Call(source).ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
-  CHECK_EQ(2, result->length());
+  CHECK_EQ(2u, result->length().value());
   CHECK_EQ(Cast<Smi>(result->get(0)).value(), 1234);
-  CHECK(IsTheHole(result->get(1), isolate));
+  CHECK(IsTheHole(result->get(1)));
 }
 
 TEST(ExtractFixedArraySimpleIntPtrConstant) {
@@ -3877,9 +3880,9 @@ TEST(ExtractFixedArraySimpleIntPtrConstant) {
   source->set(1, Smi::FromInt(1234));
   DirectHandle<Object> result_raw = ft.Call(source).ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
-  CHECK_EQ(2, result->length());
+  CHECK_EQ(2u, result->length().value());
   CHECK_EQ(Cast<Smi>(result->get(0)).value(), 1234);
-  CHECK(IsTheHole(result->get(1), isolate));
+  CHECK(IsTheHole(result->get(1)));
 }
 
 TEST(ExtractFixedArraySimpleIntPtrConstantNoDoubles) {
@@ -3901,9 +3904,9 @@ TEST(ExtractFixedArraySimpleIntPtrConstantNoDoubles) {
   source->set(1, Smi::FromInt(1234));
   DirectHandle<Object> result_raw = ft.Call(source).ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
-  CHECK_EQ(2, result->length());
+  CHECK_EQ(2u, result->length().value());
   CHECK_EQ(Cast<Smi>(result->get(0)).value(), 1234);
-  CHECK(IsTheHole(result->get(1), isolate));
+  CHECK(IsTheHole(result->get(1)));
 }
 
 TEST(ExtractFixedArraySimpleIntPtrParameters) {
@@ -3926,9 +3929,9 @@ TEST(ExtractFixedArraySimpleIntPtrParameters) {
               Handle<Smi>(Smi::FromInt(2), isolate))
           .ToHandleChecked();
   Tagged<FixedArray> result(Cast<FixedArray>(*result_raw));
-  CHECK_EQ(2, result->length());
+  CHECK_EQ(2u, result->length().value());
   CHECK_EQ(Cast<Smi>(result->get(0)).value(), 1234);
-  CHECK(IsTheHole(result->get(1), isolate));
+  CHECK(IsTheHole(result->get(1)));
 
   Handle<FixedDoubleArray> source_double =
       Cast<FixedDoubleArray>(isolate->factory()->NewFixedDoubleArray(5));
@@ -3943,7 +3946,7 @@ TEST(ExtractFixedArraySimpleIntPtrParameters) {
           .ToHandleChecked();
   Tagged<FixedDoubleArray> double_result =
       Cast<FixedDoubleArray>(*double_result_raw);
-  CHECK_EQ(2, double_result->length());
+  CHECK_EQ(2u, double_result->length().value());
   CHECK_EQ(double_result->get_scalar(0), 11);
   CHECK_EQ(double_result->get_scalar(1), 12);
 }
@@ -4679,14 +4682,13 @@ TEST(IntPtrMulWithOverflow) {
     m.Return(m.SelectBooleanConstant(overflow));
 
     FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
-    CHECK(IsTrue(*ft.Call(handle(Smi::FromInt(-1), isolate)).ToHandleChecked(),
-                 isolate));
-    CHECK(IsFalse(*ft.Call(handle(Smi::FromInt(1), isolate)).ToHandleChecked(),
-                  isolate));
-    CHECK(IsTrue(*ft.Call(handle(Smi::FromInt(2), isolate)).ToHandleChecked(),
-                 isolate));
-    CHECK(IsFalse(*ft.Call(handle(Smi::FromInt(0), isolate)).ToHandleChecked(),
-                  isolate));
+    CHECK(
+        IsTrue(*ft.Call(handle(Smi::FromInt(-1), isolate)).ToHandleChecked()));
+    CHECK(
+        IsFalse(*ft.Call(handle(Smi::FromInt(1), isolate)).ToHandleChecked()));
+    CHECK(IsTrue(*ft.Call(handle(Smi::FromInt(2), isolate)).ToHandleChecked()));
+    CHECK(
+        IsFalse(*ft.Call(handle(Smi::FromInt(0), isolate)).ToHandleChecked()));
   }
 
   {
@@ -4700,12 +4702,11 @@ TEST(IntPtrMulWithOverflow) {
     m.Return(m.SelectBooleanConstant(overflow));
 
     FunctionTester ft(asm_tester.GenerateCode(), kNumParams);
-    CHECK(IsFalse(*ft.Call(handle(Smi::FromInt(-1), isolate)).ToHandleChecked(),
-                  isolate));
-    CHECK(IsFalse(*ft.Call(handle(Smi::FromInt(1), isolate)).ToHandleChecked(),
-                  isolate));
-    CHECK(IsTrue(*ft.Call(handle(Smi::FromInt(2), isolate)).ToHandleChecked(),
-                 isolate));
+    CHECK(
+        IsFalse(*ft.Call(handle(Smi::FromInt(-1), isolate)).ToHandleChecked()));
+    CHECK(
+        IsFalse(*ft.Call(handle(Smi::FromInt(1), isolate)).ToHandleChecked()));
+    CHECK(IsTrue(*ft.Call(handle(Smi::FromInt(2), isolate)).ToHandleChecked()));
   }
 }
 

@@ -9,6 +9,7 @@
 #include "src/common/assert-scope.h"
 #include "src/common/globals.h"
 #include "src/objects/tagged-field.h"
+#include "src/sandbox/cppheap-pointer.h"
 #include "src/sandbox/external-pointer-table.h"
 #include "src/sandbox/external-pointer.h"
 #include "src/sandbox/indirect-pointer-tag.h"
@@ -18,6 +19,8 @@ namespace v8::internal {
 
 class Object;
 class ExposedTrustedObject;
+template <typename T, IndirectPointerTagRange kTagRange>
+class TrustedPointerMember;
 using TaggedBase = TaggedImpl<HeapObjectReferenceType::STRONG, Address>;
 
 template <typename Subclass, typename Data,
@@ -58,17 +61,21 @@ class SlotBase {
     DCHECK_GE(ptr_, other.ptr_);
     return static_cast<size_t>((ptr_ - other.ptr_) / kSlotDataSize);
   }
-  Subclass operator-(int i) const { return Subclass(ptr_ - i * kSlotDataSize); }
-  Subclass operator+(int i) const { return Subclass(ptr_ + i * kSlotDataSize); }
-  friend Subclass operator+(int i, const Subclass& slot) {
+  Subclass operator-(uint32_t i) const {
+    return Subclass(ptr_ - i * kSlotDataSize);
+  }
+  Subclass operator+(uint32_t i) const {
+    return Subclass(ptr_ + i * kSlotDataSize);
+  }
+  friend Subclass operator+(uint32_t i, const Subclass& slot) {
     return Subclass(slot.ptr_ + i * kSlotDataSize);
   }
-  Subclass& operator+=(int i) {
+  Subclass& operator+=(uint32_t i) {
     ptr_ += i * kSlotDataSize;
     return *static_cast<Subclass*>(this);
   }
-  Subclass operator-(int i) { return Subclass(ptr_ - i * kSlotDataSize); }
-  Subclass& operator-=(int i) {
+  Subclass operator-(uint32_t i) { return Subclass(ptr_ - i * kSlotDataSize); }
+  Subclass& operator-=(uint32_t i) {
     ptr_ -= i * kSlotDataSize;
     return *static_cast<Subclass*>(this);
   }
@@ -297,19 +304,6 @@ class UnalignedSlot : public SlotBase<UnalignedSlot<T>, T, 1> {
   }
 };
 
-// An off-heap uncompressed object slot can be the same as an on-heap one, with
-// a few methods deleted.
-class OffHeapFullObjectSlot : public FullObjectSlot {
- public:
-  OffHeapFullObjectSlot() : FullObjectSlot() {}
-  explicit OffHeapFullObjectSlot(Address ptr) : FullObjectSlot(ptr) {}
-  explicit OffHeapFullObjectSlot(const Address* ptr) : FullObjectSlot(ptr) {}
-
-  inline Tagged<Object> operator*() const = delete;
-
-  using FullObjectSlot::Relaxed_Load;
-};
-
 // An ExternalPointerSlot instance describes a kExternalPointerSlotSize-sized
 // field ("slot") holding a pointer to objects located outside the V8 heap and
 // V8 sandbox (think: ExternalPointer_t).
@@ -320,41 +314,21 @@ class ExternalPointerSlot
     : public SlotBase<ExternalPointerSlot, ExternalPointer_t,
                       kTaggedSize /* slot alignment */> {
  public:
-  ExternalPointerSlot()
-      : SlotBase(kNullAddress)
-#ifdef V8_COMPRESS_POINTERS
-        ,
-        tag_range_()
-#endif
-  {
-  }
-
   ExternalPointerSlot(Address ptr, ExternalPointerTag tag_range)
-      : SlotBase(ptr)
-#ifdef V8_COMPRESS_POINTERS
-        ,
-        tag_range_(tag_range)
-#endif
-  {
-  }
+      : SlotBase(ptr), tag_range_(tag_range) {}
 
   ExternalPointerSlot(Address ptr, ExternalPointerTagRange tag_range)
-      : SlotBase(ptr)
-#ifdef V8_COMPRESS_POINTERS
-        ,
-        tag_range_(tag_range)
-#endif
-  {
-  }
+      : SlotBase(ptr), tag_range_(tag_range) {}
 
-  template <ExternalPointerTag tag>
-  explicit ExternalPointerSlot(ExternalPointerMember<tag>* member)
-      : SlotBase(member->storage_address())
-#ifdef V8_COMPRESS_POINTERS
-        ,
-        tag_range_(tag)
-#endif
-  {
+  template <ExternalPointerTagRange kTagRange>
+  explicit ExternalPointerSlot(ExternalPointerMember<kTagRange>* member)
+      : SlotBase(member->storage_address()), tag_range_(kTagRange) {}
+
+  template <ExternalPointerTagRange kTagRange>
+  ExternalPointerSlot(ExternalPointerMember<kTagRange>* member,
+                      ExternalPointerTagRange tag_range)
+      : SlotBase(member->storage_address()), tag_range_(tag_range) {
+    DCHECK(kTagRange.Contains(tag_range));
   }
 
   inline void init_lazily_initialized();
@@ -407,7 +381,6 @@ class ExternalPointerSlot
   inline uint32_t GetContentAsIndexAfterDeserialization(
       const DisallowGarbageCollection& no_gc);
 
-#ifdef V8_COMPRESS_POINTERS
   bool ExactTagIsKnown() const { return tag_range_.Size() == 1; }
 
   ExternalPointerTag exact_tag() const {
@@ -416,15 +389,6 @@ class ExternalPointerSlot
   }
 
   ExternalPointerTagRange tag_range() const { return tag_range_; }
-#else
-  bool ExactTagIsKnown() const { return true; }
-
-  ExternalPointerTag exact_tag() const { return kExternalPointerNullTag; }
-
-  ExternalPointerTagRange tag_range() const {
-    return ExternalPointerTagRange();
-  }
-#endif  // V8_COMPRESS_POINTERS
 
  private:
 #ifdef V8_COMPRESS_POINTERS
@@ -432,10 +396,10 @@ class ExternalPointerSlot
     DCHECK(HasExternalPointerHandle());
     return reinterpret_cast<ExternalPointerHandle*>(address());
   }
+#endif  // V8_COMPRESS_POINTERS
 
   // The tag range associated with this slot.
   ExternalPointerTagRange tag_range_;
-#endif  // V8_COMPRESS_POINTERS
 };
 
 // Similar to ExternalPointerSlot with the difference that it refers to an
@@ -445,29 +409,39 @@ class CppHeapPointerSlot
     : public SlotBase<CppHeapPointerSlot, CppHeapPointer_t,
                       /*SlotDataAlignment=*/sizeof(CppHeapPointer_t)> {
  public:
-  CppHeapPointerSlot() : SlotBase(kNullAddress) {}
+  explicit CppHeapPointerSlot(Address ptr) : SlotBase(ptr) {}
 
-  CppHeapPointerSlot(Address ptr) : SlotBase(ptr) {}
+  explicit CppHeapPointerSlot(CppHeapPointerMember* member)
+      : SlotBase(member->storage_address()) {}
+
+  inline void init() const;
 
 #ifdef V8_COMPRESS_POINTERS
 
   // When V8 runs with pointer compression, the slots here store a handle to an
-  // entry in a dedicated ExternalPointerTable that is only used for CppHeap
+  // entry in a dedicated CppHeapPointerTable that is only used for CppHeap
   // references. These methods allow access to the underlying handle while the
   // load/store methods below resolve the handle to the real pointer. Handles
   // should generally be accessed atomically as they may be accessed from other
   // threads, for example GC marking threads.
   inline CppHeapPointerHandle Relaxed_LoadHandle() const;
-  inline void Relaxed_StoreHandle(CppHeapPointerHandle handle) const;
+
   inline void Release_StoreHandle(CppHeapPointerHandle handle) const;
+
+  inline void Relaxed_StoreHandle(CppHeapPointerHandle handle) const;
+
+#else
+
+  inline void store(Address value) const;
+  inline Address load() const;
 
 #endif  // V8_COMPRESS_POINTERS
 
-  inline Address try_load(IsolateForPointerCompression isolate,
-                          CppHeapPointerTagRange tag_range) const;
-  inline void store(IsolateForPointerCompression isolate, Address value,
-                    CppHeapPointerTag tag) const;
-  inline void init() const;
+  using RawContent = CppHeapPointer_t;
+  inline RawContent GetAndClearContentForSerialization(
+      const DisallowGarbageCollection& no_gc);
+  inline void RestoreContentAfterSerialization(
+      RawContent content, const DisallowGarbageCollection& no_gc);
 };
 
 // An IndirectPointerSlot instance describes a 32-bit field ("slot") containing
@@ -483,16 +457,27 @@ class IndirectPointerSlot
       : SlotBase(kNullAddress)
 #ifdef V8_ENABLE_SANDBOX
         ,
-        tag_(kIndirectPointerNullTag)
+        tag_range_()
 #endif
   {
   }
 
-  explicit IndirectPointerSlot(Address ptr, IndirectPointerTag tag)
+  explicit IndirectPointerSlot(Address ptr, IndirectPointerTagRange tag_range)
       : SlotBase(ptr)
 #ifdef V8_ENABLE_SANDBOX
         ,
-        tag_(tag)
+        tag_range_(tag_range)
+#endif
+  {
+  }
+
+  template <typename T, IndirectPointerTagRange kTagRange>
+  explicit IndirectPointerSlot(TrustedPointerMember<T, kTagRange>* member)
+#ifdef V8_ENABLE_SANDBOX
+      : SlotBase(member->storage_address()),
+        tag_range_(kTagRange)
+#else
+      : SlotBase(member->ptr_location())
 #endif
   {
   }
@@ -522,9 +507,11 @@ class IndirectPointerSlot
   inline void Release_StoreHandle(IndirectPointerHandle handle) const;
 
 #ifdef V8_ENABLE_SANDBOX
-  IndirectPointerTag tag() const { return tag_; }
+  IndirectPointerTagRange tag_range() const { return tag_range_; }
 #else
-  IndirectPointerTag tag() const { return kIndirectPointerNullTag; }
+  IndirectPointerTagRange tag_range() const {
+    return IndirectPointerTagRange();
+  }
 #endif
 
   // Whether this slot is empty, i.e. contains a null handle.
@@ -546,15 +533,11 @@ class IndirectPointerSlot
   // Retrieve the object referenced through the given trusted pointer handle
   // from the trusted pointer table.
   template <TagCheckStrictness allow_unpublished = kRequireExactMatch>
-  inline Tagged<Object> ResolveTrustedPointerHandle(
+  inline Tagged<Object> ResolveIndirectPointerHandle(
       IndirectPointerHandle handle, IsolateForSandbox isolate) const;
-  // Retrieve the Code object referenced through the given code pointer handle
-  // from the code pointer table.
-  inline Tagged<Object> ResolveCodePointerHandle(
-      IndirectPointerHandle handle) const;
 
   // The tag associated with this slot.
-  IndirectPointerTag tag_;
+  IndirectPointerTagRange tag_range_;
 #endif  // V8_ENABLE_SANDBOX
 };
 
@@ -585,14 +568,27 @@ class WriteProtectedSlot : public SlotT {
 // |src| and |dst| must be kTaggedSize-aligned.
 inline void CopyTagged(Address dst, const Address src, size_t num_tagged);
 
-// Sets |counter| number of kTaggedSize-sized values starting at |start| slot.
+// Fills `start` with `count` `value`s.
 inline void MemsetTagged(Tagged_t* start, Tagged<MaybeObject> value,
-                         size_t counter);
+                         size_t count);
 
-// Sets |counter| number of kTaggedSize-sized values starting at |start| slot.
+// Fills `start` with `count` `value`s.
 template <typename T>
 inline void MemsetTagged(SlotBase<T, Tagged_t> start, Tagged<MaybeObject> value,
-                         size_t counter);
+                         size_t count);
+
+// Fills `start` with `count` `value`s using relaxed atomic stores.
+inline void Relaxed_MemsetTagged(Tagged_t* start, Tagged<MaybeObject> value,
+                                 size_t count);
+
+// Fills `start` with `count` `value`s using relaxed atomic stores.
+template <typename T>
+inline void Relaxed_MemsetTagged(SlotBase<T, Tagged_t> start,
+                                 Tagged<MaybeObject> value, size_t count);
+
+// Fills `start` with `count` `value`s.
+inline void MemsetPointer(FullObjectSlot start, Tagged<Object> value,
+                          size_t count);
 
 }  // namespace v8::internal
 

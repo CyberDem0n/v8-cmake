@@ -18,8 +18,8 @@ namespace v8_inspector {
 // ContextCollected callbacks may invoke JS which cannot run from inside the GC.
 class InspectedContext::ContextCollectedCallbacks final : public v8::Task {
  public:
-  explicit ContextCollectedCallbacks(InspectedContext::WeakCallbackData* data)
-      : data_(data) {}
+  explicit ContextCollectedCallbacks(InspectedContext::WeakCallbackData* data);
+  ~ContextCollectedCallbacks();
 
   void Run() override;
 
@@ -54,6 +54,13 @@ class InspectedContext::WeakCallbackData {
 
   friend class InspectedContext::ContextCollectedCallbacks;
 };
+
+InspectedContext::ContextCollectedCallbacks::ContextCollectedCallbacks(
+    InspectedContext::WeakCallbackData* data)
+    : data_(data) {}
+
+InspectedContext::ContextCollectedCallbacks::~ContextCollectedCallbacks() =
+    default;
 
 void InspectedContext::ContextCollectedCallbacks::Run() {
   data_->m_inspector->contextCollected(data_->m_groupId, data_->m_contextId);
@@ -119,23 +126,26 @@ bool InspectedContext::isReported(int sessionId) const {
 }
 
 void InspectedContext::setReported(int sessionId, bool reported) {
-  if (reported)
+  if (reported) {
     m_reportedSessionIds.insert(sessionId);
-  else
+  } else {
     m_reportedSessionIds.erase(sessionId);
+  }
 }
 
-InjectedScript* InspectedContext::getInjectedScript(int sessionId) {
+std::shared_ptr<InjectedScript> InspectedContext::getInjectedScript(
+    int sessionId) {
   auto it = m_injectedScripts.find(sessionId);
-  return it == m_injectedScripts.end() ? nullptr : it->second.get();
+  return it == m_injectedScripts.end() ? nullptr : it->second;
 }
 
-InjectedScript* InspectedContext::createInjectedScript(int sessionId) {
-  std::unique_ptr<InjectedScript> injectedScript =
-      std::make_unique<InjectedScript>(this, sessionId);
+std::shared_ptr<InjectedScript> InspectedContext::createInjectedScript(
+    int sessionId) {
+  std::shared_ptr<InjectedScript> injectedScript =
+      std::make_shared<InjectedScript>(this, sessionId);
   CHECK(m_injectedScripts.find(sessionId) == m_injectedScripts.end());
-  m_injectedScripts[sessionId] = std::move(injectedScript);
-  return getInjectedScript(sessionId);
+  m_injectedScripts[sessionId] = injectedScript;
+  return injectedScript;
 }
 
 void InspectedContext::discardInjectedScript(int sessionId) {

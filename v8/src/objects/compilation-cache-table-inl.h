@@ -11,6 +11,7 @@
 #include <optional>
 
 #include "src/objects/name-inl.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/script-inl.h"
 #include "src/objects/shared-function-info.h"
 #include "src/objects/smi.h"
@@ -31,15 +32,15 @@ void CompilationCacheTable::SetPrimaryValueAt(InternalIndex entry,
   set(EntryToIndex(entry) + 1, value, mode);
 }
 
-Tagged<Object> CompilationCacheTable::EvalJSFunctionsValueAt(
-    InternalIndex entry) {
+Tagged<UnionOf<TheHole, WeakFixedArray>>
+CompilationCacheTable::EvalJSFunctionsValueAt(InternalIndex entry) {
   static_assert(CompilationCacheShape::kEntrySize == 3);
-  return get(EntryToIndex(entry) + 2);
+  return Cast<UnionOf<TheHole, WeakFixedArray>>(get(EntryToIndex(entry) + 2));
 }
 
-void CompilationCacheTable::SetEvalJSFunctionsValueAt(InternalIndex entry,
-                                                      Tagged<Object> value,
-                                                      WriteBarrierMode mode) {
+void CompilationCacheTable::SetEvalJSFunctionsValueAt(
+    InternalIndex entry, Tagged<UnionOf<TheHole, WeakFixedArray>> value,
+    WriteBarrierMode mode) {
   set(EntryToIndex(entry) + 2, value, mode);
 }
 
@@ -78,7 +79,7 @@ class ScriptCacheKey : public HashTableKey {
     DisallowGarbageCollection no_gc;
     DCHECK(IsWeakFixedArray(obj));
     Tagged<WeakFixedArray> array = Cast<WeakFixedArray>(obj);
-    DCHECK_EQ(array->length(), kEnd);
+    DCHECK_EQ(array->ulength().value(), static_cast<uint32_t>(kEnd));
 
     Tagged<MaybeObject> maybe_script = array->get(kWeakScript);
     if (Tagged<HeapObject> script; maybe_script.GetHeapObjectIfWeak(&script)) {
@@ -131,8 +132,9 @@ uint32_t CompilationCacheShape::EvalHash(Tagged<String> source,
 uint32_t CompilationCacheShape::HashForObject(ReadOnlyRoots roots,
                                               Tagged<Object> object) {
   // Eval: The key field contains the hash as a Number.
-  if (IsNumber(object))
+  if (IsNumber(object)) {
     return static_cast<uint32_t>(Object::NumberValue(object));
+  }
 
   // Code: The key field contains the SFI key.
   if (IsSharedFunctionInfo(object)) {
@@ -149,15 +151,15 @@ uint32_t CompilationCacheShape::HashForObject(ReadOnlyRoots roots,
   // object.
   if (IsRegExpDataWrapper(object)) {
     Tagged<RegExpDataWrapper> re_wrapper = Cast<RegExpDataWrapper>(object);
-    Isolate* isolate = GetIsolateFromWritableObject(re_wrapper);
+    Isolate* isolate = Isolate::Current();
     Tagged<RegExpData> data = re_wrapper->data(isolate);
-    return RegExpHash(data->source(), Smi::FromInt(data->flags()));
+    return RegExpHash(data->original_source(), Smi::FromInt(data->flags()));
   }
 
   // Eval: See EvalCacheKey::ToHandle for the encoding.
   Tagged<FixedArray> val = Cast<FixedArray>(object);
   DCHECK_EQ(val->map(), roots.fixed_cow_array_map());
-  DCHECK_EQ(4, val->length());
+  DCHECK_EQ(4u, val->ulength().value());
   Tagged<String> source = Cast<String>(val->get(1));
   int language_unchecked = Smi::ToInt(val->get(2));
   DCHECK(is_valid_language_mode(language_unchecked));

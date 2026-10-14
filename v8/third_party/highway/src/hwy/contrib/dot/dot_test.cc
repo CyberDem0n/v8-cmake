@@ -89,11 +89,10 @@ class TestDot {
       a[i] = ConvertScalarTo<T>(random_t());
       b[i] = ConvertScalarTo<T>(random_t());
     }
-    // Fill padding with NaN - the values are not used, but avoids MSAN errors.
+    // Fill padding - the values are not used, but avoids MSAN errors.
     for (; i < padded; ++i) {
-      ScalableTag<float> df1;
-      a[i] = ConvertScalarTo<T>(GetLane(NaN(df1)));
-      b[i] = ConvertScalarTo<T>(GetLane(NaN(df1)));
+      a[i] = ConvertScalarTo<T>(0);
+      b[i] = ConvertScalarTo<T>(0);
     }
 
     const double expected = SimpleDot(a, b, num);
@@ -102,8 +101,11 @@ class TestDot {
         ConvertScalarTo<double>(Dot::Compute<kAssumptions>(d, a, b, num));
     const double max = static_cast<double>(8 * 8 * num);
     HWY_ASSERT(-max <= actual && actual <= max);
+    // Integer math is exact, so no tolerance.
     const double tolerance =
-        96.0 * ConvertScalarTo<double>(Epsilon<T>()) * HWY_MAX(magnitude, 1.0);
+        IsFloat<T>() ? 96.0 * ConvertScalarTo<double>(Epsilon<T>()) *
+                           HWY_MAX(magnitude, 1.0)
+                     : 0;
     HWY_ASSERT(expected - tolerance <= actual &&
                actual <= expected + tolerance);
   }
@@ -194,7 +196,7 @@ class TestDotF32BF16 {
       b[i] = ConvertScalarTo<T2>(GetLane(NaN(df1)));
     }
 
-    const double expected = SimpleDot(a, b, num);
+    double expected = SimpleDot(a, b, num);
     const double magnitude = expected > 0.0 ? expected : -expected;
     const double actual =
         ConvertScalarTo<double>(Dot::Compute<kAssumptions>(d, a, b, num));
@@ -202,8 +204,15 @@ class TestDotF32BF16 {
     HWY_ASSERT(-max <= actual && actual <= max);
     const double tolerance =
         64.0 * ConvertScalarTo<double>(Epsilon<T2>()) * HWY_MAX(magnitude, 1.0);
-    HWY_ASSERT(expected - tolerance <= actual &&
-               actual <= expected + tolerance);
+    // Workaround for GCC 15 bug causing test failure. Without this, the
+    // `expected` value is way off.
+#if HWY_COMPILER_GCC_ACTUAL
+    __asm__ volatile("" : "+r"(expected));
+#endif
+    if (!(expected - tolerance <= actual && actual <= expected + tolerance)) {
+      HWY_ABORT("expected: %E actual: %E tolerance: %E", expected, actual,
+                tolerance);
+    }
   }
 
   // Runs tests with various alignments.
@@ -263,14 +272,14 @@ class TestDotF32BF16 {
 // All floating-point types, both arguments same.
 void TestAllDot() { ForFloatTypes(ForPartialVectors<TestDot>()); }
 
-// Mixed f32 and bf16.
-void TestAllDotF32BF16() {
-  ForPartialVectors<TestDotF32BF16> test;
-  test(float());
-}
+// Mixed f32 and bf16 inputs.
+void TestAllDotF32BF16() { ForPartialVectors<TestDotF32BF16>()(float()); }
 
-// Both bf16.
+// Both inputs bf16.
 void TestAllDotBF16() { ForShrinkableVectors<TestDot>()(bfloat16_t()); }
+
+// Both inputs i16.
+void TestAllDotI16() { ForShrinkableVectors<TestDot>()(int16_t()); }
 
 }  // namespace
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -285,6 +294,7 @@ HWY_BEFORE_TEST(DotTest);
 HWY_EXPORT_AND_TEST_P(DotTest, TestAllDot);
 HWY_EXPORT_AND_TEST_P(DotTest, TestAllDotF32BF16);
 HWY_EXPORT_AND_TEST_P(DotTest, TestAllDotBF16);
+HWY_EXPORT_AND_TEST_P(DotTest, TestAllDotI16);
 HWY_AFTER_TEST();
 }  // namespace
 }  // namespace hwy

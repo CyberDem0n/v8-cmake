@@ -219,8 +219,52 @@ struct FloatMatcher final : public ValueMatcher<T, kOpcode> {
 };
 
 using Float32Matcher = FloatMatcher<float, IrOpcode::kFloat32Constant>;
-using Float64Matcher = FloatMatcher<double, IrOpcode::kFloat64Constant>;
 using NumberMatcher = FloatMatcher<double, IrOpcode::kNumberConstant>;
+
+// A pattern matcher for floating point constants.
+template <typename T, IrOpcode::Value kOpcode>
+struct BoxedFloatMatcher final : public ValueMatcher<T, kOpcode> {
+  explicit BoxedFloatMatcher(Node* node) : ValueMatcher<T, kOpcode>(node) {}
+
+  double ScalarValue() const { return this->ResolvedValue().get_scalar(); }
+
+  bool Is(const double& value) const {
+    // Compare double with ScalarValue so that we get IEEE comparison semantics.
+    return this->HasResolvedValue() && this->ScalarValue() == value;
+  }
+  bool IsInRange(const T& low, const T& high) const {
+    return this->HasResolvedValue() && low <= this->ResolvedValue() &&
+           this->ResolvedValue() <= high;
+  }
+  bool IsMinusZero() const {
+    return this->Is(0.0) && std::signbit(this->ScalarValue());
+  }
+  bool IsNegative() const {
+    return this->HasResolvedValue() && this->ScalarValue() < 0.0;
+  }
+  bool IsNaN() const {
+    return this->HasResolvedValue() && this->ResolvedValue().is_nan();
+  }
+  bool IsZero() const {
+    return this->Is(0.0) && !std::signbit(this->ScalarValue());
+  }
+  bool IsNormal() const {
+    return this->HasResolvedValue() && std::isnormal(this->ScalarValue());
+  }
+  bool IsInteger() const {
+    return this->HasResolvedValue() &&
+           std::nearbyint(this->ScalarValue()) == this->ScalarValue();
+  }
+  bool IsPositiveOrNegativePowerOf2() const {
+    if (!this->HasResolvedValue() || (this->ScalarValue() == 0.0)) {
+      return false;
+    }
+    base::Double value = base::Double(this->ResolvedValue().get_bits());
+    return !value.IsInfinite() && base::bits::IsPowerOfTwo(value.Significand());
+  }
+};
+
+using Float64Matcher = BoxedFloatMatcher<Float64, IrOpcode::kFloat64Constant>;
 
 // A pattern matcher for heap object constants.
 template <IrOpcode::Value kHeapConstantOpcode>
@@ -750,7 +794,7 @@ struct BaseWithIndexAndDisplacementMatcher {
       switch (from->opcode()) {
         case IrOpcode::kLoad:
         case IrOpcode::kLoadImmutable:
-        case IrOpcode::kProtectedLoad:
+        case IrOpcode::kTrappingLoad:
         case IrOpcode::kLoadTrapOnNull:
         case IrOpcode::kInt32Add:
         case IrOpcode::kInt64Add:
@@ -758,16 +802,18 @@ struct BaseWithIndexAndDisplacementMatcher {
           break;
         case IrOpcode::kInt32Sub:
           // If the subtrahend is not a constant, it is not an addressing use.
-          if (from->InputAt(1)->opcode() != IrOpcode::kInt32Constant)
+          if (from->InputAt(1)->opcode() != IrOpcode::kInt32Constant) {
             return false;
+          }
           break;
         case IrOpcode::kInt64Sub:
           // If the subtrahend is not a constant, it is not an addressing use.
-          if (from->InputAt(1)->opcode() != IrOpcode::kInt64Constant)
+          if (from->InputAt(1)->opcode() != IrOpcode::kInt64Constant) {
             return false;
+          }
           break;
         case IrOpcode::kStore:
-        case IrOpcode::kProtectedStore:
+        case IrOpcode::kTrappingStore:
         case IrOpcode::kStoreTrapOnNull:
           // If the stored value is this node, it is not an addressing use.
           if (from->InputAt(2) == node) return false;

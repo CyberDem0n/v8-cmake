@@ -83,12 +83,19 @@ class TrustedCage : public AllStatic {
   static V8_EXPORT_PRIVATE Address base_non_inlined();
   static V8_EXPORT_PRIVATE void set_base_non_inlined(Address base);
 
+#ifdef V8_COMPRESS_POINTERS_IN_SHARED_CAGE
   static V8_EXPORT_PRIVATE uintptr_t base_ V8_CONSTINIT;
+#else
+  static thread_local uintptr_t base_ V8_CONSTINIT;
+#endif  // V8_COMPRESS_POINTERS_IN_SHARED_CAGE
 };
 using TrustedSpaceCompressionScheme = V8HeapCompressionSchemeImpl<TrustedCage>;
 #else
-// The trusted cage does not exist in this case.
-using TrustedSpaceCompressionScheme = V8HeapCompressionScheme;
+// The trusted cage does not exist in this case, so trusted compression uses
+// the main-cage encoding. Keep this as a distinct type (not a `using`-alias)
+// so that `is_same_v<..., TrustedSpaceCompressionScheme>` behaves identically
+// regardless of the sandbox flag.
+struct TrustedSpaceCompressionScheme : V8HeapCompressionScheme {};
 #endif  // V8_ENABLE_SANDBOX
 
 // A compression scheme which can be passed if the only objects we ever expect
@@ -248,6 +255,7 @@ class V8_NODISCARD PtrComprCageAccessScope final {
 #endif  // V8_EXTERNAL_CODE_SPACE
   IsolateGroup* saved_current_isolate_group_;
 #ifdef V8_ENABLE_SANDBOX
+  const Address saved_trusted_cage_base_;
   Sandbox* saved_current_sandbox_;
 #endif  // V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
 };

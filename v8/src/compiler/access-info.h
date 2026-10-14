@@ -34,6 +34,9 @@ class ElementAccessInfo final {
  public:
   ElementAccessInfo(ZoneVector<MapRef>&& lookup_start_object_maps,
                     ElementsKind elements_kind, Zone* zone);
+  // For Proxy-on-Prototype mode.
+  ElementAccessInfo(MapRef map, ObjectRef accessor, ObjectRef target,
+                    bool string_keys, Zone* zone);
 
   ElementsKind elements_kind() const { return elements_kind_; }
   ZoneVector<MapRef> const& lookup_start_object_maps() const {
@@ -48,10 +51,29 @@ class ElementAccessInfo final {
     transition_sources_.push_back(map);
   }
 
+  // Indicates whether this {ElementAccessInfo} is for the standard case
+  // where elements are directly on the receiver, or the special case where
+  // Proxy traps found on the prototype chain are handling the access.
+  bool is_proxy_on_prototype() const {
+    // Either both of {accessor_} and {target_} must be present, or neither.
+    DCHECK_EQ(accessor_.has_value(), target_.has_value());
+    DCHECK_IMPLIES(!accessor_.has_value(), !string_keys_);
+    return accessor_.has_value();
+  }
+
+  // Only for Proxy-on-Prototype mode: records whether the Proxy trap expects
+  // string keys or integer keys.
+  bool string_keys() const { return string_keys_; }
+  OptionalObjectRef accessor() const { return accessor_; }
+  OptionalObjectRef target() const { return target_; }
+
  private:
   ElementsKind elements_kind_;
+  bool string_keys_{false};
   ZoneVector<MapRef> lookup_start_object_maps_;
   ZoneVector<MapRef> transition_sources_;
+  OptionalObjectRef accessor_;
+  OptionalObjectRef target_;
 };
 
 // This class encapsulates all information required to access a certain
@@ -63,6 +85,7 @@ class PropertyAccessInfo final {
     kNotFound,
     kDataField,
     kFastDataConstant,
+    kDictionaryDataField,
     kDictionaryProtoDataConstant,
     kFastAccessorConstant,
     kDictionaryProtoAccessorConstant,
@@ -90,12 +113,17 @@ class PropertyAccessInfo final {
       Zone* zone, MapRef receiver_map, OptionalJSObjectRef holder,
       OptionalObjectRef constant, OptionalJSObjectRef api_holder);
   static PropertyAccessInfo ModuleExport(Zone* zone, MapRef receiver_map,
-                                         CellRef cell);
+                                         CellRef cell,
+                                         OptionalJSObjectRef holder);
   static PropertyAccessInfo StringLength(Zone* zone, MapRef receiver_map);
   static PropertyAccessInfo StringWrapperLength(Zone* zone,
                                                 MapRef receiver_map);
   static PropertyAccessInfo TypedArrayLength(Zone* zone, MapRef receiver_map);
   static PropertyAccessInfo Invalid(Zone* zone);
+  static PropertyAccessInfo DictionaryDataField(Zone* zone, MapRef receiver_map,
+                                                OptionalJSObjectRef holder,
+                                                InternalIndex dict_index,
+                                                NameRef name);
   static PropertyAccessInfo DictionaryProtoDataConstant(
       Zone* zone, MapRef receiver_map, JSObjectRef holder,
       InternalIndex dict_index, NameRef name);
@@ -119,6 +147,7 @@ class PropertyAccessInfo final {
   bool IsStringLength() const { return kind() == kStringLength; }
   bool IsStringWrapperLength() const { return kind() == kStringWrapperLength; }
   bool IsTypedArrayLength() const { return kind() == kTypedArrayLength; }
+  bool IsDictionaryDataField() const { return kind() == kDictionaryDataField; }
   bool IsDictionaryProtoDataConstant() const {
     return kind() == kDictionaryProtoDataConstant;
   }
@@ -128,7 +157,8 @@ class PropertyAccessInfo final {
 
   bool HasTransitionMap() const { return transition_map().has_value(); }
   bool HasDictionaryHolder() const {
-    return kind_ == kDictionaryProtoDataConstant ||
+    return kind_ == kDictionaryDataField ||
+           kind_ == kDictionaryProtoDataConstant ||
            kind_ == kDictionaryProtoAccessorConstant;
   }
   ConstFieldInfo GetConstFieldInfo() const;
@@ -241,8 +271,9 @@ class AccessInfoFactory final {
       ElementAccessFeedback const& feedback,
       ZoneVector<ElementAccessInfo>* access_infos) const;
 
-  PropertyAccessInfo ComputePropertyAccessInfo(MapRef map, NameRef name,
-                                               AccessMode access_mode) const;
+  PropertyAccessInfo ComputePropertyAccessInfo(
+      MapRef map, NameRef name, AccessMode access_mode,
+      OptionalObjectRef handler = OptionalObjectRef()) const;
 
   PropertyAccessInfo ComputeDictionaryProtoAccessInfo(
       MapRef receiver_map, NameRef name, JSObjectRef holder,
@@ -264,6 +295,8 @@ class AccessInfoFactory final {
       ZoneVector<PropertyAccessInfo> infos, AccessMode access_mode) const;
 
  private:
+  enum class KeyType { kString, kIndex };
+
   std::optional<ElementAccessInfo> ConsolidateElementLoad(
       ElementAccessFeedback const& feedback) const;
   PropertyAccessInfo LookupSpecialFieldAccessor(MapRef map, NameRef name) const;
@@ -281,6 +314,8 @@ class AccessInfoFactory final {
   PropertyAccessInfo ComputeAccessorDescriptorAccessInfo(
       MapRef receiver_map, NameRef name, MapRef map, OptionalJSObjectRef holder,
       InternalIndex descriptor, AccessMode access_mode) const;
+  PropertyAccessInfo ComputeDictionaryDataFieldAccessInfo(
+      MapRef map, NameRef name, OptionalObjectRef handler) const;
 
   PropertyAccessInfo Invalid() const {
     return PropertyAccessInfo::Invalid(zone());
@@ -293,6 +328,10 @@ class AccessInfoFactory final {
   bool TryLoadPropertyDetails(MapRef map, OptionalJSObjectRef maybe_holder,
                               NameRef name, InternalIndex* index_out,
                               PropertyDetails* details_out) const;
+
+  bool ObjectMayHaveElements(JSObjectRef obj, MapRef map) const;
+  bool ObjectMayHaveOwnProperties(JSObjectRef obj, MapRef map) const;
+  bool ObjectIsSuitableProxyTarget(KeyType key_type, JSObjectRef obj) const;
 
   CompilationDependencies* dependencies() const;
   JSHeapBroker* broker() const { return broker_; }

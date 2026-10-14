@@ -51,7 +51,8 @@ void V8SerializationDuplicateTracker::SetKnownSerializedValue(
   m_v8ObjectToSerializedDictionary =
       m_v8ObjectToSerializedDictionary
           ->Set(m_context, v8Value,
-                v8::External::New(v8::Isolate::GetCurrent(), serializedValue))
+                v8::External::New(v8::Isolate::GetCurrent(), serializedValue,
+                                  v8::kDictionaryValueTag))
           .ToLocalChecked();
 }
 
@@ -66,7 +67,7 @@ V8SerializationDuplicateTracker::FindKnownSerializedValue(
   }
 
   return static_cast<protocol::DictionaryValue*>(
-      knownValue.As<v8::External>()->Value());
+      knownValue.As<v8::External>()->Value(v8::kDictionaryValueTag));
 }
 
 V8SerializationDuplicateTracker::V8SerializationDuplicateTracker(

@@ -4,7 +4,7 @@
 
 #include "src/wasm/wasm-opcodes-inl.h"
 #include "test/cctest/cctest.h"
-#include "test/cctest/wasm/wasm-run-utils.h"
+#include "test/cctest/wasm/wasm-runner.h"
 #include "test/common/wasm/test-signatures.h"
 #include "test/common/wasm/wasm-macro-gen.h"
 #include "test/common/wasm/wasm-module-runner.h"
@@ -15,8 +15,8 @@ template <typename ReturnType, typename... ParamTypes>
 class Memory64Runner : public WasmRunner<ReturnType, ParamTypes...> {
  public:
   explicit Memory64Runner(TestExecutionTier execution_tier)
-      : WasmRunner<ReturnType, ParamTypes...>(execution_tier, kWasmOrigin,
-                                              nullptr, "main") {}
+      : WasmRunner<ReturnType, ParamTypes...>(execution_tier, nullptr, "main") {
+  }
 
   template <typename T>
   T* AddMemoryElems(uint32_t count) {
@@ -24,7 +24,7 @@ class Memory64Runner : public WasmRunner<ReturnType, ParamTypes...> {
   }
 
   uint8_t* AddMemory(uint32_t size, size_t max_size,
-                     SharedFlag shared = SharedFlag::kNotShared) {
+                     SharedFlag shared = SharedFlag{false}) {
     return this->builder().AddMemory(size, shared, AddressType::kI64, max_size);
   }
 };

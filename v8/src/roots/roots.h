@@ -32,6 +32,7 @@ class RootVisitor;
 #define STRONG_READ_ONLY_HEAP_NUMBER_ROOT_LIST(V)         \
   /* Special numbers */                                   \
   V(HeapNumber, nan_value, NanValue)                      \
+  V(HeapNumber, undefined_nan_value, UndefinedNanValue)   \
   V(HeapNumber, hole_nan_value, HoleNanValue)             \
   V(HeapNumber, infinity_value, InfinityValue)            \
   V(HeapNumber, minus_zero_value, MinusZeroValue)         \
@@ -43,7 +44,8 @@ class RootVisitor;
 
 // Adapts one INTERNALIZED_STRING_LIST_GENERATOR entry to
 // the ROOT_LIST-compatible entry
-#define INTERNALIZED_STRING_LIST_ADAPTER(V, name, ...) V(String, name, name)
+#define INTERNALIZED_STRING_LIST_ADAPTER(V, name, ...) \
+  V(InternalizedString, name, name)
 
 // Produces (String, name, CamelCase) entries
 #define EXTRA_IMPORTANT_INTERNALIZED_STRING_ROOT_LIST(V) \
@@ -55,17 +57,12 @@ class RootVisitor;
   /* Cluster the most popular ones in a few cache lines here at the top.    */ \
   /* The first 32 entries are most often used in the startup snapshot and   */ \
   /* can use a shorter representation in the serialization format.          */ \
-  V(Map, free_space_map, FreeSpaceMap)                                         \
-  V(Map, one_pointer_filler_map, OnePointerFillerMap)                          \
-  V(Map, two_pointer_filler_map, TwoPointerFillerMap)                          \
-  V(Hole, uninitialized_value, UninitializedValue)                             \
   V(Undefined, undefined_value, UndefinedValue)                                \
-  V(Hole, the_hole_value, TheHoleValue)                                        \
+  V(TheHole, the_hole_value, TheHoleValue)                                     \
   V(Null, null_value, NullValue)                                               \
   V(True, true_value, TrueValue)                                               \
   V(False, false_value, FalseValue)                                            \
   EXTRA_IMPORTANT_INTERNALIZED_STRING_ROOT_LIST(V)                             \
-  V(Map, meta_map, MetaMap)                                                    \
   V(Map, byte_array_map, ByteArrayMap)                                         \
   V(Map, fixed_array_map, FixedArrayMap)                                       \
   V(Map, fixed_cow_array_map, FixedCOWArrayMap)                                \
@@ -74,66 +71,80 @@ class RootVisitor;
   V(Map, symbol_map, SymbolMap)                                                \
   V(Map, seq_one_byte_string_map, SeqOneByteStringMap)                         \
   V(Map, internalized_one_byte_string_map, InternalizedOneByteStringMap)       \
-  V(Map, scope_info_map, ScopeInfoMap)                                         \
   V(Map, shared_function_info_map, SharedFunctionInfoMap)                      \
-  V(Map, instruction_stream_map, InstructionStreamMap)                         \
   V(Map, cell_map, CellMap)                                                    \
   V(Map, global_property_cell_map, GlobalPropertyCellMap)                      \
-  V(Map, foreign_map, ForeignMap)                                              \
   V(Map, heap_number_map, HeapNumberMap)                                       \
   V(Map, transition_array_map, TransitionArrayMap)                             \
-  /* TODO(mythria): Once lazy feedback lands, check if feedback vector map */  \
-  /* is still a popular map */                                                 \
-  V(Map, feedback_vector_map, FeedbackVectorMap)                               \
+  V(Map, property_array_map, PropertyArrayMap)                                 \
+  V(Map, weak_fixed_array_map, WeakFixedArrayMap)                              \
+  V(EnumCache, empty_enum_cache, EmptyEnumCache)                               \
   V(ScopeInfo, empty_scope_info, EmptyScopeInfo)                               \
+  V(PropertyArray, empty_property_array, EmptyPropertyArray)                   \
   V(FixedArray, empty_fixed_array, EmptyFixedArray)                            \
   V(DescriptorArray, empty_descriptor_array, EmptyDescriptorArray)             \
+  V(WeakArrayList, empty_weak_array_list, EmptyWeakArrayList)                  \
+  V(Cell, invalid_prototype_validity_cell, InvalidPrototypeValidityCell)       \
+  V(FeedbackCell, many_closures_cell, ManyClosuresCell)                        \
   /* Entries beyond the first 32                                            */ \
   /* Holes */                                                                  \
-  V(Hole, arguments_marker, ArgumentsMarker)                                   \
-  V(Hole, exception, Exception)                                                \
-  V(Hole, termination_exception, TerminationException)                         \
-  V(Hole, optimized_out, OptimizedOut)                                         \
-  V(Hole, stale_register, StaleRegister)                                       \
-  V(Hole, property_cell_hole_value, PropertyCellHoleValue)                     \
-  V(Hole, hash_table_hole_value, HashTableHoleValue)                           \
-  V(Hole, promise_hole_value, PromiseHoleValue)                                \
+  V(ArgumentsMarker, arguments_marker, ArgumentsMarker)                        \
+  V(ExceptionHole, exception, Exception)                                       \
+  V(HashTableHole, hash_table_hole_value, HashTableHoleValue)                  \
+  V(OptimizedOut, optimized_out, OptimizedOut)                                 \
+  V(PromiseHole, promise_hole_value, PromiseHoleValue)                         \
+  V(PropertyCellHole, property_cell_hole_value, PropertyCellHoleValue)         \
+  V(StaleRegister, stale_register, StaleRegister)                              \
+  V(TerminationException, termination_exception, TerminationException)         \
+  V(UninitializedHole, uninitialized_value, UninitializedValue)                \
   /* Maps */                                                                   \
-  V(Map, script_context_table_map, ScriptContextTableMap)                      \
-  V(Map, closure_feedback_cell_array_map, ClosureFeedbackCellArrayMap)         \
-  V(Map, feedback_metadata_map, FeedbackMetadataArrayMap)                      \
+  V(Map, meta_map, MetaMap)                                                    \
+  V(Map, weak_homomorphic_fixed_array_map, WeakHomomorphicFixedArrayMap)       \
+  V(Map, free_space_map, FreeSpaceMap)                                         \
+  V(Map, one_pointer_filler_map, OnePointerFillerMap)                          \
+  V(Map, two_pointer_filler_map, TwoPointerFillerMap)                          \
+  V(Map, accessor_info_map, AccessorInfoMap)                                   \
   V(Map, array_list_map, ArrayListMap)                                         \
+  V(Map, atom_regexp_data_map, AtomRegExpDataMap)                              \
   V(Map, bigint_map, BigIntMap)                                                \
-  V(Map, object_boilerplate_description_map, ObjectBoilerplateDescriptionMap)  \
   V(Map, bytecode_array_map, BytecodeArrayMap)                                 \
+  V(Map, closure_feedback_cell_array_map, ClosureFeedbackCellArrayMap)         \
   V(Map, code_map, CodeMap)                                                    \
+  V(Map, context_cell_map, ContextCellMap)                                     \
   V(Map, coverage_info_map, CoverageInfoMap)                                   \
   V(Map, dictionary_template_info_map, DictionaryTemplateInfoMap)              \
+  V(Map, double_string_cache_map, DoubleStringCacheMap)                        \
+  V(Map, feedback_metadata_map, FeedbackMetadataArrayMap)                      \
+  V(Map, feedback_vector_map, FeedbackVectorMap)                               \
+  V(Map, foreign_map, ForeignMap)                                              \
+  V(Map, hash_seed_wrapper_map, HashSeedWrapperMap)                            \
+  V(Map, function_template_info_map, FunctionTemplateInfoMap)                  \
   V(Map, global_dictionary_map, GlobalDictionaryMap)                           \
-  V(Map, context_cell_map, ContextCellMap)                                     \
+  V(Map, instruction_stream_map, InstructionStreamMap)                         \
+  V(Map, interceptor_info_map, InterceptorInfoMap)                             \
+  V(Map, ir_regexp_data_map, IrRegExpDataMap)                                  \
   V(Map, many_closures_cell_map, ManyClosuresCellMap)                          \
   V(Map, mega_dom_handler_map, MegaDomHandlerMap)                              \
   V(Map, module_info_map, ModuleInfoMap)                                       \
   V(Map, name_dictionary_map, NameDictionaryMap)                               \
+  V(Map, name_to_index_hash_table_map, NameToIndexHashTableMap)                \
   V(Map, no_closures_cell_map, NoClosuresCellMap)                              \
   V(Map, number_dictionary_map, NumberDictionaryMap)                           \
+  V(Map, object_boilerplate_description_map, ObjectBoilerplateDescriptionMap)  \
+  V(Map, object_template_info_map, ObjectTemplateInfoMap)                      \
   V(Map, one_closure_cell_map, OneClosureCellMap)                              \
   V(Map, ordered_hash_map_map, OrderedHashMapMap)                              \
   V(Map, ordered_hash_set_map, OrderedHashSetMap)                              \
-  V(Map, name_to_index_hash_table_map, NameToIndexHashTableMap)                \
-  V(Map, registered_symbol_table_map, RegisteredSymbolTableMap)                \
   V(Map, ordered_name_dictionary_map, OrderedNameDictionaryMap)                \
   V(Map, preparse_data_map, PreparseDataMap)                                   \
-  V(Map, property_array_map, PropertyArrayMap)                                 \
-  V(Map, accessor_info_map, AccessorInfoMap)                                   \
-  V(Map, interceptor_info_map, InterceptorInfoMap)                             \
-  V(Map, regexp_match_info_map, RegExpMatchInfoMap)                            \
   V(Map, regexp_data_map, RegExpDataMap)                                       \
-  V(Map, atom_regexp_data_map, AtomRegExpDataMap)                              \
-  V(Map, ir_regexp_data_map, IrRegExpDataMap)                                  \
-  V(Map, double_string_cache_map, DoubleStringCacheMap)                        \
-  V(Map, simple_number_dictionary_map, SimpleNumberDictionaryMap)              \
+  V(Map, regexp_match_info_map, RegExpMatchInfoMap)                            \
+  V(Map, registered_symbol_table_map, RegisteredSymbolTableMap)                \
+  V(Map, scope_info_map, ScopeInfoMap)                                         \
+  V(Map, script_context_table_map, ScriptContextTableMap)                      \
+  V(Map, sloppy_arguments_elements_map, SloppyArgumentsElementsMap)            \
   V(Map, simple_name_dictionary_map, SimpleNameDictionaryMap)                  \
+  V(Map, simple_number_dictionary_map, SimpleNumberDictionaryMap)              \
   V(Map, small_ordered_hash_map_map, SmallOrderedHashMapMap)                   \
   V(Map, small_ordered_hash_set_map, SmallOrderedHashSetMap)                   \
   V(Map, small_ordered_name_dictionary_map, SmallOrderedNameDictionaryMap)     \
@@ -143,18 +154,19 @@ class RootVisitor;
   IF_WASM(V, Map, wasm_import_data_map, WasmImportDataMap)                     \
   IF_WASM(V, Map, wasm_capi_function_data_map, WasmCapiFunctionDataMap)        \
   IF_WASM(V, Map, wasm_dispatch_table_map, WasmDispatchTableMap)               \
+  IF_WASM(V, Map, wasm_dispatch_table_for_imports_map,                         \
+          WasmDispatchTableForImportsMap)                                      \
   IF_WASM(V, Map, wasm_exported_function_data_map,                             \
           WasmExportedFunctionDataMap)                                         \
   IF_WASM(V, Map, wasm_internal_function_map, WasmInternalFunctionMap)         \
   IF_WASM(V, Map, wasm_func_ref_map, WasmFuncRefMap)                           \
-  IF_WASM(V, Map, wasm_js_function_data_map, WasmJSFunctionDataMap)            \
   IF_WASM(V, Map, wasm_null_map, WasmNullMap)                                  \
   IF_WASM(V, Map, wasm_resume_data_map, WasmResumeDataMap)                     \
   IF_WASM(V, Map, wasm_suspender_object_map, WasmSuspenderObjectMap)           \
   IF_WASM(V, Map, wasm_continuation_object_map, WasmContinuationObjectMap)     \
+  IF_WASM(V, Map, wasm_stack_object_map, WasmStackObjectMap)                   \
   IF_WASM(V, Map, wasm_trusted_instance_data_map, WasmTrustedInstanceDataMap)  \
   IF_WASM(V, Map, wasm_type_info_map, WasmTypeInfoMap)                         \
-  V(Map, weak_fixed_array_map, WeakFixedArrayMap)                              \
   V(Map, weak_array_list_map, WeakArrayListMap)                                \
   V(Map, ephemeron_hash_table_map, EphemeronHashTableMap)                      \
   V(Map, embedder_data_array_map, EmbedderDataArrayMap)                        \
@@ -165,8 +177,17 @@ class RootVisitor;
   V(Map, protected_fixed_array_map, ProtectedFixedArrayMap)                    \
   V(Map, protected_weak_fixed_array_map, ProtectedWeakFixedArrayMap)           \
   V(Map, interpreter_data_map, InterpreterDataMap)                             \
+  V(Map, debug_info_map, DebugInfoMap)                                         \
   V(Map, shared_function_info_wrapper_map, SharedFunctionInfoWrapperMap)       \
   V(Map, trusted_foreign_map, TrustedForeignMap)                               \
+  V(Map, uncompiled_data_without_preparse_data_map,                            \
+    UncompiledDataWithoutPreparseDataMap)                                      \
+  V(Map, uncompiled_data_with_preparse_data_map,                               \
+    UncompiledDataWithPreparseDataMap)                                         \
+  V(Map, uncompiled_data_without_preparse_data_with_job_map,                   \
+    UncompiledDataWithoutPreparseDataWithJobMap)                               \
+  V(Map, uncompiled_data_with_preparse_data_and_job_map,                       \
+    UncompiledDataWithPreparseDataAndJobMap)                                   \
   /* String maps */                                                            \
   V(Map, seq_two_byte_string_map, SeqTwoByteStringMap)                         \
   V(Map, cons_two_byte_string_map, ConsTwoByteStringMap)                       \
@@ -207,9 +228,25 @@ class RootVisitor;
   V(Map, js_shared_array_map, JSSharedArrayMap)                                \
   V(Map, js_atomics_mutex_map, JSAtomicsMutexMap)                              \
   V(Map, js_atomics_condition_map, JSAtomicsConditionMap)                      \
+  V(Map, descriptor_array_map, DescriptorArrayMap)                             \
+  V(Map, on_heap_basic_block_profiler_data_map,                                \
+    OnHeapBasicBlockProfilerDataMap)                                           \
+  V(Map, turbofan_bitset_type_map, TurbofanBitsetTypeMap)                      \
+  V(Map, turbofan_union_type_map, TurbofanUnionTypeMap)                        \
+  V(Map, turbofan_range_type_map, TurbofanRangeTypeMap)                        \
+  V(Map, turbofan_heap_constant_type_map, TurbofanHeapConstantTypeMap)         \
+  V(Map, turbofan_other_number_constant_type_map,                              \
+    TurbofanOtherNumberConstantTypeMap)                                        \
+  V(Map, turboshaft_word32range_type_map, TurboshaftWord32RangeTypeMap)        \
+  V(Map, turboshaft_word32set_type_map, TurboshaftWord32SetTypeMap)            \
+  V(Map, turboshaft_word64range_type_map, TurboshaftWord64RangeTypeMap)        \
+  V(Map, turboshaft_word64set_type_map, TurboshaftWord64SetTypeMap)            \
+  V(Map, turboshaft_float64range_type_map, TurboshaftFloat64RangeTypeMap)      \
+  V(Map, turboshaft_float64set_type_map, TurboshaftFloat64SetTypeMap)          \
+  V(Map, sort_state_map, SortStateMap)                                         \
+  IF_WASM(V, Map, wasm_fast_api_call_data_map, WasmFastApiCallDataMap)         \
+  IF_WASM(V, Map, wasm_string_view_iter_map, WasmStringViewIterMap)            \
   /* Canonical empty values */                                                 \
-  V(EnumCache, empty_enum_cache, EmptyEnumCache)                               \
-  V(PropertyArray, empty_property_array, EmptyPropertyArray)                   \
   V(ByteArray, empty_byte_array, EmptyByteArray)                               \
   V(ObjectBoilerplateDescription, empty_object_boilerplate_description,        \
     EmptyObjectBoilerplateDescription)                                         \
@@ -227,17 +264,17 @@ class RootVisitor;
     EmptyOrderedPropertyDictionary)                                            \
   V(SwissNameDictionary, empty_swiss_property_dictionary,                      \
     EmptySwissPropertyDictionary)                                              \
-  V(InterceptorInfo, noop_interceptor_info, NoOpInterceptorInfo)               \
+  V(InterceptorInfo, noop_named_interceptor_info, NoOpNamedInterceptorInfo)    \
+  V(InterceptorInfo, noop_indexed_interceptor_info,                            \
+    NoOpIndexedInterceptorInfo)                                                \
   V(ArrayList, empty_array_list, EmptyArrayList)                               \
   V(WeakFixedArray, empty_weak_fixed_array, EmptyWeakFixedArray)               \
-  V(WeakArrayList, empty_weak_array_list, EmptyWeakArrayList)                  \
-  V(Cell, invalid_prototype_validity_cell, InvalidPrototypeValidityCell)       \
-  V(FeedbackCell, many_closures_cell, ManyClosuresCell)                        \
   STRONG_READ_ONLY_HEAP_NUMBER_ROOT_LIST(V)                                    \
   /* Marker for self-references during code-generation */                      \
-  V(Hole, self_reference_marker, SelfReferenceMarker)                          \
+  V(SelfReferenceMarker, self_reference_marker, SelfReferenceMarker)           \
   /* Marker for basic-block usage counters array during code-generation */     \
-  V(Hole, basic_block_counters_marker, BasicBlockCountersMarker)               \
+  V(BasicBlockCountersMarker, basic_block_counters_marker,                     \
+    BasicBlockCountersMarker)                                                  \
   /* Canonical scope infos */                                                  \
   V(ScopeInfo, global_this_binding_scope_info, GlobalThisBindingScopeInfo)     \
   V(ScopeInfo, empty_function_scope_info, EmptyFunctionScopeInfo)              \
@@ -246,10 +283,9 @@ class RootVisitor;
   V(RegisteredSymbolTable, empty_symbol_table, EmptySymbolTable)               \
   V(ContextCell, undefined_context_cell, UndefinedContextCell)                 \
   /* Hash seed */                                                              \
-  V(ByteArray, hash_seed, HashSeed)                                            \
+  V(HashSeedWrapper, hash_seed, HashSeed)                                      \
   V(FixedArray, preallocated_number_string_table,                              \
     PreallocatedNumberStringTable)                                             \
-  IF_WASM(V, HeapObject, wasm_null_padding, WasmNullPadding)                   \
   IF_WASM(V, WasmNull, wasm_null, WasmNull)
 
 // TODO(saelo): ideally, these would be read-only roots (and then become part
@@ -264,7 +300,9 @@ class RootVisitor;
   V(ProtectedFixedArray, empty_protected_fixed_array,                     \
     EmptyProtectedFixedArray)                                             \
   V(ProtectedWeakFixedArray, empty_protected_weak_fixed_array,            \
-    EmptyProtectedWeakFixedArray)
+    EmptyProtectedWeakFixedArray)                                         \
+  IF_WASM(V, WasmDispatchTable, empty_wasm_dispatch_table,                \
+          EmptyWasmDispatchTable)
 
 #define BUILTINS_WITH_SFI_LIST_GENERATOR(APPLY, V)                             \
   APPLY(V, ProxyRevoke, proxy_revoke)                                          \
@@ -329,7 +367,6 @@ class RootVisitor;
   /* Canonical empty values */                                                 \
   V(Script, empty_script, EmptyScript)                                         \
   /* Protectors */                                                             \
-  V(PropertyCell, array_constructor_protector, ArrayConstructorProtector)      \
   V(PropertyCell, no_elements_protector, NoElementsProtector)                  \
   V(PropertyCell, mega_dom_protector, MegaDOMProtector)                        \
   V(PropertyCell, no_profiling_protector, NoProfilingProtector)                \
@@ -346,6 +383,7 @@ class RootVisitor;
   V(PropertyCell, array_iterator_protector, ArrayIteratorProtector)            \
   V(PropertyCell, array_buffer_detaching_protector,                            \
     ArrayBufferDetachingProtector)                                             \
+  V(PropertyCell, array_buffer_mutable_protector, ArrayBufferMutableProtector) \
   V(PropertyCell, promise_hook_protector, PromiseHookProtector)                \
   V(PropertyCell, promise_resolve_protector, PromiseResolveProtector)          \
   V(PropertyCell, map_iterator_protector, MapIteratorProtector)                \
@@ -367,12 +405,6 @@ class RootVisitor;
     SourceTextModuleExecuteAsyncModuleFulfilledSFI)                            \
   V(SharedFunctionInfo, source_text_module_execute_async_module_rejected_sfi,  \
     SourceTextModuleExecuteAsyncModuleRejectedSFI)                             \
-  V(SharedFunctionInfo, atomics_mutex_async_unlock_resolve_handler_sfi,        \
-    AtomicsMutexAsyncUnlockResolveHandlerSFI)                                  \
-  V(SharedFunctionInfo, atomics_mutex_async_unlock_reject_handler_sfi,         \
-    AtomicsMutexAsyncUnlockRejectHandlerSFI)                                   \
-  V(SharedFunctionInfo, atomics_condition_acquire_lock_sfi,                    \
-    AtomicsConditionAcquireLockSFI)                                            \
   V(SharedFunctionInfo, async_disposable_stack_on_fulfilled_shared_fun,        \
     AsyncDisposableStackOnFulfilledSharedFun)                                  \
   V(SharedFunctionInfo, async_disposable_stack_on_rejected_shared_fun,         \
@@ -387,6 +419,11 @@ class RootVisitor;
   /* Caches */                                                              \
   V(SmiStringCache, smi_string_cache, SmiStringCache)                       \
   V(DoubleStringCache, double_string_cache, DoubleStringCache)              \
+  /* Allocated on first use, so it must be loaded rather than baked in. */  \
+  V(FixedArray, regexp_split_cache, RegExpSplitCache)                       \
+  /* undefined or BigInt. Caching divisors used for modulo divisions. */    \
+  V(Object, cached_bigint_divisor, CachedBigIntDivisor)                     \
+  V(Object, next_cached_bigint_divisor, NextCachedBigIntDivisor)            \
   /* Lists and dictionaries */                                              \
   V(RegisteredSymbolTable, public_symbol_table, PublicSymbolTable)          \
   V(RegisteredSymbolTable, api_symbol_table, ApiSymbolTable)                \
@@ -410,9 +447,11 @@ class RootVisitor;
   V(WeakArrayList, shared_wasm_memories, SharedWasmMemories)                \
   /* EphemeronHashTable for debug scopes (local debug evaluate) */          \
   V(HeapObject, locals_block_list_cache, DebugLocalsBlockListCache)         \
-  IF_WASM(V, HeapObject, active_suspender, ActiveSuspender)                 \
   IF_WASM(V, WeakFixedArray, js_to_wasm_wrappers, JSToWasmWrappers)         \
   IF_WASM(V, WeakFixedArray, wasm_canonical_rtts, WasmCanonicalRtts)        \
+  /* Only updated/used on the shared-space isolate */                       \
+  IF_WASM(V, WeakFixedArray, wasm_shared_canonical_rtts,                    \
+          WasmSharedCanonicalRtts)                                          \
   /* Internal SharedFunctionInfos */                                        \
   V(FunctionTemplateInfo, error_stack_getter_fun_template,                  \
     ErrorStackGetterSharedFun)                                              \
@@ -470,21 +509,21 @@ class RootVisitor;
 #define ACCESSOR_INFO_ROOT_LIST(V) \
   ACCESSOR_INFO_LIST_GENERATOR(ACCESSOR_INFO_ROOT_LIST_ADAPTER, V)
 
-#define READ_ONLY_ROOT_LIST(V)                   \
-  STRONG_READ_ONLY_ROOT_LIST(V)                  \
-  INTERNALIZED_STRING_ROOT_LIST(V)               \
-  PRIVATE_SYMBOL_ROOT_LIST(V)                    \
-  PUBLIC_SYMBOL_ROOT_LIST(V)                     \
-  WELL_KNOWN_SYMBOL_ROOT_LIST(V)                 \
-  STRUCT_MAPS_LIST(V)                            \
-  TORQUE_DEFINED_MAP_ROOT_LIST(V)                \
-  ALLOCATION_SITE_MAPS_LIST(V)                   \
-  NAME_FOR_PROTECTOR_ROOT_LIST(V)                \
-  DATA_HANDLER_MAPS_LIST(V)                      \
-  /* Maps */                                     \
-  V(Map, external_map, ExternalMap)              \
-  V(Map, message_object_map, JSMessageObjectMap) \
-  V(Map, cpp_heap_external_map, CppHeapExternalMap)
+#define READ_ONLY_ROOT_LIST(V)                      \
+  STRONG_READ_ONLY_ROOT_LIST(V)                     \
+  INTERNALIZED_STRING_ROOT_LIST(V)                  \
+  PRIVATE_SYMBOL_ROOT_LIST(V)                       \
+  PUBLIC_SYMBOL_ROOT_LIST(V)                        \
+  WELL_KNOWN_SYMBOL_ROOT_LIST(V)                    \
+  STRUCT_MAPS_LIST(V)                               \
+  ALLOCATION_SITE_MAPS_LIST(V)                      \
+  NAME_FOR_PROTECTOR_ROOT_LIST(V)                   \
+  DATA_HANDLER_MAPS_LIST(V)                         \
+  /* Maps */                                        \
+  V(Map, external_map, ExternalMap)                 \
+  V(Map, message_object_map, JSMessageObjectMap)    \
+  V(Map, cpp_heap_external_map, CppHeapExternalMap) \
+  V(Map, cpp_gc_managed_base_map, CppGCManagedBaseMap)
 
 #define MUTABLE_ROOT_LIST(V)            \
   STRONG_MUTABLE_IMMOVABLE_ROOT_LIST(V) \
@@ -721,8 +760,13 @@ class RootsTable {
   friend class RootsSerializer;
 };
 
-inline ReadOnlyRoots GetReadOnlyRoots();
+#ifdef V8_STATIC_ROOTS
+#define V8_RO_CONST V8_CONST
+#else
+#define V8_RO_CONST
+#endif
 
+V8_RO_CONST inline ReadOnlyRoots GetReadOnlyRoots();
 class ReadOnlyRoots {
  public:
   static constexpr size_t kEntriesCount =
@@ -736,26 +780,26 @@ class ReadOnlyRoots {
   // map-word instead of a tagged heap pointer.
   MapWord one_pointer_filler_map_word();
 
-#define ROOT_ACCESSOR(Type, name, CamelName) \
-  V8_INLINE Tagged<Type> name() const;       \
-  V8_INLINE Tagged<Type> unchecked_##name() const;
+#define ROOT_ACCESSOR(Type, name, CamelName)       \
+  V8_RO_CONST V8_INLINE Tagged<Type> name() const; \
+  V8_RO_CONST V8_INLINE Tagged<Type> unchecked_##name() const;
 
   READ_ONLY_ROOT_LIST(ROOT_ACCESSOR)
 #undef ROOT_ACCESSOR
 
   V8_INLINE bool IsNameForProtector(Tagged<HeapObject> object) const;
-  V8_INLINE void VerifyNameForProtectorsPages() const;
+  void VerifyNameForProtectorsPages() const;
 #ifdef DEBUG
   void VerifyNameForProtectors();
   void VerifyTypes();
 #endif
 
-  V8_INLINE Tagged<Boolean> boolean_value(bool value) const;
+  V8_RO_CONST V8_INLINE Tagged<Boolean> boolean_value(bool value) const;
 
-  V8_INLINE Tagged<String> single_character_string(int code) const;
+  V8_RO_CONST V8_INLINE Tagged<String> single_character_string(int code) const;
 
-  V8_INLINE Address address_at(RootIndex root_index) const;
-  V8_INLINE Tagged<Object> object_at(RootIndex root_index) const;
+  V8_RO_CONST V8_INLINE Address address_at(RootIndex root_index) const;
+  V8_RO_CONST V8_INLINE Tagged<Object> object_at(RootIndex root_index) const;
 
   // Check if a slot is initialized yet. Should only be necessary for code
   // running during snapshot creation.
@@ -783,6 +827,13 @@ class ReadOnlyRoots {
   friend class DeserializerAllocator;
   friend class ReadOnlyHeapImageDeserializer;
   friend ReadOnlyRoots GetReadOnlyRoots();
+};
+
+// Subclass for RORoots loaded specifically early in the snapshot
+// deserializtion.
+class EarlyReadOnlyRoots : public ReadOnlyRoots {
+ public:
+  explicit EarlyReadOnlyRoots(ReadOnlyRoots roots) : ReadOnlyRoots(roots) {}
 };
 
 }  // namespace internal

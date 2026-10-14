@@ -15,8 +15,10 @@ namespace v8 {
 namespace internal {
 
 AllocationResult EvacuationAllocator::Allocate(AllocationSpace space,
-                                               int object_size,
+                                               SafeHeapObjectSize object_size,
                                                AllocationAlignment alignment) {
+  // TODO(425150995): We should have uint versions for allocation to avoid
+  // introducing OOBs via sign-extended ints along the way.
   DCHECK_IMPLIES(!shared_space_allocator_, space != SHARED_SPACE);
   object_size = ALIGN_TO_ALLOCATION_ALIGNMENT(object_size);
   switch (space) {

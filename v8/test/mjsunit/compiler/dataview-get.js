@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --allow-natives-syntax --turbofan --no-always-turbofan
+// Flags: --allow-natives-syntax --turbofan
 
 var buffer = new ArrayBuffer(64);
 var dataview = new DataView(buffer, 8, 24);
@@ -104,6 +104,12 @@ warmup(readUint16);
 assertOptimized(readUint16);
 assertEquals(0xabcd, readUint16(8));
 assertEquals(0xcdab, readUint16(8, true));
+dataview.setUint16(8, 0x1234);
+assertEquals(0x1234, readUint16(8));
+assertEquals(0x3412, readUint16(8, true));
+dataview.setUint16(8, 0x8000);
+assertEquals(0x8000, readUint16(8));
+assertEquals(0x0080, readUint16(8, true));
 
 // TurboFan valid getInt16.
 let b1 = -0x1234;

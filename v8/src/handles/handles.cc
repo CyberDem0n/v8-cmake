@@ -9,6 +9,7 @@
 #include "src/codegen/optimized-compilation-info.h"
 #include "src/execution/isolate.h"
 #include "src/execution/thread-id.h"
+#include "src/handles/handle-scope-implementer-inl.h"
 #include "src/handles/maybe-handles.h"
 #include "src/heap/base/stack.h"
 #include "src/heap/heap-layout-inl.h"
@@ -20,13 +21,6 @@
 #ifdef V8_ENABLE_MAGLEV
 #include "src/maglev/maglev-concurrent-dispatcher.h"
 #endif  // V8_ENABLE_MAGLEV
-
-#ifdef DEBUG
-// For GetIsolateFromWritableHeapObject.
-#include "src/heap/heap-write-barrier-inl.h"
-// For GetIsolateFromWritableObject.
-#include "src/execution/isolate-utils-inl.h"
-#endif
 
 #ifdef V8_ENABLE_DIRECT_HANDLE
 // For Isolate::Current() in indirect_handle.
@@ -102,7 +96,7 @@ bool HandleBase::IsDereferenceAllowed() const {
   // epilogue callbacks in the safepoint after a GC.
   if (AllowHandleUsageOnAllThreads::IsAllowed()) return true;
 
-  LocalHeap* local_heap = isolate->CurrentLocalHeap();
+  LocalHeap* local_heap = LocalHeap::Current();
 
   // Local heap can't access handles when parked
   if (!local_heap->IsHandleDereferenceAllowed()) {
@@ -145,7 +139,7 @@ bool DirectHandleBase::IsDereferenceAllowed() const {
   // epilogue callbacks in the safepoint after a GC.
   if (AllowHandleUsageOnAllThreads::IsAllowed()) return true;
 
-  LocalHeap* local_heap = isolate->CurrentLocalHeap();
+  LocalHeap* local_heap = LocalHeap::Current();
 
   // Local heap can't access handles when parked
   if (!local_heap->IsHandleDereferenceAllowed()) {
@@ -215,6 +209,12 @@ Address* HandleScope::Extend(Isolate* isolate) {
   }
 
   return result;
+}
+
+Address* HandleScope::ExtendAndCreateHandle(Isolate* isolate, Address value) {
+  Address* result = Extend(isolate);
+  HandleScopeData* data = isolate->handle_scope_data();
+  return CreateHandleUnchecked(data, result, value);
 }
 
 void HandleScope::DeleteExtensions(Isolate* isolate) {

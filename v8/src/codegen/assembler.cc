@@ -34,9 +34,12 @@
 
 #include "src/codegen/assembler.h"
 
+#include "absl/container/flat_hash_map.h"
+#include "src/base/macros.h"
 #ifdef V8_CODE_COMMENTS
 #include <iomanip>
 #endif
+
 #include "src/base/vector.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/deoptimizer/deoptimizer.h"
@@ -58,6 +61,7 @@ AssemblerOptions AssemblerOptions::Default(Isolate* isolate) {
   options.record_reloc_info_for_serialization = serializer;
   options.enable_root_relative_access =
       !serializer && !generating_embedded_builtin;
+  options.generating_embedded_builtin = generating_embedded_builtin;
 #ifdef USE_SIMULATOR
   // Even though the simulator is enabled, we may still need to generate code
   // that may need to run on both the simulator and real hardware. For example,
@@ -192,6 +196,25 @@ AssemblerBase::AssemblerBase(const AssemblerOptions& options,
 
 AssemblerBase::~AssemblerBase() = default;
 
+int AssemblerBase::ComputeNewBufferSize(BufferGrowthStrategy strategy) {
+  int old_size = buffer_size();
+  int64_t new_size_64;
+
+  if (strategy == BufferGrowthStrategy::kDouble) {
+    new_size_64 = 2LL * old_size;
+  } else {
+    DCHECK_EQ(strategy, BufferGrowthStrategy::kDoubleCapped1MB);
+    new_size_64 = std::min<int64_t>(2LL * old_size,
+                                    static_cast<int64_t>(old_size) + 1 * MB);
+  }
+
+  if (new_size_64 > kMaximalBufferSize) {
+    V8::FatalProcessOutOfMemory(nullptr, "Assembler::GrowBuffer");
+  }
+  DCHECK_LE(new_size_64, kMaxInt);
+  return static_cast<int>(new_size_64);
+}
+
 void AssemblerBase::Print(Isolate* isolate) {
   StdoutStream os;
   v8::internal::Disassembler::Decode(isolate, os, buffer_start_, pc_);
@@ -215,11 +238,12 @@ CpuFeatureScope::~CpuFeatureScope() {
 #endif
 
 bool CpuFeatures::initialized_ = false;
-bool CpuFeatures::supports_wasm_simd_128_ = false;
+bool CpuFeatures::supports_simd_128_ = false;
 bool CpuFeatures::supports_cetss_ = false;
-unsigned CpuFeatures::supported_ = 0;
+CpuFeatureSet CpuFeatures::supported_ = {};
 unsigned CpuFeatures::icache_line_size_ = 0;
 unsigned CpuFeatures::dcache_line_size_ = 0;
+unsigned CpuFeatures::vlen_ = 0;
 
 HeapNumberRequest::HeapNumberRequest(double heap_number, int offset)
     : offset_(offset) {
@@ -232,9 +256,8 @@ HeapNumberRequest::HeapNumberRequest(double heap_number, int offset)
 void Assembler::RecordDeoptReason(DeoptimizeReason reason, uint32_t node_id,
                                   SourcePosition position, int id) {
   static_assert(RelocInfoWriter::kMaxSize * 2 <= kGap);
-  {
+  if (position.IsKnown()) {
     EnsureSpace space(this);
-    DCHECK(position.IsKnown());
     RecordRelocInfo(RelocInfo::DEOPT_SCRIPT_OFFSET, position.ScriptOffset());
     RecordRelocInfo(RelocInfo::DEOPT_INLINING_ID, position.InliningId());
   }
@@ -262,6 +285,40 @@ void Assembler::DataAlign(int m) {
 void AssemblerBase::RequestHeapNumber(HeapNumberRequest request) {
   request.set_offset(pc_offset());
   heap_number_requests_.push_front(request);
+}
+
+void AssemblerBase::AllocateAndInstallRequestedHeapNumbers(
+    LocalIsolate* isolate) {
+  DCHECK_IMPLIES(isolate == nullptr, heap_number_requests_.empty());
+
+  // {previous_requests} is a cache of HeapNumbers that have already been
+  // requested. It is keyed on uint64_t rather than doubles to avoid undefined
+  // behavior when NaN is used as a key (where the uint64_t are just bitcasts
+  // from the doubles).
+  absl::flat_hash_map<uint64_t, Handle<HeapNumber>> previous_requests;
+
+  for (HeapNumberRequest& request : heap_number_requests_) {
+    Handle<HeapNumber> object;
+
+    if (v8_flags.deduplicate_heap_number_requests) {
+      uint64_t cache_key = base::bit_cast<uint64_t>(request.heap_number());
+      auto it = previous_requests.find(cache_key);
+      if (it != previous_requests.end()) {
+        object = it->second;
+      } else {
+        object = isolate->factory()->NewHeapNumber<AllocationType::kOld>(
+            request.heap_number());
+        previous_requests.insert({cache_key, object});
+      }
+    } else {
+      object = isolate->factory()->NewHeapNumber<AllocationType::kOld>(
+          request.heap_number());
+    }
+
+    Address pc = reinterpret_cast<Address>(buffer_start_) + request.offset();
+
+    PatchInHeapNumberRequest(pc, object);
+  }
 }
 
 int AssemblerBase::AddCodeTarget(IndirectHandle<Code> target) {
@@ -303,10 +360,12 @@ IndirectHandle<HeapObject> AssemblerBase::GetEmbeddedObject(
   return embedded_objects_[index];
 }
 
+void AssemblerBase::RecordJSDispatchHandle(JSDispatchHandle handle,
+                                           uint16_t argument_count) {
+  js_dispatch_handles_.push_back({handle, argument_count});
+}
+
 int Assembler::WriteCodeComments() {
-  if (!v8_flags.code_comments) return 0;
-  CHECK_IMPLIES(code_comments_writer_.entry_count() > 0,
-                options().emit_code_comments);
   if (code_comments_writer_.entry_count() == 0) return 0;
   int offset = pc_offset();
   code_comments_writer_.Emit(this);
@@ -318,7 +377,7 @@ int Assembler::WriteCodeComments() {
 #ifdef V8_CODE_COMMENTS
 int Assembler::CodeComment::depth() const { return assembler_->comment_depth_; }
 void Assembler::CodeComment::Open(const std::string& comment,
-                                  const SourceLocation& loc) {
+                                  SourceLocation loc) {
   std::stringstream sstream;
   sstream << std::setfill(' ') << std::setw(depth() * kIndentWidth + 2);
   sstream << "[ " << comment;

@@ -9,6 +9,8 @@
 #include <optional>
 
 #include "src/base/bit-field.h"
+#include "src/base/macros.h"
+#include "src/base/strong-alias.h"
 #include "src/builtins/builtins.h"
 #include "src/codegen/bailout-reason.h"
 #include "src/common/globals.h"
@@ -16,21 +18,22 @@
 #include "src/objects/function-kind.h"
 #include "src/objects/function-syntax-kind.h"
 #include "src/objects/name.h"
+#include "src/objects/objects-body-descriptors.h"
 #include "src/objects/objects.h"
 #include "src/objects/script.h"
 #include "src/objects/slots.h"
 #include "src/objects/smi.h"
 #include "src/objects/struct.h"
+#include "src/objects/tagged-field.h"
+#include "src/objects/trusted-object.h"
 #include "src/roots/roots.h"
 #include "testing/gtest/include/gtest/gtest_prod.h"  // nogncheck
-#include "torque-generated/bit-fields.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
 namespace v8::internal {
 
-class AsmWasmData;
 class BytecodeArray;
 class CoverageInfo;
 class DebugInfo;
@@ -40,7 +43,6 @@ class Signature;
 class WasmFunctionData;
 class WasmCapiFunctionData;
 class WasmExportedFunctionData;
-class WasmJSFunctionData;
 class WasmResumeData;
 
 #if V8_ENABLE_WEBASSEMBLY
@@ -51,11 +53,10 @@ class ValueType;
 }  // namespace wasm
 #endif
 
-#include "torque-generated/src/objects/shared-function-info-tq.inc"
-
 // Defines whether the source positions should be created during function
 // compilation.
-enum class CreateSourcePositions { kNo, kYes };
+using CreateSourcePositions =
+    base::StrongAlias<struct CreateSourcePositionsTag, bool>;
 
 // Data collected by the pre-parser storing information about scopes and inner
 // functions.
@@ -75,11 +76,13 @@ enum class CreateSourcePositions { kNo, kYes };
 // +-------------------------------+
 // | Inner PreparseData N          |
 // +-------------------------------+
-class PreparseData
-    : public TorqueGeneratedPreparseData<PreparseData, HeapObject> {
+V8_OBJECT class PreparseData : public HeapObject {
  public:
-  inline int inner_start_offset() const;
-  inline ObjectSlot inner_data_start() const;
+  int32_t data_length() const { return data_length_; }
+  void set_data_length(int32_t value) { data_length_ = value; }
+
+  int32_t children_length() const { return children_length_; }
+  void set_children_length(int32_t value) { children_length_ = value; }
 
   inline uint8_t get(int index) const;
   inline void set(int index, uint8_t value);
@@ -95,30 +98,58 @@ class PreparseData
   DECL_PRINTER(PreparseData)
   DECL_VERIFIER(PreparseData)
 
-  static const int kDataStartOffset = kSize;
-
   class BodyDescriptor;
 
-  static int InnerOffset(int data_length) {
-    return RoundUp(kDataStartOffset + data_length * kByteSize, kTaggedSize);
-  }
-
-  static int SizeFor(int data_length, int children_length) {
-    return InnerOffset(data_length) + children_length * kTaggedSize;
-  }
-
-  TQ_OBJECT_CONSTRUCTORS(PreparseData)
+  static inline int SizeFor(int data_length, int children_length);
 
  private:
-  inline Tagged<Object> get_child_raw(int index) const;
-};
+  friend class TorqueGeneratedPreparseDataAsserts;
+  template <typename Impl>
+  friend class FactoryBase;
+
+  static int ChildrenOffsetInData(int data_length) {
+    return RoundUp(data_length * kByteSize, kTaggedSize);
+  }
+
+  uint8_t* data() { return reinterpret_cast<uint8_t*>(data_and_children()); }
+  const uint8_t* data() const {
+    return reinterpret_cast<const uint8_t*>(data_and_children());
+  }
+  TaggedMember<PreparseData>* children() {
+    return reinterpret_cast<TaggedMember<PreparseData>*>(
+        &data_and_children()[ChildrenOffsetInData(data_length())]);
+  }
+  const TaggedMember<PreparseData>* children() const {
+    return reinterpret_cast<const TaggedMember<PreparseData>*>(
+        &data_and_children()[ChildrenOffsetInData(data_length())]);
+  }
+
+  inline int children_start_offset() const;
+
+  int32_t data_length_;
+  int32_t children_length_;
+  FLEXIBLE_ARRAY_MEMBER(char, data_and_children);
+} V8_OBJECT_END;
+
+static_assert(IsAligned(OFFSET_OF_DATA_START(PreparseData),
+                        alignof(TaggedMember<PreparseData>)));
 
 // Abstract class representing extra data for an uncompiled function, which is
 // not stored in the SharedFunctionInfo.
-class UncompiledData
-    : public TorqueGeneratedUncompiledData<UncompiledData,
-                                           ExposedTrustedObject> {
+V8_OBJECT class UncompiledData : public ExposedTrustedObject {
+  V8_IT_ABSTRACT;
+
  public:
+  inline Tagged<String> inferred_name() const;
+  inline void set_inferred_name(Tagged<String> value,
+                                WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline int32_t start_position() const { return start_position_; }
+  inline void set_start_position(int32_t value) { start_position_ = value; }
+
+  inline int32_t end_position() const { return end_position_; }
+  inline void set_end_position(int32_t value) { end_position_ = value; }
+
   inline void InitAfterBytecodeFlush(
       Isolate* isolate, Tagged<String> inferred_name, int start_position,
       int end_position,
@@ -126,79 +157,181 @@ class UncompiledData
                          Tagged<HeapObject> target)>
           gc_notify_updated_slot);
 
-  TQ_OBJECT_CONSTRUCTORS(UncompiledData)
-};
+  DECL_VERIFIER(UncompiledData)
+
+  friend class Torque;
+  friend struct OffsetsForDebug;
+
+  TaggedMember<String> inferred_name_;
+  int32_t start_position_;
+  int32_t end_position_;
+} V8_OBJECT_END;
 
 // Class representing data for an uncompiled function that does not have any
 // data from the pre-parser, either because it's a leaf function or because the
 // pre-parser bailed out.
-class UncompiledDataWithoutPreparseData
-    : public TorqueGeneratedUncompiledDataWithoutPreparseData<
-          UncompiledDataWithoutPreparseData, UncompiledData> {
- public:
-  class BodyDescriptor;
+V8_OBJECT class UncompiledDataWithoutPreparseData : public UncompiledData {
+  V8_IT_OWN_TYPE;
 
-  TQ_OBJECT_CONSTRUCTORS(UncompiledDataWithoutPreparseData)
-};
+ public:
+  DECL_PRINTER(UncompiledDataWithoutPreparseData)
+  DECL_VERIFIER(UncompiledDataWithoutPreparseData)
+
+  class BodyDescriptor;
+} V8_OBJECT_END;
 
 // Class representing data for an uncompiled function that has pre-parsed scope
 // data.
-class UncompiledDataWithPreparseData
-    : public TorqueGeneratedUncompiledDataWithPreparseData<
-          UncompiledDataWithPreparseData, UncompiledData> {
+V8_OBJECT class UncompiledDataWithPreparseData : public UncompiledData {
+  V8_IT_OWN_TYPE;
+
  public:
+  inline Tagged<PreparseData> preparse_data() const;
+  inline void set_preparse_data(Tagged<PreparseData> value,
+                                WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  DECL_PRINTER(UncompiledDataWithPreparseData)
+  DECL_VERIFIER(UncompiledDataWithPreparseData)
+
   class BodyDescriptor;
 
-  TQ_OBJECT_CONSTRUCTORS(UncompiledDataWithPreparseData)
-};
+  TaggedMember<PreparseData> preparse_data_;
+} V8_OBJECT_END;
 
 // Class representing data for an uncompiled function that does not have any
 // data from the pre-parser, either because it's a leaf function or because the
 // pre-parser bailed out, but has a job pointer.
-class UncompiledDataWithoutPreparseDataWithJob
-    : public TorqueGeneratedUncompiledDataWithoutPreparseDataWithJob<
-          UncompiledDataWithoutPreparseDataWithJob,
-          UncompiledDataWithoutPreparseData> {
+V8_OBJECT class UncompiledDataWithoutPreparseDataWithJob
+    : public UncompiledDataWithoutPreparseData {
  public:
+  inline Address job() const { return job_; }
+  inline void set_job(Address value) { job_ = value; }
+
+  DECL_PRINTER(UncompiledDataWithoutPreparseDataWithJob)
+  DECL_VERIFIER(UncompiledDataWithoutPreparseDataWithJob)
+
   class BodyDescriptor;
 
-  TQ_OBJECT_CONSTRUCTORS(UncompiledDataWithoutPreparseDataWithJob)
-};
+  Address job_;
+} V8_OBJECT_END;
 
 // Class representing data for an uncompiled function that has pre-parsed scope
 // data and a job pointer.
-class UncompiledDataWithPreparseDataAndJob
-    : public TorqueGeneratedUncompiledDataWithPreparseDataAndJob<
-          UncompiledDataWithPreparseDataAndJob,
-          UncompiledDataWithPreparseData> {
+V8_OBJECT class UncompiledDataWithPreparseDataAndJob
+    : public UncompiledDataWithPreparseData {
  public:
+  inline Address job() const { return job_; }
+  inline void set_job(Address value) { job_ = value; }
+
+  DECL_PRINTER(UncompiledDataWithPreparseDataAndJob)
+  DECL_VERIFIER(UncompiledDataWithPreparseDataAndJob)
+
   class BodyDescriptor;
 
-  TQ_OBJECT_CONSTRUCTORS(UncompiledDataWithPreparseDataAndJob)
-};
+  Address job_;
+} V8_OBJECT_END;
 
-class InterpreterData
-    : public TorqueGeneratedInterpreterData<InterpreterData,
-                                            ExposedTrustedObject> {
+V8_OBJECT class InterpreterData : public ExposedTrustedObject {
  public:
-  DECL_PROTECTED_POINTER_ACCESSORS(bytecode_array, BytecodeArray)
-  DECL_PROTECTED_POINTER_ACCESSORS(interpreter_trampoline, Code)
+  inline Tagged<BytecodeArray> bytecode_array() const;
+  inline void set_bytecode_array(Tagged<BytecodeArray> value,
+                                 WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline bool has_bytecode_array() const;
+  inline void clear_bytecode_array();
+
+  inline Tagged<Code> interpreter_trampoline() const;
+  inline void set_interpreter_trampoline(
+      Tagged<Code> value, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline bool has_interpreter_trampoline() const;
+  inline void clear_interpreter_trampoline();
+
+  DECL_VERIFIER(InterpreterData)
+  DECL_PRINTER(InterpreterData)
 
   class BodyDescriptor;
 
  private:
-  TQ_OBJECT_CONSTRUCTORS(InterpreterData)
-};
+  friend class TorqueGeneratedInterpreterDataAsserts;
+  friend class MacroAssembler;
+  friend class CodeStubAssembler;
+
+  ProtectedTaggedMember<BytecodeArray> bytecode_array_;
+  ProtectedTaggedMember<Code> interpreter_trampoline_;
+} V8_OBJECT_END;
 
 using NameOrScopeInfoT = UnionOf<Smi, String, ScopeInfo>;
 
 // SharedFunctionInfo describes the JSFunction information that can be
 // shared by multiple instances of the function.
-class SharedFunctionInfo
-    : public TorqueGeneratedSharedFunctionInfo<SharedFunctionInfo, HeapObject> {
+V8_OBJECT class SharedFunctionInfo : public HeapObject {
  public:
-  DEFINE_TORQUE_GENERATED_SHARED_FUNCTION_INFO_FLAGS()
-  DEFINE_TORQUE_GENERATED_SHARED_FUNCTION_INFO_FLAGS2()
+  // Bit positions in |flags|.
+  using FunctionKindBits = base::BitField<FunctionKind, 0, 5, uint32_t>;
+  using IsNativeBit = FunctionKindBits::Next<bool, 1>;
+  using IsStrictBit = IsNativeBit::Next<bool, 1>;
+  using FunctionSyntaxKindBits = IsStrictBit::Next<FunctionSyntaxKind, 3>;
+  using IsClassConstructorBit = FunctionSyntaxKindBits::Next<bool, 1>;
+  using HasDuplicateParametersBit = IsClassConstructorBit::Next<bool, 1>;
+  using AllowLazyCompilationBit = HasDuplicateParametersBit::Next<bool, 1>;
+  using FunctionMapIndexBits = AllowLazyCompilationBit::Next<uint32_t, 5>;
+  using DisabledOptimizationReasonBits =
+      FunctionMapIndexBits::Next<BailoutReason, 4>;
+  using RequiresInstanceMembersInitializerBit =
+      DisabledOptimizationReasonBits::Next<bool, 1>;
+  using ConstructAsBuiltinBit =
+      RequiresInstanceMembersInitializerBit::Next<bool, 1>;
+  using NameShouldPrintAsAnonymousBit = ConstructAsBuiltinBit::Next<bool, 1>;
+  using HasReportedBinaryCoverageBit =
+      NameShouldPrintAsAnonymousBit::Next<bool, 1>;
+  using IsTopLevelBit = HasReportedBinaryCoverageBit::Next<bool, 1>;
+  using PropertiesAreFinalBit = IsTopLevelBit::Next<bool, 1>;
+  using PrivateNameLookupSkipsOuterClassBit =
+      PropertiesAreFinalBit::Next<bool, 1>;
+  using IsHoistedInContextBit =
+      PrivateNameLookupSkipsOuterClassBit::Next<bool, 1>;
+  // Bit positions in |flags2|.
+  using ClassScopeHasPrivateBrandBit = base::BitField<bool, 0, 1, uint8_t>;
+  using HasStaticPrivateMethodsOrAccessorsBit =
+      ClassScopeHasPrivateBrandBit::Next<bool, 1>;
+  using IsSparkplugCompilingBit =
+      HasStaticPrivateMethodsOrAccessorsBit::Next<bool, 1>;
+  using MaglevCompilationFailedBit = IsSparkplugCompilingBit::Next<bool, 1>;
+  using CachedTieringDecisionBits =
+      MaglevCompilationFailedBit::Next<CachedTieringDecision, 3>;
+  using FunctionContextIndependentCompiledBit =
+      CachedTieringDecisionBits::Next<bool, 1>;
+
+  // Primitive header accessors (equivalents of the previously Torque-
+  // generated inline getters/setters). Kept in the same order as the
+  // field declarations. Other accessors are declared further below with
+  // the existing DECL_* macros.
+  inline Tagged<Object> untrusted_function_data() const;
+  inline void set_untrusted_function_data(
+      Tagged<Object> value, WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline Tagged<UnionOf<ScopeInfo, FeedbackMetadata, TheHole>>
+  outer_scope_info_or_feedback_metadata() const;
+  inline void set_outer_scope_info_or_feedback_metadata(
+      Tagged<UnionOf<ScopeInfo, FeedbackMetadata, TheHole>> value,
+      WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+
+  inline uint16_t length() const;
+  inline void set_length(uint16_t value);
+
+  inline uint16_t formal_parameter_count() const;
+  inline void set_formal_parameter_count(uint16_t value);
+
+  inline uint16_t function_token_offset() const;
+  inline void set_function_token_offset(uint16_t value);
+
+  inline uint8_t expected_nof_properties() const;
+  inline void set_expected_nof_properties(uint8_t value);
+
+  inline int32_t unique_id() const;
+  inline void set_unique_id(int32_t value);
+
+  inline uint16_t feedback_slot() const;
+  inline void set_feedback_slot(uint16_t value);
 
   // This initializes the SharedFunctionInfo after allocation. It must
   // initialize all fields, and leave the SharedFunctionInfo in a state where
@@ -243,7 +376,7 @@ class SharedFunctionInfo
 
   static const int kNotFound = -1;
 
-  static constexpr int kAgeSize = kAgeOffsetEnd - kAgeOffset + 1;
+  static constexpr int kAgeSize = sizeof(uint16_t);
   static constexpr uint16_t kMaxAge = UINT16_MAX;
 
   DECL_ACQUIRE_GETTER(scope_info, Tagged<ScopeInfo>)
@@ -268,24 +401,17 @@ class SharedFunctionInfo
   // Start position of this function in the script source.
   V8_EXPORT_PRIVATE int StartPosition() const;
 
-  V8_EXPORT_PRIVATE void UpdateFromFunctionLiteralForLiveEdit(
-      IsolateForSandbox isolate, FunctionLiteral* lit);
-
   // [outer scope info | feedback metadata] Shared storage for outer scope info
   // (on uncompiled functions) and feedback metadata (on compiled functions).
-  DECL_ACCESSORS(raw_outer_scope_info_or_feedback_metadata, Tagged<HeapObject>)
+  DECL_ACCESSORS(raw_outer_scope_info_or_feedback_metadata,
+                 Tagged<UnionOf<ScopeInfo, FeedbackMetadata, TheHole>>)
   DECL_ACQUIRE_GETTER(raw_outer_scope_info_or_feedback_metadata,
-                      Tagged<HeapObject>)
- private:
-  using TorqueGeneratedSharedFunctionInfo::
-      outer_scope_info_or_feedback_metadata;
-  using TorqueGeneratedSharedFunctionInfo::
-      set_outer_scope_info_or_feedback_metadata;
-
- public:
+                      Tagged<UnionOf<ScopeInfo, FeedbackMetadata, TheHole>>)
   // Get the outer scope info whether this function is compiled or not.
   inline bool HasOuterScopeInfo() const;
   inline Tagged<ScopeInfo> GetOuterScopeInfo() const;
+  inline Tagged<ScopeInfo> TryGetScopeInfoForMerge() const;
+  inline Tagged<ScopeInfo> TryGetOuterScopeInfo() const;
 
   // [feedback metadata] Metadata template for feedback vectors of instances of
   // this function.
@@ -323,11 +449,10 @@ class SharedFunctionInfo
   inline uint16_t internal_formal_parameter_count_with_receiver() const;
   inline uint16_t internal_formal_parameter_count_without_receiver() const;
 
- private:
-  using TorqueGeneratedSharedFunctionInfo::formal_parameter_count;
-  using TorqueGeneratedSharedFunctionInfo::set_formal_parameter_count;
+  inline uint32_t unused_parameter_bits() const;
+  inline bool CanOnlyAccessFixedFormalParameters() const;
+  inline bool IsSloppyNormalJSFunction() const;
 
- public:
   // Set the formal parameter count so the function code will be
   // called without using argument adaptor frames.
   inline void DontAdaptArguments();
@@ -339,32 +464,30 @@ class SharedFunctionInfo
   //  - a BytecodeArray for the interpreter [HasBytecodeArray()].
   //  - a InterpreterData with the BytecodeArray and a copy of the
   //    interpreter trampoline [HasInterpreterData()]
-  //  - an AsmWasmData with Asm->Wasm conversion [HasAsmWasmData()].
   //  - a Smi containing the builtin id [HasBuiltinId()]
   //  - a UncompiledDataWithoutPreparseData for lazy compilation
   //    [HasUncompiledDataWithoutPreparseData()]
   //  - a UncompiledDataWithPreparseData for lazy compilation
   //    [HasUncompiledDataWithPreparseData()]
   //  - a WasmExportedFunctionData for Wasm [HasWasmExportedFunctionData()]
-  //  - a WasmJSFunctionData for functions created with WebAssembly.Function
   //  - a WasmCapiFunctionData for Wasm C-API functions
   //  - a WasmResumeData for JSPI Wasm functions
   //
   // If the (expected) type of data is known, prefer to use the specialized
   // accessors (e.g. bytecode_array(), uncompiled_data(), etc.).
-  inline Tagged<Object> GetTrustedData(IsolateForSandbox isolate) const;
+  V8_EXPORT_PRIVATE Tagged<Union<Smi, TrustedObject>> GetTrustedData(
+      IsolateForSandbox isolate) const;
   inline Tagged<Object> GetUntrustedData() const;
 
   // Helper function for use when a specific data type is expected.
-  template <typename T, IndirectPointerTag tag>
+  template <typename T, IndirectPointerTagRange tag_range>
   inline Tagged<T> GetTrustedData(IsolateForSandbox isolate) const;
-
-  // Helper function when no Isolate is available. Prefer to use the variant
-  // with an isolate parameter if possible.
-  inline Tagged<Object> GetTrustedData() const;
 
   // Some code may encounter unreachable unusable objects and needs to skip
   // over them without crashing.
+  // If we end up needing to check for this condition in many places, it might
+  // be easier to instead clear the trusted pointer of these SFIs as they are
+  // anyway unusable (and should always be unreachable as well).
   inline bool HasUnpublishedTrustedData(IsolateForSandbox isolate) const;
 
  private:
@@ -394,12 +517,16 @@ class SharedFunctionInfo
   inline bool HasUntrustedData() const;
 
  public:
+  static constexpr IndirectPointerTagRange kTrustedDataIndirectPointerRange =
+      kAllIndirectPointerTags;
+
   inline bool IsApiFunction() const;
   inline bool is_class_constructor() const;
   DECL_ACCESSORS(api_func_data, Tagged<FunctionTemplateInfo>)
   DECL_GETTER(HasBytecodeArray, bool)
   template <typename IsolateT>
   inline Tagged<BytecodeArray> GetBytecodeArray(IsolateT* isolate) const;
+  inline Tagged<BytecodeArray> GetBytecodeArrayForGC(Isolate* isolate) const;
 
   // Sets the bytecode for this SFI. This is only allowed when this SFI has not
   // yet been compiled or if it has been "uncompiled", or in other words when
@@ -418,26 +545,21 @@ class SharedFunctionInfo
   DECL_GETTER(HasBaselineCode, bool)
   DECL_RELEASE_ACQUIRE_ACCESSORS(baseline_code, Tagged<Code>)
   inline void FlushBaselineCode();
-  inline Tagged<BytecodeArray> GetActiveBytecodeArray(
-      IsolateForSandbox isolate) const;
+  inline Tagged<BytecodeArray> GetActiveBytecodeArray(Isolate* isolate) const;
   inline void SetActiveBytecodeArray(Tagged<BytecodeArray> bytecode,
                                      IsolateForSandbox isolate);
 
 #if V8_ENABLE_WEBASSEMBLY
-  inline bool HasAsmWasmData() const;
-  inline bool HasWasmFunctionData() const;
-  inline bool HasWasmExportedFunctionData() const;
-  inline bool HasWasmJSFunctionData() const;
-  inline bool HasWasmCapiFunctionData() const;
+  inline bool HasWasmFunctionData(IsolateForSandbox) const;
+  inline bool HasWasmExportedFunctionData(IsolateForSandbox) const;
+  inline bool HasWasmCapiFunctionData(IsolateForSandbox) const;
   inline bool HasWasmResumeData() const;
-  DECL_ACCESSORS(asm_wasm_data, Tagged<AsmWasmData>)
 
   // Note: The accessors below will read a trusted pointer; when accessing it
   // again, you must assume that it might have been swapped out e.g. by a
   // concurrently running worker.
   DECL_GETTER(wasm_function_data, Tagged<WasmFunctionData>)
   DECL_GETTER(wasm_exported_function_data, Tagged<WasmExportedFunctionData>)
-  DECL_GETTER(wasm_js_function_data, Tagged<WasmJSFunctionData>)
   DECL_GETTER(wasm_capi_function_data, Tagged<WasmCapiFunctionData>)
 
   DECL_GETTER(wasm_resume_data, Tagged<WasmResumeData>)
@@ -447,19 +569,20 @@ class SharedFunctionInfo
   inline bool HasBuiltinId() const;
   DECL_PRIMITIVE_ACCESSORS(builtin_id, Builtin)
 
-  inline bool HasUncompiledData() const;
+  inline bool HasUncompiledData(IsolateForSandbox isolate) const;
   inline Tagged<UncompiledData> uncompiled_data(
       IsolateForSandbox isolate) const;
   inline void set_uncompiled_data(Tagged<UncompiledData> data,
                                   WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  inline bool HasUncompiledDataWithPreparseData() const;
+  inline bool HasUncompiledDataWithPreparseData(
+      IsolateForSandbox isolate) const;
   inline Tagged<UncompiledDataWithPreparseData>
   uncompiled_data_with_preparse_data(IsolateForSandbox isolate) const;
   inline void set_uncompiled_data_with_preparse_data(
       Tagged<UncompiledDataWithPreparseData> data,
       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  inline bool HasUncompiledDataWithoutPreparseData() const;
-  inline void ClearUncompiledDataJobPointer(IsolateForSandbox isolate);
+  inline bool HasUncompiledDataWithoutPreparseData(
+      IsolateForSandbox isolate) const;
 
   // Clear out pre-parsed scope data from UncompiledDataWithPreparseData,
   // turning it into UncompiledDataWithoutPreparseData.
@@ -485,8 +608,9 @@ class SharedFunctionInfo
 
   // The function's name if it is non-empty, otherwise the inferred name.
   std::unique_ptr<char[]> DebugNameCStr() const;
-  static Handle<String> DebugName(Isolate* isolate,
-                                  DirectHandle<SharedFunctionInfo> shared);
+  static Handle<String> DebugName(
+      Isolate* isolate, DirectHandle<SharedFunctionInfo> shared,
+      AllowAllocation allow_allocation = AllowAllocation{true});
 
   // Used for flags such as --turbo-filter.
   bool PassesFilter(const char* raw_filter);
@@ -500,7 +624,6 @@ class SharedFunctionInfo
   // TODO(jgruber): Remove these overloads and pass the kAcquireLoad tag
   // explicitly.
   inline Tagged<HeapObject> script() const;
-  inline Tagged<HeapObject> script(PtrComprCageBase cage_base) const;
   inline bool has_script(AcquireLoadTag tag) const;
 
   // True if the underlying script was parsed and compiled in REPL mode.
@@ -510,11 +633,7 @@ class SharedFunctionInfo
   // start position. Can return kFunctionTokenOutOfRange if offset doesn't
   // fit in 16 bits.
   DECL_UINT16_ACCESSORS(raw_function_token_offset)
- private:
-  using TorqueGeneratedSharedFunctionInfo::function_token_offset;
-  using TorqueGeneratedSharedFunctionInfo::set_function_token_offset;
 
- public:
   // The position of the 'function' token in the script source. Can return
   // kNoSourcePosition if raw_function_token_offset() returns
   // kFunctionTokenOutOfRange.
@@ -568,11 +687,6 @@ class SharedFunctionInfo
   // global object.
   DECL_BOOLEAN_ACCESSORS(native)
 
-#if V8_ENABLE_WEBASSEMBLY
-  // Indicates that asm->wasm conversion failed and should not be re-attempted.
-  DECL_BOOLEAN_ACCESSORS(is_asm_wasm_broken)
-#endif  // V8_ENABLE_WEBASSEMBLY
-
   // Indicates that the function was created by the Function function.
   // Though it's anonymous, toString should treat it as if it had the name
   // "anonymous".  We don't set the name itself so that the system does not
@@ -589,8 +703,8 @@ class SharedFunctionInfo
   // closest outer class scope.
   DECL_BOOLEAN_ACCESSORS(private_name_lookup_skips_outer_class)
 
-  // Indicates that the shared function info was live-edited.
-  DECL_BOOLEAN_ACCESSORS(live_edited)
+  // Indicates that the function is a hoisted-in-context declaration.
+  DECL_BOOLEAN_ACCESSORS(is_hoisted_in_context)
 
   inline FunctionKind kind() const;
 
@@ -599,10 +713,6 @@ class SharedFunctionInfo
   // Defines the index in a native context of closure's map instantiated using
   // this shared function info.
   DECL_INT_ACCESSORS(function_map_index)
-
-  // Clear uninitialized padding space. This ensures that the snapshot content
-  // is deterministic.
-  inline void clear_padding();
 
   // Recalculates the |map_index| value after modifications of this shared info.
   inline void UpdateFunctionMapIndex();
@@ -643,9 +753,10 @@ class SharedFunctionInfo
   // Whether this function is defined in user-provided JavaScript code.
   inline bool IsUserJavaScript() const;
 
-  // True if one can flush compiled code from this function, in such a way that
-  // it can later be re-compiled.
-  inline bool CanDiscardCompiled() const;
+  using DiscardableData = UnionOf<BytecodeArray, InterpreterData, Code,
+                                  UncompiledDataWithPreparseData>;
+  inline bool CanDiscardCompiled(
+      Tagged<DiscardableData>* out_data = nullptr) const;
 
   // Flush compiled data from this function, setting it back to CompileLazy and
   // clearing any compiled metadata.
@@ -690,13 +801,13 @@ class SharedFunctionInfo
   // Returns `false` if formal parameters include rest parameters, optional
   // parameters, or destructuring parameters.
   // TODO(caitp): make this a flag set during parsing
-  inline bool has_simple_parameters();
+  inline bool has_simple_parameters() const;
 
   // Initialize a SharedFunctionInfo from a parsed or preparsed function
   // literal.
   template <typename IsolateT>
-  static void InitFromFunctionLiteral(IsolateT* isolate,
-                                      FunctionLiteral* lit, bool is_toplevel);
+  static void InitFromFunctionLiteral(IsolateT* isolate, FunctionLiteral* lit,
+                                      bool is_toplevel);
 
   template <typename IsolateT>
   static void CreateAndSetUncompiledData(IsolateT* isolate,
@@ -715,7 +826,7 @@ class SharedFunctionInfo
   static void EnsureBytecodeArrayAvailable(
       Isolate* isolate, Handle<SharedFunctionInfo> shared_info,
       IsCompiledScope* is_compiled_scope,
-      CreateSourcePositions flag = CreateSourcePositions::kNo);
+      CreateSourcePositions flag = CreateSourcePositions{false});
 
   inline bool CanCollectSourcePosition(Isolate* isolate);
   static void EnsureSourcePositionsAvailable(
@@ -755,29 +866,37 @@ class SharedFunctionInfo
 #endif
 
   // Iterate over all shared function infos in a given script.
-  class ScriptIterator {
+  // V8_OBJECT_INNER_CLASS restores default alignment: the enclosing
+  // V8_OBJECT pragma packs to 4 bytes, but ScriptIterator's Handle<...>
+  // member needs 8-byte alignment.
+  V8_OBJECT_INNER_CLASS class ScriptIterator {
    public:
     V8_EXPORT_PRIVATE ScriptIterator(Isolate* isolate, Tagged<Script> script);
     explicit ScriptIterator(Handle<WeakFixedArray> infos);
     ScriptIterator(const ScriptIterator&) = delete;
     ScriptIterator& operator=(const ScriptIterator&) = delete;
     V8_EXPORT_PRIVATE Tagged<SharedFunctionInfo> Next();
-    int CurrentIndex() const { return index_ - 1; }
+    uint32_t CurrentIndex() const {
+      DCHECK_GT(index_, 0);
+      return index_ - 1;
+    }
 
     // Reset the iterator to run on |script|.
     void Reset(Isolate* isolate, Tagged<Script> script);
 
    private:
     Handle<WeakFixedArray> infos_;
-    int index_;
-  };
+    uint32_t index_;
+  } V8_OBJECT_INNER_CLASS_END;
 
   // Constants.
   static const int kMaximumFunctionTokenOffset = kMaxUInt16 - 1;
   static const uint16_t kFunctionTokenOutOfRange = static_cast<uint16_t>(-1);
   static_assert(kMaximumFunctionTokenOffset + 1 == kFunctionTokenOutOfRange);
 
-  static_assert(kSize % kTaggedSize == 0);
+  static const int kEndOfStrongFieldsOffset;
+  static const int kSize;
+  static const int kHeaderSize;
 
   class BodyDescriptor;
 
@@ -816,7 +935,7 @@ class SharedFunctionInfo
 
   // [outer scope info] The outer scope info, needed to lazily parse this
   // function.
-  DECL_ACCESSORS(outer_scope_info, Tagged<HeapObject>)
+  DECL_ACCESSORS(outer_scope_info, Tagged<UnionOf<ScopeInfo, TheHole>>)
 
   // [properties_are_final]: This bit is used to track if we have finished
   // parsing its properties. The properties final bit is only used by
@@ -834,34 +953,71 @@ class SharedFunctionInfo
   template <typename Impl>
   friend class FactoryBase;
   friend class V8HeapExplorer;
+  friend class TorqueGeneratedSharedFunctionInfoAsserts;
   FRIEND_TEST(PreParserTest, LazyFunctionLength);
 
-  TQ_OBJECT_CONSTRUCTORS(SharedFunctionInfo)
-};
+  inline Tagged<BytecodeArray> GetBytecodeArrayInternal(Isolate* isolate) const;
+
+ public:
+  // trusted_function_data may point at any concrete ExposedTrustedObject, so
+  // the indirect-pointer tag range covers all trusted tags.
+  TrustedPointerMember<ExposedTrustedObject, kAllIndirectPointerTags>
+      trusted_function_data_;
+  TaggedMember<Object> untrusted_function_data_;
+  TaggedMember<NameOrScopeInfoT> name_or_scope_info_;
+  TaggedMember<UnionOf<ScopeInfo, FeedbackMetadata, TheHole>>
+      outer_scope_info_or_feedback_metadata_;
+  TaggedMember<HeapObject> script_;
+  uint16_t length_;
+  uint16_t formal_parameter_count_;
+  uint16_t function_token_offset_;
+  uint8_t expected_nof_properties_;
+  uint8_t flags2_;
+  std::atomic<uint32_t> flags_;
+  std::atomic<int32_t> function_literal_id_;
+  int32_t unique_id_;
+  std::atomic<uint16_t> age_;
+  std::atomic<uint16_t> feedback_slot_;
+} V8_OBJECT_END;
+
+inline constexpr int SharedFunctionInfo::kEndOfStrongFieldsOffset =
+    offsetof(SharedFunctionInfo, script_) + kTaggedSize;
+inline constexpr int SharedFunctionInfo::kSize = sizeof(SharedFunctionInfo);
+inline constexpr int SharedFunctionInfo::kHeaderSize =
+    sizeof(SharedFunctionInfo);
 
 std::ostream& operator<<(std::ostream& os, SharedFunctionInfo::Inlineability i);
 
 // A SharedFunctionInfoWrapper wraps a SharedFunctionInfo from trusted space.
 // It can be useful when a protected pointer reference to a SharedFunctionInfo
 // is needed, for example for a ProtectedFixedArray.
-class SharedFunctionInfoWrapper : public TrustedObject {
+V8_OBJECT class SharedFunctionInfoWrapper : public TrustedObject {
  public:
-  DECL_ACCESSORS(shared_info, Tagged<SharedFunctionInfo>)
+  inline Tagged<SharedFunctionInfo> shared_info() const;
+  inline void set_shared_info(Tagged<SharedFunctionInfo> value,
+                              WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   DECL_PRINTER(SharedFunctionInfoWrapper)
   DECL_VERIFIER(SharedFunctionInfoWrapper)
 
-#define FIELD_LIST(V)               \
-  V(kSharedInfoOffset, kTaggedSize) \
-  V(kHeaderSize, 0)                 \
-  V(kSize, 0)
+  static const int kHeaderSize;
+  static const int kSize;
 
-  DEFINE_FIELD_OFFSET_CONSTANTS(TrustedObject::kHeaderSize, FIELD_LIST)
-#undef FIELD_LIST
+ public:
+  TaggedMember<SharedFunctionInfo> shared_info_;
+} V8_OBJECT_END;
 
-  class BodyDescriptor;
+inline constexpr int SharedFunctionInfoWrapper::kHeaderSize =
+    sizeof(SharedFunctionInfoWrapper);
+inline constexpr int SharedFunctionInfoWrapper::kSize =
+    sizeof(SharedFunctionInfoWrapper);
 
-  OBJECT_CONSTRUCTORS(SharedFunctionInfoWrapper, TrustedObject);
+template <>
+struct ObjectTraits<SharedFunctionInfoWrapper> {
+  using BodyDescriptor =
+      FixedBodyDescriptor<offsetof(SharedFunctionInfoWrapper, shared_info_),
+                          sizeof(SharedFunctionInfoWrapper),
+                          sizeof(SharedFunctionInfoWrapper)>;
 };
 
 static constexpr int kStaticRootsSFISize = 48;
@@ -912,6 +1068,47 @@ class V8_NODISCARD IsBaselineCompiledScope {
 };
 
 std::ostream& operator<<(std::ostream& os, const SourceCodeOf& v);
+
+V8_OBJECT class OnHeapBasicBlockProfilerData : public HeapObject {
+ public:
+  inline Tagged<ByteArray> block_ids() const;
+  inline void set_block_ids(Tagged<ByteArray> value,
+                            WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline Tagged<ByteArray> counts() const;
+  inline void set_counts(Tagged<ByteArray> value,
+                         WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline Tagged<ByteArray> branches() const;
+  inline void set_branches(Tagged<ByteArray> value,
+                           WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline Tagged<String> name() const;
+  inline void set_name(Tagged<String> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline Tagged<String> schedule() const;
+  inline void set_schedule(Tagged<String> value,
+                           WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline Tagged<String> code() const;
+  inline void set_code(Tagged<String> value,
+                       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline Tagged<Smi> hash() const;
+  inline void set_hash(Tagged<Smi> value);
+
+  DECL_PRINTER(OnHeapBasicBlockProfilerData)
+  DECL_VERIFIER(OnHeapBasicBlockProfilerData)
+
+  class BodyDescriptor;
+
+  static constexpr int SizeFor() {
+    return sizeof(OnHeapBasicBlockProfilerData);
+  }
+
+  TaggedMember<ByteArray> block_ids_;
+  TaggedMember<ByteArray> counts_;
+  TaggedMember<ByteArray> branches_;
+  TaggedMember<String> name_;
+  TaggedMember<String> schedule_;
+  TaggedMember<String> code_;
+  TaggedMember<Smi> hash_;
+} V8_OBJECT_END;
 
 }  // namespace v8::internal
 

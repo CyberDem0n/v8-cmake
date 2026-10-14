@@ -10,8 +10,7 @@ namespace v8 {
 namespace internal {
 
 int AbstractCode::SourcePosition(Isolate* isolate, int offset) {
-  PtrComprCageBase cage_base(isolate);
-  Tagged<Map> map_object = map(cage_base);
+  Tagged<Map> map_object = map();
   if (InstanceTypeChecker::IsCode(map_object)) {
     return GetCode()->SourcePosition(offset);
   } else {
@@ -20,12 +19,31 @@ int AbstractCode::SourcePosition(Isolate* isolate, int offset) {
 }
 
 int AbstractCode::SourceStatementPosition(Isolate* isolate, int offset) {
-  PtrComprCageBase cage_base(isolate);
-  Tagged<Map> map_object = map(cage_base);
+  Tagged<Map> map_object = map();
   if (InstanceTypeChecker::IsCode(map_object)) {
     return GetCode()->SourceStatementPosition(offset);
   } else {
     return GetBytecodeArray()->SourceStatementPosition(offset);
+  }
+}
+
+bool AbstractCode::is_context_specialized() {
+  Tagged<Map> map_object = map();
+  if (InstanceTypeChecker::IsCode(map_object)) {
+    return GetCode()->is_context_specialized();
+  } else {
+    DCHECK(InstanceTypeChecker::IsBytecodeArray(map_object));
+    return false;
+  }
+}
+
+BytecodeOffset AbstractCode::osr_offset() {
+  Tagged<Map> map_object = map();
+  if (InstanceTypeChecker::IsCode(map_object)) {
+    return GetCode()->osr_offset();
+  } else {
+    DCHECK(InstanceTypeChecker::IsBytecodeArray(map_object));
+    return BytecodeOffset::None();
   }
 }
 

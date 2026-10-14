@@ -74,12 +74,10 @@ void DisassembleFunctionImpl(const WasmModule* module, int func_index,
   const wasm::WasmFunction& func = module->functions[func_index];
   AccountingAllocator allocator;
   Zone zone(&allocator, "Wasm disassembler");
-  bool shared = module->type(func.sig_index).is_shared;
   WasmDetectedFeatures detected;
-  FunctionBodyDisassembler d(&zone, module, func_index, shared, &detected,
-                             func.sig, function_body.begin(),
-                             function_body.end(), func.code.offset(),
-                             module_bytes, names);
+  FunctionBodyDisassembler d(&zone, module, func_index, &detected, func.sig,
+                             function_body.begin(), function_body.end(),
+                             func.code.offset(), module_bytes, names);
   d.DecodeAsWat(sb, {0, 2}, FunctionBodyDisassembler::kPrintHeader);
   const bool print_offsets = false;
   sb.WriteTo(os, print_offsets, offsets);
@@ -236,7 +234,7 @@ void FunctionBodyDisassembler::DecodeAsWat(MultiLineStringBuilder& out,
   uint32_t locals_length = DecodeLocals(pc_);
   if (failed()) {
     // TODO(jkummerow): Improve error handling.
-    out << "Failed to decode locals\n";
+    out << "Failed to decode locals: " << error().message() << '\n';
     return;
   }
   for (uint32_t i = static_cast<uint32_t>(sig_->parameter_count());
@@ -402,7 +400,7 @@ class ImmediatesPrinter {
   void HeapType(HeapTypeImmediate& imm) {
     out_ << " ";
     names()->PrintHeapType(out_, imm.type);
-    if (imm.type.is_index()) use_type(imm.type.ref_index());
+    if (imm.type.has_index()) use_type(imm.type.ref_index());
   }
 
   void ValueType(ValueType type) {
@@ -492,6 +490,24 @@ class ImmediatesPrinter {
   }
 
   void MemoryAccess(MemoryAccessImmediate& imm) {
+    if (imm.mem_index != 0) {
+      out_ << " ";
+      names()->PrintMemoryName(out_, imm.mem_index);
+    }
+    if (WasmOpcodes::ExtractPrefix(owner_->current_opcode_) == kAtomicPrefix) {
+      switch (imm.memory_order) {
+        case AtomicMemoryOrder::kAcqRel:
+          out_ << " acqrel";
+          break;
+        case AtomicMemoryOrder::kSeqCst:
+          // This is the default. Skip printing it, so that existing operations
+          // are disassembled in the same way as before.
+          break;
+        default:
+          out_ << " INVALID(" << static_cast<int>(imm.memory_order) << ')';
+          break;
+      }
+    }
     if (imm.offset != 0) out_ << " offset=" << imm.offset;
     if (imm.alignment != GetDefaultAlignment(owner_->current_opcode_)) {
       out_ << " align=" << (1u << imm.alignment);
@@ -556,7 +572,8 @@ class ImmediatesPrinter {
 
   void MemoryIndex(MemoryIndexImmediate& imm) {
     if (imm.index == 0) return;
-    out_ << " " << imm.index;
+    out_ << " ";
+    names()->PrintMemoryName(out_, imm.index);
   }
 
   void DataSegmentIndex(IndexImmediate& imm) {
@@ -752,7 +769,7 @@ void OffsetsProvider::CollectOffsets(const WasmModule* module,
   recgroups_.reserve(4);  // We can't know, so this is just a guess.
 
   WasmDetectedFeatures unused_detected_features;
-  ModuleDecoderImpl decoder{WasmEnabledFeatures::All(), wire_bytes, kWasmOrigin,
+  ModuleDecoderImpl decoder{WasmEnabledFeatures::All(), wire_bytes,
                             &unused_detected_features, this};
   constexpr bool kNoVerifyFunctions = false;
   decoder.DecodeModule(kNoVerifyFunctions);
@@ -788,15 +805,24 @@ void ModuleDisassembler::PrintTypeDefinition(uint32_t type_index,
   uint32_t offset = offsets_->type_offset(type_index);
   out_.NextLine(offset);
   out_ << indentation << "(type ";
+  size_t num_closing_parens = 2;  // One for "(type", one for "(struct" etc.
   names_->PrintTypeName(out_, type_index, index_as_comment);
   const TypeDefinition& type = module_->types[type_index];
-  bool has_super = type.supertype != kNoSuperType;
-  if (has_super) {
+  if (type.supertype != kNoSuperType) {
     out_ << " (sub ";
+    num_closing_parens++;
     if (type.is_final) out_ << "final ";
-    names_->PrintHeapType(out_,
-                          HeapType::Index(type.supertype, type.is_shared,
-                                          static_cast<RefTypeKind>(type.kind)));
+    names_->PrintTypeName(out_, type.supertype);
+  }
+  if (type.is_descriptor()) {
+    out_ << " (describes ";
+    names_->PrintTypeName(out_, type.describes);
+    out_ << ")";
+  }
+  if (type.has_descriptor()) {
+    out_ << " (descriptor ";
+    names_->PrintTypeName(out_, type.descriptor);
+    out_ << ")";
   }
   if (type.kind == TypeDefinition::kArray) {
     const ArrayType* atype = type.array_type;
@@ -804,7 +830,7 @@ void ModuleDisassembler::PrintTypeDefinition(uint32_t type_index,
     if (type.is_shared) out_ << " shared";
     out_ << " (field ";
     PrintMutableType(atype->mutability(), atype->element_type());
-    out_ << ")";  // Closes "(field ...".
+    num_closing_parens++;  // Closes "(field ...".
   } else if (type.kind == TypeDefinition::kStruct) {
     const StructType* stype = type.struct_type;
     out_ << " (struct";
@@ -838,8 +864,9 @@ void ModuleDisassembler::PrintTypeDefinition(uint32_t type_index,
       out_ << ")";
     }
   }
-  // Closes "(type", "(sub", and "(array" / "(struct" / "(func".
-  out_ << (has_super ? ")))" : "))");
+  constexpr const char* parens = ")))))";
+  DCHECK_LE(num_closing_parens, strlen(parens));
+  out_.write(parens, num_closing_parens);
 }
 
 void ModuleDisassembler::PrintModule(Indentation indentation, size_t max_mb) {
@@ -922,14 +949,19 @@ void ModuleDisassembler::PrintModule(Indentation indentation, size_t max_mb) {
         PrintTable(table);
         break;
       }
-      case kExternalFunction: {
+      case kExternalFunction:
+      case kExternalExactFunction: {
         out_ << "(func ";
         names_->PrintFunctionName(out_, import.index, NamesProvider::kDevTools,
                                   kIndicesAsComments);
         const WasmFunction& func = module_->functions[import.index];
+        // Exports always use non-exact kExternalFunction, because exact
+        // exports would provide no benefit.
         if (func.exported) PrintExportName(kExternalFunction, import.index);
         PrintImportName(import);
+        if (import.kind == kExternalExactFunction) out_ << "(exact ";
         PrintSignatureOneLine(out_, func.sig, import.index, names_, false);
+        if (import.kind == kExternalExactFunction) out_ << ")";
         break;
       }
       case kExternalGlobal: {
@@ -1056,9 +1088,9 @@ void ModuleDisassembler::PrintModule(Indentation indentation, size_t max_mb) {
     names_->PrintValueType(out_, elem.type);
 
     WasmDetectedFeatures unused_detected_features;
-    ModuleDecoderImpl decoder(
-        WasmEnabledFeatures::All(), wire_bytes_.module_bytes(),
-        ModuleOrigin::kWasmOrigin, &unused_detected_features);
+    ModuleDecoderImpl decoder(WasmEnabledFeatures::All(),
+                              wire_bytes_.module_bytes(),
+                              &unused_detected_features);
     decoder.consume_bytes(elem.elements_wire_bytes_offset);
     for (size_t j = 0; j < elem.element_count; j++) {
       ConstantExpression entry = decoder.consume_element_segment_entry(
@@ -1088,10 +1120,9 @@ void ModuleDisassembler::PrintModule(Indentation indentation, size_t max_mb) {
     if (func->exported) PrintExportName(kExternalFunction, i);
     PrintSignatureOneLine(out_, func->sig, i, names_, true, kIndicesAsComments);
     out_.NextLine(func->code.offset());
-    bool shared = module_->type(func->sig_index).is_shared;
     WasmDetectedFeatures detected;
     base::Vector<const uint8_t> code = wire_bytes_.GetFunctionBytes(func);
-    FunctionBodyDisassembler d(&zone_, module_, i, shared, &detected, func->sig,
+    FunctionBodyDisassembler d(&zone_, module_, i, &detected, func->sig,
                                code.begin(), code.end(), func->code.offset(),
                                wire_bytes_, names_);
     uint32_t first_instruction_offset;
@@ -1209,8 +1240,8 @@ void ModuleDisassembler::PrintInitExpression(const ConstantExpression& init,
 
       auto sig = FixedSizeSignature<ValueType>::Returns(expected_type);
       WasmDetectedFeatures detected;
-      FunctionBodyDisassembler d(&zone_, module_, 0, false, &detected, &sig,
-                                 start, end, ref.offset(), wire_bytes_, names_);
+      FunctionBodyDisassembler d(&zone_, module_, 0, &detected, &sig, start,
+                                 end, ref.offset(), wire_bytes_, names_);
       d.DecodeGlobalInitializer(out_);
       break;
   }

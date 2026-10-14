@@ -123,8 +123,13 @@ class BasicSlotSet {
     DCHECK(bucket != nullptr);
     DCHECK_EQ(bucket->cells(), LoadBucket<access_mode>(bucket_index)->cells());
     uint32_t mask = 1u << bit_index;
-    if ((bucket->template LoadCell<access_mode>(cell_index) & mask) == 0) {
-      bucket->template SetCellBits<access_mode>(cell_index, mask);
+    if constexpr (access_mode == AccessMode::ATOMIC) {
+      if ((bucket->template LoadCell<AccessMode::ATOMIC>(cell_index) & mask) ==
+          0) {
+        bucket->template SetCellBits<AccessMode::ATOMIC>(cell_index, mask);
+      }
+    } else {
+      bucket->template SetCellBits<AccessMode::NON_ATOMIC>(cell_index, mask);
     }
   }
 
@@ -291,8 +296,9 @@ class BasicSlotSet {
     template <AccessMode access_mode = AccessMode::ATOMIC>
     uint32_t LoadCell(int cell_index) {
       DCHECK_LT(cell_index, kCellsPerBucket);
-      if constexpr (access_mode == AccessMode::ATOMIC)
+      if constexpr (access_mode == AccessMode::ATOMIC) {
         return v8::base::AsAtomic32::Acquire_Load(cell(cell_index));
+      }
       return *(cell(cell_index));
     }
 
@@ -301,8 +307,7 @@ class BasicSlotSet {
       if constexpr (access_mode == AccessMode::ATOMIC) {
         v8::base::AsAtomic32::Release_SetBits(cell(cell_index), mask, mask);
       } else {
-        uint32_t* c = cell(cell_index);
-        *c = (*c & ~mask) | mask;
+        *cell(cell_index) |= mask;
       }
     }
 
@@ -411,8 +416,9 @@ class BasicSlotSet {
 
   template <AccessMode access_mode = AccessMode::ATOMIC>
   Bucket* LoadBucket(Bucket** bucket) {
-    if (access_mode == AccessMode::ATOMIC)
+    if (access_mode == AccessMode::ATOMIC) {
       return v8::base::AsAtomicPointer::Acquire_Load(bucket);
+    }
     return *bucket;
   }
 

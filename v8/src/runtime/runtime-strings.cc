@@ -5,6 +5,7 @@
 #include "src/execution/arguments-inl.h"
 #include "src/heap/heap-inl.h"
 #include "src/numbers/conversions.h"
+#include "src/objects/dictionary-inl.h"
 #include "src/objects/js-array-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/slots.h"
@@ -154,8 +155,6 @@ RUNTIME_FUNCTION(Runtime_StringSubstring) {
 }
 
 RUNTIME_FUNCTION(Runtime_StringAdd) {
-  // This is used by Wasm.
-  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
   HandleScope scope(isolate);
   DCHECK_EQ(2, args.length());
   DirectHandle<String> str1 = args.at<String>(0);
@@ -164,44 +163,59 @@ RUNTIME_FUNCTION(Runtime_StringAdd) {
                            isolate->factory()->NewConsString(str1, str2));
 }
 
-RUNTIME_FUNCTION(Runtime_StringAdd_LhsIsStringConstant_Internalize) {
-  HandleScope scope(isolate);
-  DCHECK_EQ(4, args.length());
-  DirectHandle<String> lhs = args.at<String>(0);
-  DirectHandle<Object> rhs = args.at<Object>(1);
-  Handle<HeapObject> maybe_feedback_vector = args.at<HeapObject>(2);
-  const int slot_index = args.tagged_index_value_at(3);
+namespace {
 
-  DirectHandle<String> rhs_string;
-  if (IsString(*rhs)) {
-    rhs_string = Cast<String>(rhs);
+using ASVariant = AddStringConstantAndInternalizeVariant;
+
+Tagged<Object> StringAdd_StringConstant_Internalize(
+    Isolate* isolate, DirectHandle<Object> lhs, DirectHandle<Object> rhs,
+    Handle<HeapObject> maybe_feedback_vector, int slot_index,
+    ASVariant as_variant) {
+  const bool lhs_is_string_constant =
+      as_variant == ASVariant::kLhsIsStringConstant;
+  DirectHandle<Object> const_str_operand = lhs_is_string_constant ? lhs : rhs;
+  DirectHandle<Object> other_operand = lhs_is_string_constant ? rhs : lhs;
+  DCHECK(IsInternalizedString(*const_str_operand));
+
+  DirectHandle<String> other_operand_string;
+  if (IsString(*other_operand)) {
+    other_operand_string = Cast<String>(other_operand);
   } else {
     // According to spec we first have to do ToPrimitive and only then
     // ToString.
     // https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator
-    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, rhs,
-                                       Object::ToPrimitive(isolate, rhs));
-    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, rhs_string,
-                                       Object::ToString(isolate, rhs));
+    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+        isolate, other_operand, Object::ToPrimitive(isolate, other_operand));
+    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+        isolate, other_operand_string,
+        Object::ToString(isolate, other_operand));
   }
 
   auto f = isolate->factory();
-  auto rhs_internalized = IsInternalizedString(*rhs_string)
-                              ? Cast<InternalizedString>(rhs_string)
-                              : f->InternalizeString(rhs_string);
+  auto other_operand_internalize =
+      IsInternalizedString(*other_operand_string)
+          ? Cast<InternalizedString>(other_operand_string)
+          : f->InternalizeString(other_operand_string);
+
+  auto lhs_internalize = lhs_is_string_constant
+                             ? Cast<String>(const_str_operand)
+                             : Cast<String>(other_operand_internalize);
+  auto rhs_internalize = lhs_is_string_constant
+                             ? Cast<String>(other_operand_internalize)
+                             : Cast<String>(const_str_operand);
 
   if (IsUndefined(*maybe_feedback_vector)) {
     DirectHandle<String> cons;
     ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
-        isolate, cons, f->NewConsString(lhs, Cast<String>(rhs_internalized)));
+        isolate, cons, f->NewConsString(lhs_internalize, rhs_internalize));
     return *f->InternalizeString(cons);
   }
 
   auto feedback_vector = Cast<FeedbackVector>(maybe_feedback_vector);
 
   FeedbackSlot cache_slot(FeedbackVector::ToSlot(
-      slot_index + kAdd_LhsIsStringConstant_Internalize_CacheSlotOffset));
-  DCHECK_LT(cache_slot.ToInt(), feedback_vector->length());
+      slot_index + kAdd_StringConstant_Internalize_CacheSlotOffset));
+  DCHECK_LT(cache_slot.ToInt(), feedback_vector->length().value());
   Handle<Object> cache_obj(Cast<Object>(feedback_vector->Get(cache_slot)),
                            isolate);
   Handle<SimpleNameDictionary> cache;
@@ -212,7 +226,7 @@ RUNTIME_FUNCTION(Runtime_StringAdd_LhsIsStringConstant_Internalize) {
     cache = Cast<SimpleNameDictionary>(cache_obj);
   }
 
-  InternalIndex entry = cache->FindEntry(isolate, rhs_internalized);
+  InternalIndex entry = cache->FindEntry(isolate, other_operand_internalize);
   if (entry.is_found()) {
     auto result = cache->ValueAt(entry);
     DCHECK(IsInternalizedString(result));
@@ -221,16 +235,42 @@ RUNTIME_FUNCTION(Runtime_StringAdd_LhsIsStringConstant_Internalize) {
 
   DirectHandle<String> cons;
   ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
-      isolate, cons, f->NewConsString(lhs, Cast<String>(rhs_internalized)));
+      isolate, cons, f->NewConsString(lhs_internalize, rhs_internalize));
 
   auto internalized = f->InternalizeString(cons);
-  auto new_cache =
-      SimpleNameDictionary::Set(isolate, cache, rhs_internalized, internalized);
+  auto new_cache = SimpleNameDictionary::Set(
+      isolate, cache, other_operand_internalize, internalized);
   if (*new_cache != *cache) {
     feedback_vector->SynchronizedSet(cache_slot, *new_cache);
   }
 
   return *internalized;
+}
+
+}  // namespace
+
+RUNTIME_FUNCTION(Runtime_StringAdd_LhsIsStringConstant_Internalize) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(4, args.length());
+  DirectHandle<String> lhs = args.at<String>(0);
+  DirectHandle<Object> rhs = args.at<Object>(1);
+  Handle<HeapObject> maybe_feedback_vector = args.at<HeapObject>(2);
+  int slot_index = args.tagged_index_value_at(3);
+  return StringAdd_StringConstant_Internalize(isolate, lhs, rhs,
+                                              maybe_feedback_vector, slot_index,
+                                              ASVariant::kLhsIsStringConstant);
+}
+
+RUNTIME_FUNCTION(Runtime_StringAdd_RhsIsStringConstant_Internalize) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(4, args.length());
+  DirectHandle<Object> lhs = args.at<Object>(0);
+  DirectHandle<String> rhs = args.at<String>(1);
+  Handle<HeapObject> maybe_feedback_vector = args.at<HeapObject>(2);
+  int slot_index = args.tagged_index_value_at(3);
+  return StringAdd_StringConstant_Internalize(isolate, lhs, rhs,
+                                              maybe_feedback_vector, slot_index,
+                                              ASVariant::kRhsIsStringConstant);
 }
 
 RUNTIME_FUNCTION(Runtime_InternalizeString) {
@@ -241,7 +281,6 @@ RUNTIME_FUNCTION(Runtime_InternalizeString) {
 }
 
 RUNTIME_FUNCTION(Runtime_StringCharCodeAt) {
-  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
 
@@ -301,6 +340,7 @@ RUNTIME_FUNCTION(Runtime_StringBuilderConcat) {
   DirectHandle<FixedArray> array = args.at<FixedArray>(0);
 
   int array_length = args.smi_value_at(1);
+  DCHECK_GE(array_length, 0);
 
   DirectHandle<String> special = args.at<String>(2);
 
@@ -339,7 +379,7 @@ RUNTIME_FUNCTION(Runtime_StringBuilderConcat) {
         isolate, answer, isolate->factory()->NewRawOneByteString(length));
     DisallowGarbageCollection no_gc;
     StringBuilderConcatHelper(*special, answer->GetChars(no_gc), *array,
-                              array_length);
+                              static_cast<uint32_t>(array_length));
     return *answer;
   } else {
     DirectHandle<SeqTwoByteString> answer;
@@ -347,7 +387,7 @@ RUNTIME_FUNCTION(Runtime_StringBuilderConcat) {
         isolate, answer, isolate->factory()->NewRawTwoByteString(length));
     DisallowGarbageCollection no_gc;
     StringBuilderConcatHelper(*special, answer->GetChars(no_gc), *array,
-                              array_length);
+                              static_cast<uint32_t>(array_length));
     return *answer;
   }
 }
@@ -450,7 +490,6 @@ RUNTIME_FUNCTION(Runtime_StringGreaterThanOrEqual) {
 }
 
 RUNTIME_FUNCTION(Runtime_StringEqual) {
-  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
   HandleScope handle_scope(isolate);
   DCHECK_EQ(2, args.length());
   // This function can be called from Wasm: optimized Wasm code calls
@@ -474,7 +513,6 @@ RUNTIME_FUNCTION(Runtime_StringEqual) {
 }
 
 RUNTIME_FUNCTION(Runtime_StringCompare) {
-  SaveAndClearThreadInWasmFlag non_wasm_scope(isolate);
   DCHECK_EQ(2, args.length());
   HandleScope scope(isolate);
   DirectHandle<String> lhs(Cast<String>(args[0]), isolate);
@@ -496,6 +534,37 @@ RUNTIME_FUNCTION(Runtime_StringMaxLength) {
   return Smi::FromInt(String::kMaxLength);
 }
 
+namespace {
+
+template <const char* replacement, typename Char, typename IndicesT>
+void CopyEscapedRaw(Char* dst, const Char* src, int src_length,
+                    const IndicesT& indices,
+                    const DisallowGarbageCollection& no_gc) {
+  constexpr size_t replacement_length =
+      std::char_traits<char>::length(replacement);
+  int prev_index = -1;  // Start at -1 to avoid special-casing the first match.
+  int dst_index = 0;
+  for (int index : indices) {
+    const int slice_start = prev_index + 1;
+    const int slice_end = index;
+    if (slice_end > slice_start) {
+      const int slice_length = slice_end - slice_start;
+      CopyChars(dst + dst_index, src + slice_start, slice_length);
+      dst_index += slice_length;
+    }
+    CopyChars(dst + dst_index, replacement, replacement_length);
+    dst_index += replacement_length;
+    prev_index = index;
+  }
+
+  if (prev_index < src_length - 1) {
+    const int remaining_length = src_length - prev_index - 1;
+    CopyChars(dst + dst_index, src + prev_index + 1, remaining_length);
+  }
+}
+
+}  // namespace
+
 RUNTIME_FUNCTION(Runtime_StringEscapeQuotes) {
   HandleScope handle_scope(isolate);
   DCHECK_EQ(1, args.length());
@@ -508,43 +577,55 @@ RUNTIME_FUNCTION(Runtime_StringEscapeQuotes) {
   DirectHandle<String> quotes =
       isolate->factory()->LookupSingleCharacterStringFromCode('"');
 
+  string = String::Flatten(isolate, string);
   int quote_index = String::IndexOf(isolate, string, quotes, 0);
 
   // No quotes, nothing to do.
   if (quote_index == -1) return *string;
 
   // Find all quotes.
-  std::vector<int> indices = {quote_index};
+  base::SmallVector<int, 2> indices = {quote_index};
   while (quote_index + 1 < string_length) {
     quote_index = String::IndexOf(isolate, string, quotes, quote_index + 1);
     if (quote_index == -1) break;
     indices.emplace_back(quote_index);
   }
 
-  // Build the replacement string.
-  DirectHandle<String> replacement =
-      isolate->factory()->NewStringFromAsciiChecked("&quot;");
-  const int estimated_part_count = static_cast<int>(indices.size()) * 2 + 1;
-  ReplacementStringBuilder builder(isolate->heap(), string,
-                                   estimated_part_count);
-
-  int prev_index = -1;  // Start at -1 to avoid special-casing the first match.
-  for (int index : indices) {
-    const int slice_start = prev_index + 1;
-    const int slice_end = index;
-    if (slice_end > slice_start) {
-      builder.AddSubjectSlice(slice_start, slice_end);
-    }
-    builder.AddString(replacement);
-    prev_index = index;
-  }
-
-  if (prev_index < string_length - 1) {
-    builder.AddSubjectSlice(prev_index + 1, string_length);
-  }
+  static constexpr char replacement[] = "&quot;";
+  constexpr size_t replacement_length =
+      std::char_traits<char>::length(replacement);
+  constexpr size_t replace_length_factor =
+      replacement_length - 1 /* original '"' */;
+  static_assert(replace_length_factor == 5);
+  uint32_t result_length =
+      string_length +
+      static_cast<uint32_t>(indices.size()) * replace_length_factor;
+  const bool is_one_byte = String::IsOneByteRepresentationUnderneath(*string);
 
   DirectHandle<String> result;
-  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, result, builder.ToString());
+  if (is_one_byte) {
+    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+        isolate, result,
+        isolate->factory()->NewRawOneByteString(result_length));
+  } else {
+    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+        isolate, result,
+        isolate->factory()->NewRawTwoByteString(result_length));
+  }
+  DisallowGarbageCollection no_gc;
+  String::FlatContent flat_string = string->GetFlatContent(no_gc);
+  if (is_one_byte) {
+    base::Vector<const uint8_t> string_vec = flat_string.ToOneByteVector();
+    uint8_t* dst = Cast<SeqOneByteString>(result)->GetChars(no_gc);
+    CopyEscapedRaw<replacement>(dst, string_vec.data(), string_vec.length(),
+                                indices, no_gc);
+  } else {
+    base::Vector<const base::uc16> string_vec = flat_string.ToUC16Vector();
+    base::uc16* dst = Cast<SeqTwoByteString>(result)->GetChars(no_gc);
+    CopyEscapedRaw<replacement>(dst, string_vec.data(), string_vec.length(),
+                                indices, no_gc);
+  }
+
   return *result;
 }
 

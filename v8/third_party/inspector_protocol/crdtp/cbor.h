@@ -46,7 +46,7 @@ namespace cbor {
 // Checks whether |msg| is a cbor message.
 bool IsCBORMessage(span<uint8_t> msg);
 
-// Performs a lightweight check of |msg|.
+// Performs a leightweight check of |msg|.
 // Disallows:
 // - Empty message
 // - Not starting with the two bytes 0xd8, 0x5a
@@ -127,7 +127,7 @@ class EnvelopeHeader {
   EnvelopeHeader() = default;
   ~EnvelopeHeader() = default;
 
-  // Parse envelope. Implies that `in` accommodates the entire size of envelope.
+  // Parse envelope. Implies that `in` accomodates the entire size of envelope.
   static StatusOr<EnvelopeHeader> Parse(span<uint8_t> in);
   // Parse envelope, but allow `in` to only include the beginning of the
   // envelope.
@@ -311,6 +311,18 @@ void ParseCBOR(span<uint8_t> bytes, ParserHandler* out);
 Status AppendString8EntryToCBORMap(span<uint8_t> string8_key,
                                    span<uint8_t> string8_value,
                                    std::vector<uint8_t>* cbor);
+
+// Safely extracts the value for |string8_key| from a CBOR encoded map wrapped
+// in an envelope. This is a shallow parser that skips unknown keys and
+// complex values. If the key is not found, or if it is found more than once,
+// or if it contains nested maps/arrays, returns an empty span.
+// Explicitly rejects duplicate keys and non-STRING8 values.
+span<uint8_t> GetString8ValueFromMap(span<uint8_t> message,
+                                     span<uint8_t> string8_key);
+// Safely checks if |key| exists in the top-level of a CBOR encoded map wrapped
+// in an envelope. Shallow parser that skips nested structures.
+// Returns true as soon as the key is found at the top level.
+bool HasKeyInMap(span<uint8_t> message, span<uint8_t> key);
 
 namespace internals {  // Exposed only for writing tests.
 size_t ReadTokenStart(span<uint8_t> bytes,

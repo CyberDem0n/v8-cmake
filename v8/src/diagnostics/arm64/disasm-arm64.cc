@@ -270,6 +270,27 @@ void DisassemblingDecoder::VisitLogicalImmediate(Instruction* instr) {
   Format(instr, mnemonic, form);
 }
 
+void DisassemblingDecoder::VisitMinMaxImmediate(Instruction* instr) {
+  const char* mnemonic = "";
+  const char* form = "'Rd, 'Rn, 'IMinMax";
+
+  switch (instr->Mask(MinMaxImmediateMask)) {
+#define FORMAT(A, B) \
+  case A##_w_imm:    \
+  case A##_x_imm:    \
+    mnemonic = B;    \
+    break;
+    FORMAT(SMAX, "smax");
+    FORMAT(UMAX, "umax");
+    FORMAT(SMIN, "smin");
+    FORMAT(UMIN, "umin");
+#undef FORMAT
+    default:
+      UNREACHABLE();
+  }
+  Format(instr, mnemonic, form);
+}
+
 bool DisassemblingDecoder::IsMovzMovnImm(unsigned reg_size, uint64_t value) {
   DCHECK((reg_size == kXRegSizeInBits) ||
          ((reg_size == kWRegSizeInBits) && (value <= 0xFFFFFFFF)));
@@ -660,6 +681,10 @@ void DisassemblingDecoder::VisitDataProcessing2Source(Instruction* instr) {
     FORMAT(LSRV, "lsr");
     FORMAT(ASRV, "asr");
     FORMAT(RORV, "ror");
+    FORMAT(SMAX, "smax");
+    FORMAT(UMAX, "umax");
+    FORMAT(SMIN, "smin");
+    FORMAT(UMIN, "umin");
 #undef FORMAT
     default:
       form = "(DataProcessing2Source)";
@@ -883,7 +908,7 @@ void DisassemblingDecoder::VisitLoadStoreUnsignedOffset(Instruction* instr) {
 #undef LS_UNSIGNEDOFFSET
     case PRFM_unsigned:
       mnemonic = "prfm";
-      form = "'PrefOp, ['Xn'ILU]";
+      form = "'PrefOp, ['Xns'ILU]";
   }
   Format(instr, mnemonic, form);
 }
@@ -3057,6 +3082,10 @@ void DisassemblingDecoder::VisitNEONSHA3(Instruction* instr) {
     case NEON_EOR3:
       mnemonic = "eor3";
       break;
+    case NEON_XAR:
+      mnemonic = "xar";
+      form = "'Vd.2d, 'Vn.2d, 'Vm.2d, #'u1510";
+      break;
     default:
       form = "(NEONSHA3)";
   }
@@ -3786,6 +3815,24 @@ void DisassemblingDecoder::VisitNEONTable(Instruction* instr) {
   Format(instr, mnemonic, nfd.Substitute(re_form));
 }
 
+void DisassemblingDecoder::VisitSVEBitPerm(Instruction* instr) {
+  const char* form = "'Zd.%s, 'Zn.%s, 'Zm.%s";
+  const char* mnemonic = "unimplemented";
+  SVESizeDecoder ssd(instr);
+
+  DCHECK_EQ(instr->Mask(SVEBitPermFMask), SVEBitPermFixed);
+
+  switch (instr->Mask(SVEBitPermMask)) {
+    case BEXT:
+      mnemonic = "bext";
+      break;
+    default:
+      break;
+  }
+
+  Format(instr, mnemonic, ssd.Substitute(form));
+}
+
 void DisassemblingDecoder::VisitUnimplemented(Instruction* instr) {
   Format(instr, "unimplemented", "(Unimplemented)");
 }
@@ -3876,10 +3923,11 @@ void DisassemblingDecoder::Substitute(Instruction* instr, const char* string) {
 int DisassemblingDecoder::SubstituteField(Instruction* instr,
                                           const char* format) {
   switch (format[0]) {
-    // NB. The remaining substitution prefix characters are: GJKUZ.
+    // NB. The remaining substitution prefix characters are: GJKU.
     case 'R':  // Register. X or W, selected by sf bit.
     case 'F':  // FP register. S or D, selected by type field.
     case 'V':  // Vector register, V, vector format.
+    case 'Z':  // SVE register, Z, scalable vector format.
     case 'W':
     case 'X':
     case 'B':
@@ -3908,6 +3956,8 @@ int DisassemblingDecoder::SubstituteField(Instruction* instr,
       return SubstituteLSRegOffsetField(instr, format);
     case 'M':
       return SubstituteBarrierField(instr, format);
+    case 'u':
+      return SubstituteIntField(instr, format);
     default:
       UNREACHABLE();
   }
@@ -4046,6 +4096,9 @@ int DisassemblingDecoder::SubstituteRegisterField(Instruction* instr,
     case 'V':
       AppendToOutput("v%d", reg_num);
       return field_len;
+    case 'Z':
+      AppendToOutput("z%d", reg_num);
+      return field_len;
     default:
       UNREACHABLE();
   }
@@ -4065,7 +4118,13 @@ int DisassemblingDecoder::SubstituteImmediateField(Instruction* instr,
   DCHECK_EQ(format[0], 'I');
 
   switch (format[1]) {
-    case 'M': {  // IMoveImm or IMoveLSL.
+    case 'M': {  // IMinMax, IMoveImm, or IMoveLSL.
+      if (format[2] == 'i') {
+        int32_t imm = instr->Bit(18) == 1 ? instr->Bits(17, 10)
+                                          : instr->SignedBits(17, 10);
+        AppendToOutput("#%" PRId32, imm);
+        return 7;
+      }
       if (format[5] == 'I' || format[5] == 'N') {
         uint64_t imm = static_cast<uint64_t>(instr->ImmMoveWide())
                        << (16 * instr->ShiftMoveWide());
@@ -4491,7 +4550,7 @@ int DisassemblingDecoder::SubstitutePrefetchField(Instruction* instr,
   int prefetch_mode = instr->PrefetchMode();
 
   const char* ls = (prefetch_mode & 0x10) ? "st" : "ld";
-  int level = (prefetch_mode >> 1) + 1;
+  int level = ((prefetch_mode >> 1) & 3) + 1;
   const char* ks = (prefetch_mode & 1) ? "strm" : "keep";
 
   AppendToOutput("p%sl%d%s", ls, level, ks);
@@ -4513,6 +4572,32 @@ int DisassemblingDecoder::SubstituteBarrierField(Instruction* instr,
 
   AppendToOutput("%s", options[domain][type]);
   return 1;
+}
+
+int DisassemblingDecoder::SubstituteIntField(const Instruction* instr,
+                                             const char* format) {
+  // A generic unsigned int field uses a placeholder of the form
+  // 'uAABB respectively where AA and BB are two digit bit positions between
+  // 00 and 31, and AA >= BB. The placeholder is substituted with the
+  // decimal integer represented by the bits in the instruction between
+  // positions AA and BB inclusive.
+  int32_t bits = 0;
+  const char* c = format;
+  DCHECK_EQ(*c, 'u');
+  c++;  // Skip the 'u'
+  DCHECK_EQ(strspn(c, "0123456789"), 4);
+  int msb = ((c[0] - '0') * 10) + (c[1] - '0');
+  int lsb = ((c[2] - '0') * 10) + (c[3] - '0');
+  DCHECK_GE(msb, lsb);
+  DCHECK_LE(msb, 32);
+  c += 4;
+  int chunk_width = msb - lsb + 1;
+  DCHECK((chunk_width > 0) && (chunk_width < 32));
+  bits = (bits << chunk_width) | (instr->Bits(msb, lsb));
+
+  AppendToOutput("%d", bits);
+
+  return static_cast<int>(c - format);
 }
 
 void DisassemblingDecoder::ResetOutput() {
@@ -4547,6 +4632,76 @@ void DisassemblingDecoder::DisassembleNEONPolynomialMul(Instruction* instr) {
   } else {
     mnemonic = "undefined";
   }
+  Format(instr, mnemonic, form);
+}
+
+void DisassemblingDecoder::VisitCpy(Instruction* instr) {
+  const char* mnemonic = "";
+
+  switch (instr->Mask(CpyMask)) {
+    default:
+      UNREACHABLE();
+    case CPYP:
+      mnemonic = "cpyp";
+      break;
+    case CPYM:
+      mnemonic = "cpym";
+      break;
+    case CPYE:
+      mnemonic = "cpye";
+      break;
+  }
+  const char* form = "['Xd]!, ['Xs]!, 'Xn!";
+
+  int d = instr->Rd();
+  int n = instr->Rn();
+  int s = instr->Rs();
+
+  // Aliased registers and sp/zr are disallowed.
+  if ((d == n) || (d == s) || (n == s) || (d == 31) || (n == 31) || (s == 31)) {
+    form = nullptr;
+  }
+
+  // Bits 31 and 30 must be zero.
+  if (instr->Bits(31, 30)) {
+    form = nullptr;
+  }
+
+  Format(instr, mnemonic, form);
+}
+
+void DisassemblingDecoder::VisitSet(Instruction* instr) {
+  const char* mnemonic = "";
+
+  switch (instr->Mask(SetMask)) {
+    default:
+      UNREACHABLE();
+    case SETP:
+      mnemonic = "setp";
+      break;
+    case SETM:
+      mnemonic = "setm";
+      break;
+    case SETE:
+      mnemonic = "sete";
+      break;
+  }
+  const char* form = "['Xd]!, 'Xn!, 'Xs";
+
+  int d = instr->Rd();
+  int n = instr->Rn();
+  int s = instr->Rs();
+
+  // Aliased registers are disallowed, only rs can be zr/sp.
+  if ((d == n) || (d == s) || (n == s) || (d == 31) || (n == 31)) {
+    form = nullptr;
+  }
+
+  // Bits 31 and 30 must be zero.
+  if (instr->Bits(31, 30)) {
+    form = nullptr;
+  }
+
   Format(instr, mnemonic, form);
 }
 

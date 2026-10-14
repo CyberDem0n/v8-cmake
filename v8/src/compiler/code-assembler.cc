@@ -8,6 +8,7 @@
 #include <ostream>
 #include <thread>  // NOLINT(build/c++11) (for this_thread::yield())
 
+#include "src/base/small-vector.h"
 #include "src/builtins/builtins-inl.h"
 #include "src/builtins/constants-table-builder.h"
 #include "src/codegen/compiler.h"
@@ -35,7 +36,6 @@ namespace internal {
 
 constexpr MachineType MachineTypeOf<Smi>::value;
 constexpr MachineType MachineTypeOf<Object>::value;
-constexpr MachineType MachineTypeOf<MaybeObject>::value;
 
 namespace compiler {
 
@@ -261,6 +261,13 @@ bool CodeAssembler::IsTruncateFloat64ToFloat16RawBitsSupported() const {
       .IsSupported();
 }
 
+bool CodeAssembler::IsChangeFloat16RawBitsToFloat64Supported() const {
+  return raw_assembler()
+      ->machine()
+      ->ChangeFloat16RawBitsToFloat64()
+      .IsSupported();
+}
+
 bool CodeAssembler::IsInt32AbsWithOverflowSupported() const {
   return raw_assembler()->machine()->Int32AbsWithOverflow().IsSupported();
 }
@@ -409,6 +416,10 @@ TNode<Float32T> CodeAssembler::Float32Constant(double value) {
 }
 
 TNode<Float64T> CodeAssembler::Float64Constant(double value) {
+  return UncheckedCast<Float64T>(jsgraph()->Float64Constant(value));
+}
+
+TNode<Float64T> CodeAssembler::Float64Constant(Float64 value) {
   return UncheckedCast<Float64T>(jsgraph()->Float64Constant(value));
 }
 
@@ -651,12 +662,25 @@ void CodeAssembler::ReturnIf(TNode<BoolT> condition, TNode<Object> value) {
 }
 
 void CodeAssembler::AbortCSADcheck(Node* message) {
+#if V8_ENABLE_WEBASSEMBLY
+  if (wasm::BuiltinLookup::IsWasmBuiltinId(builtin())) {
+    // We switch to the central stack for AbortCSADcheck because it requires a
+    // large amount of stack space to push the stack trace.
+    SwitchToTheCentralStackIfNeeded();
+  }
+#endif
   raw_assembler()->AbortCSADcheck(message);
 }
 
 void CodeAssembler::DebugBreak() { raw_assembler()->DebugBreak(); }
 
 void CodeAssembler::Unreachable() { raw_assembler()->Unreachable(); }
+
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+void CodeAssembler::EnterSandbox() { raw_assembler()->EnterSandbox(); }
+
+void CodeAssembler::ExitSandbox() { raw_assembler()->ExitSandbox(); }
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
 
 void CodeAssembler::EmitComment(std::string str) {
   if (!v8_flags.code_comments) return;
@@ -818,15 +842,18 @@ TNode<UintPtrT> CodeAssembler::ChangeFloat64ToUintPtr(TNode<Float64T> value) {
   }
   return UncheckedCast<UintPtrT>(raw_assembler()->ChangeFloat64ToUint32(value));
 }
-
 TNode<Float64T> CodeAssembler::ChangeUintPtrToFloat64(TNode<UintPtrT> value) {
   if (raw_assembler()->machine()->Is64()) {
-    // TODO(turbofan): Maybe we should introduce a ChangeUint64ToFloat64
-    // machine operator to TurboFan here?
-    return UncheckedCast<Float64T>(
-        raw_assembler()->RoundUint64ToFloat64(value));
+    return ChangeUint64ToFloat64(ReinterpretCast<Uint64T>(value));
   }
   return UncheckedCast<Float64T>(raw_assembler()->ChangeUint32ToFloat64(value));
+}
+
+TNode<Float64T> CodeAssembler::ChangeUint64ToFloat64(TNode<Uint64T> value) {
+  DCHECK(raw_assembler()->machine()->Is64());
+  // TODO(turbofan): Maybe we should introduce a ChangeUint64ToFloat64
+  // machine operator to TurboFan here?
+  return UncheckedCast<Float64T>(raw_assembler()->RoundUint64ToFloat64(value));
 }
 
 TNode<Float64T> CodeAssembler::RoundIntPtrToFloat64(Node* value) {
@@ -1045,6 +1072,21 @@ void CodeAssembler::StoreNoWriteBarrier(MachineRepresentation rep, Node* base,
       CanBeTaggedPointer(rep) ? kAssertNoWriteBarrier : kNoWriteBarrier);
 }
 
+void CodeAssembler::UnalignedStoreNoWriteBarrier(MachineRepresentation rep,
+                                                 TNode<BytecodeArray> base,
+                                                 TNode<IntPtrT> offset,
+                                                 Node* value) {
+  DCHECK(!raw_assembler()->IsMapOffsetConstantMinusTag(offset));
+  if (UnalignedStoreSupported(rep)) {
+    raw_assembler()->Store(
+        rep, base, offset, value,
+        CanBeTaggedPointer(rep) ? kAssertNoWriteBarrier : kNoWriteBarrier);
+  } else {
+    Node* base_raw = BitcastTaggedToWord(base);
+    raw_assembler()->UnalignedStore(rep, base_raw, offset, value);
+  }
+}
+
 void CodeAssembler::UnsafeStoreNoWriteBarrier(MachineRepresentation rep,
                                               Node* base, Node* value) {
   raw_assembler()->Store(rep, base, value, kNoWriteBarrier);
@@ -1160,6 +1202,10 @@ void CodeAssembler::StoreRoot(RootIndex root_index, TNode<Object> value) {
       ExternalConstant(ExternalReference::isolate_root(isolate()));
   int offset = IsolateData::root_slot_offset(root_index);
   StoreFullTaggedNoWriteBarrier(isolate_root, IntPtrConstant(offset), value);
+}
+
+void CodeAssembler::Retain(TNode<Object> value) {
+  raw_assembler()->Retain(value);
 }
 
 Node* CodeAssembler::Projection(int index, Node* value) {
@@ -1361,6 +1407,7 @@ void CodeAssembler::TailCallRuntimeImpl(
   raw_assembler()->TailCallN(call_descriptor, inputs.size(), inputs.data());
 }
 
+// LINT.IfChange
 Node* CodeAssembler::CallStubN(StubCallMode call_mode,
                                const CallInterfaceDescriptor& descriptor,
                                int input_count, Node* const* inputs) {
@@ -1387,6 +1434,7 @@ Node* CodeAssembler::CallStubN(StubCallMode call_mode,
   CallEpilogue();
   return return_value;
 }
+// LINT.ThenChange(/src/codegen/turboshaft-builtins-assembler-inl.h)
 
 void CodeAssembler::TailCallStubImpl(const CallInterfaceDescriptor& descriptor,
                                      TNode<Code> target, TNode<Object> context,
@@ -1429,6 +1477,7 @@ Node* CodeAssembler::CallStubRImpl(StubCallMode call_mode,
   return CallStubN(call_mode, descriptor, inputs.size(), inputs.data());
 }
 
+// LINT.IfChange
 Node* CodeAssembler::CallJSStubImpl(
     const CallInterfaceDescriptor& descriptor, TNode<Object> target,
     TNode<Object> context, TNode<Object> function,
@@ -1460,6 +1509,7 @@ Node* CodeAssembler::CallJSStubImpl(
   return CallStubN(StubCallMode::kCallCodeObject, descriptor, inputs.size(),
                    inputs.data());
 }
+// LINT.ThenChange(/src/codegen/turboshaft-builtins-assembler-inl.h)
 
 void CodeAssembler::TailCallStubThenBytecodeDispatchImpl(
     const CallInterfaceDescriptor& descriptor, Node* target, Node* context,
@@ -1657,6 +1707,30 @@ void CodeAssembler::Switch(Node* index, Label* default_label,
   return raw_assembler()->Switch(index, default_label->label_, case_values,
                                  labels, case_count);
 }
+
+template <typename Value>
+void CodeAssembler::Switch(
+    Node* index, Label* default_label,
+    const std::initializer_list<std::pair<Value, Label*>>& cases) {
+  const size_t case_count = cases.size();
+  RawMachineLabel** labels =
+      zone()->AllocateArray<RawMachineLabel*>(case_count);
+  size_t i = 0;
+  base::SmallVector<int32_t, 8> case_values(case_count);
+  for (auto [value, label] : cases) {
+    labels[i] = label->label_;
+    label->MergeVariables();
+    case_values[i] = static_cast<int32_t>(value);
+    ++i;
+  }
+  default_label->MergeVariables();
+  return raw_assembler()->Switch(index, default_label->label_,
+                                 case_values.data(), labels, case_count);
+}
+
+template void CodeAssembler::Switch<InstanceType>(
+    Node* index, Label* default_label,
+    const std::initializer_list<std::pair<InstanceType, Label*>>& cases);
 
 bool CodeAssembler::UnalignedLoadSupported(MachineRepresentation rep) const {
   return raw_assembler()->machine()->UnalignedLoadSupported(rep);

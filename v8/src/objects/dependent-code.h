@@ -6,15 +6,18 @@
 #define V8_OBJECTS_DEPENDENT_CODE_H_
 
 #include "src/objects/fixed-array.h"
+#include "src/roots/roots.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
-#include "src/roots/roots.h"
 
 namespace v8 {
 namespace internal {
 
 enum class LazyDeoptimizeReason : uint8_t;
+
+using DependableObject =
+    Union<Map, PropertyCell, AllocationSite, ContextCell, ScopeInfo>;
 
 // Dependent code is conceptually the list of {Code, DependencyGroup} tuples
 // associated with an object, where the dependency group is a reason that could
@@ -28,6 +31,8 @@ enum class LazyDeoptimizeReason : uint8_t;
 // contents may shrink).
 // TODO(jgruber): Consider adding physical shrinking.
 class DependentCode : public WeakArrayList {
+  V8_IT_NO_AUTO_CHECKER;
+
  public:
   enum DependencyGroup {
     // Group of code objects that embed a transition to this map, and depend on
@@ -76,10 +81,9 @@ class DependentCode : public WeakArrayList {
 
   // Register a dependency of {code} on {object}, of the kinds given by
   // {groups}.
-  V8_EXPORT_PRIVATE static void InstallDependency(Isolate* isolate,
-                                                  Handle<Code> code,
-                                                  Handle<HeapObject> object,
-                                                  DependencyGroups groups);
+  V8_EXPORT_PRIVATE static void InstallDependency(
+      Isolate* isolate, Handle<Code> code, Handle<DependableObject> object,
+      DependencyGroups groups);
 
   template <typename ObjectT>
   static void DeoptimizeDependencyGroups(Isolate* isolate, ObjectT object,
@@ -108,8 +112,9 @@ class DependentCode : public WeakArrayList {
 
  private:
   // Get/Set {object}'s {DependentCode}.
-  static Tagged<DependentCode> GetDependentCode(Tagged<HeapObject> object);
-  static void SetDependentCode(DirectHandle<HeapObject> object,
+  static Tagged<DependentCode> GetDependentCode(
+      Tagged<DependableObject> object);
+  static void SetDependentCode(DirectHandle<DependableObject> object,
                                DirectHandle<DependentCode> dep);
 
   static DirectHandle<DependentCode> InsertWeakCode(
@@ -134,8 +139,6 @@ class DependentCode : public WeakArrayList {
   static constexpr int LengthFor(int number_of_entries) {
     return number_of_entries * kSlotsPerEntry;
   }
-
-  OBJECT_CONSTRUCTORS(DependentCode, WeakArrayList);
 };
 
 DEFINE_OPERATORS_FOR_FLAGS(DependentCode::DependencyGroups)

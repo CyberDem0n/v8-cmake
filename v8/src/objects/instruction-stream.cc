@@ -10,6 +10,7 @@
 #include "src/codegen/reloc-info-inl.h"
 #include "src/codegen/reloc-info.h"
 #include "src/objects/instruction-stream-inl.h"
+#include "src/objects/objects.h"
 
 namespace v8 {
 namespace internal {
@@ -19,8 +20,8 @@ void InstructionStream::Relocate(WritableJitAllocation& jit_allocation,
   Tagged<Code> code;
   if (!TryGetCodeUnchecked(&code, kAcquireLoad)) return;
   // This is called during evacuation and code.instruction_stream() will point
-  // to the old object. So pass *this directly to the RelocIterator.
-  for (WritableRelocIterator it(jit_allocation, *this, constant_pool(),
+  // to the old object. So pass this directly to the RelocIterator.
+  for (WritableRelocIterator it(jit_allocation, this, constant_pool(),
                                 RelocInfo::kApplyMask);
        !it.done(); it.next()) {
     it.rinfo()->apply(delta);
@@ -29,16 +30,15 @@ void InstructionStream::Relocate(WritableJitAllocation& jit_allocation,
 }
 
 // This function performs the relocations but doesn't trigger any write barriers
-// yet. We skip the write barriers here with UNSAFE_SKIP_WRITE_BARRIER but the
+// yet. We skip the write barriers here using SKIP_WRITE_BARRIER_SCOPE but the
 // caller needs to call RelocateFromDescWriteBarriers afterwards.
 InstructionStream::WriteBarrierPromise InstructionStream::RelocateFromDesc(
     WritableJitAllocation& jit_allocation, Heap* heap, const CodeDesc& desc,
     Address constant_pool, const DisallowGarbageCollection& no_gc) {
-  WriteBarrierPromise write_barrier_promise;
+  WriteBarrierPromise write_barrier_promise(this);
   Assembler* origin = desc.origin;
   const int mode_mask = RelocInfo::PostCodegenRelocationMask();
-  for (WritableRelocIterator it(jit_allocation, *this, constant_pool,
-                                mode_mask);
+  for (WritableRelocIterator it(jit_allocation, this, constant_pool, mode_mask);
        !it.done(); it.next()) {
     // IMPORTANT:
     // this code needs be stay in sync with RelocateFromDescWriteBarriers below.
@@ -46,18 +46,17 @@ InstructionStream::WriteBarrierPromise InstructionStream::RelocateFromDesc(
     RelocInfo::Mode mode = it.rinfo()->rmode();
     if (RelocInfo::IsEmbeddedObjectMode(mode)) {
       DirectHandle<HeapObject> p = it.rinfo()->target_object_handle(origin);
-      it.rinfo()->set_target_object(*this, *p, UNSAFE_SKIP_WRITE_BARRIER,
+      it.rinfo()->set_target_object(this, *p, SKIP_WRITE_BARRIER_SCOPE,
                                     SKIP_ICACHE_FLUSH);
       write_barrier_promise.RegisterAddress(it.rinfo()->pc());
     } else if (RelocInfo::IsCodeTargetMode(mode)) {
       // Rewrite code handles to direct pointers to the first instruction in the
       // code object.
       DirectHandle<HeapObject> p = it.rinfo()->target_object_handle(origin);
-      DCHECK(IsCode(*p));
       Tagged<InstructionStream> target_istream =
-          Cast<Code>(*p)->instruction_stream();
-      it.rinfo()->set_target_address(*this, target_istream->instruction_start(),
-                                     UNSAFE_SKIP_WRITE_BARRIER,
+          TrustedCast<Code>(*p)->instruction_stream();
+      it.rinfo()->set_target_address(this, target_istream->instruction_start(),
+                                     SKIP_WRITE_BARRIER_SCOPE,
                                      SKIP_ICACHE_FLUSH);
       write_barrier_promise.RegisterAddress(it.rinfo()->pc());
     } else if (RelocInfo::IsNearBuiltinEntry(mode)) {
@@ -67,7 +66,7 @@ InstructionStream::WriteBarrierPromise InstructionStream::RelocateFromDesc(
       // This won't trigger a write barrier, but setting mode to
       // UPDATE_WRITE_BARRIER to make it clear that we didn't forget about it
       // below.
-      it.rinfo()->set_target_address(*this, p, UPDATE_WRITE_BARRIER,
+      it.rinfo()->set_target_address(this, p, UPDATE_WRITE_BARRIER,
                                      SKIP_ICACHE_FLUSH);
       DCHECK_EQ(p, it.rinfo()->target_address());
     } else if (RelocInfo::IsWasmStubCall(mode)) {
@@ -83,6 +82,8 @@ InstructionStream::WriteBarrierPromise InstructionStream::RelocateFromDesc(
 #else
       UNREACHABLE();
 #endif
+    } else if (RelocInfo::IsJSDispatchHandle(mode)) {
+      write_barrier_promise.RegisterAddress(it.rinfo()->pc());
     } else {
       intptr_t delta =
           instruction_start() - reinterpret_cast<Address>(desc.buffer);
@@ -103,14 +104,18 @@ void InstructionStream::RelocateFromDescWriteBarriers(
 
     RelocInfo::Mode mode = it.rinfo()->rmode();
     if (RelocInfo::IsEmbeddedObjectMode(mode)) {
-      Tagged<HeapObject> p = it.rinfo()->target_object(heap->isolate());
-      WriteBarrier::ForRelocInfo(*this, it.rinfo(), p, UPDATE_WRITE_BARRIER);
+      Tagged<HeapObject> p = it.rinfo()->target_object();
+      WriteBarrier::ForRelocInfo(this, it.rinfo(), p, UPDATE_WRITE_BARRIER);
       write_barrier_promise.ResolveAddress(it.rinfo()->pc());
     } else if (RelocInfo::IsCodeTargetMode(mode)) {
       Tagged<InstructionStream> target_istream =
           InstructionStream::FromTargetAddress(it.rinfo()->target_address());
-      WriteBarrier::ForRelocInfo(*this, it.rinfo(), target_istream,
+      WriteBarrier::ForRelocInfo(this, it.rinfo(), target_istream,
                                  UPDATE_WRITE_BARRIER);
+      write_barrier_promise.ResolveAddress(it.rinfo()->pc());
+    } else if (RelocInfo::IsJSDispatchHandle(mode)) {
+      JSDispatchHandle handle = it.rinfo()->js_dispatch_handle();
+      WriteBarrier::ForJSDispatchHandle(this, handle, UPDATE_WRITE_BARRIER);
       write_barrier_promise.ResolveAddress(it.rinfo()->pc());
     }
   }
@@ -128,6 +133,36 @@ InstructionStream::WriteBarrierPromise::~WriteBarrierPromise() {
   DCHECK(delayed_write_barriers_.empty());
 }
 #endif
+
+void InstructionStream::ValidateJSDispatchHandles(Heap* heap,
+                                                  const CodeDesc& desc) {
+  if (desc.origin) {
+    for (const auto& pair : desc.origin->js_dispatch_handles()) {
+      JSDispatchHandle handle = pair.first;
+      uint16_t expected_arg_count = pair.second;
+      uint16_t actual_arg_count =
+          heap->isolate()->js_dispatch_table().GetParameterCount(handle);
+      SBXCHECK_EQ(expected_arg_count, actual_arg_count);
+    }
+  }
+}
+
+#ifdef V8_ENABLE_GENERATED_CODE_VALIDATOR
+bool InstructionStream::IsValidated() const {
+  return ReadField<bool>(kIsValidatedOffset);
+}
+
+void InstructionStream::SetValidated() {
+  DCHECK(!IsValidated());
+  WritableJitAllocation writable_allocation =
+      ThreadIsolation::LookupJitAllocation(
+          address(), InstructionStream::SizeFor(body_size()),
+          ThreadIsolation::JitAllocationType::kInstructionStream);
+  DCHECK_EQ(InstructionStream::SizeFor(body_size()),
+            writable_allocation.size());
+  writable_allocation.WriteHeaderSlot<bool, kIsValidatedOffset>(true);
+}
+#endif  // V8_ENABLE_GENERATED_CODE_VALIDATOR
 
 }  // namespace internal
 }  // namespace v8

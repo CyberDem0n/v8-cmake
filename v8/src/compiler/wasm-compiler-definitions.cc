@@ -7,12 +7,36 @@
 #include <optional>
 
 #include "src/base/strings.h"
+#include "src/builtins/builtins.h"
+#include "src/codegen/interface-descriptors-inl.h"
+#include "src/compiler/common-operator.h"
 #include "src/compiler/linkage.h"
 #include "src/wasm/compilation-environment.h"
 #include "src/wasm/wasm-linkage.h"
 #include "src/wasm/wasm-module.h"
+#include "src/wasm/wasm-opcodes.h"
 
 namespace v8::internal::compiler {
+
+SubtypeCheckExactness GetExactness(const wasm::WasmModule* module,
+                                   wasm::HeapType target) {
+  // For exact target types, an exact match is needed for correctness;
+  // for final target types, it's a performance optimization.
+  // For types with custom descriptors, we need to look at their immediate
+  // supertype instead of the object's map.
+  // See Liftoff's {SubtypeCheck()} for detailed explanation.
+  if (!target.has_index()) {
+    DCHECK(!target.is_exact());  // The spec only allows exact index types.
+    return SubtypeCheckExactness::kMayBeSubtype;
+  }
+  const wasm::TypeDefinition& type = module->type(target.ref_index());
+  if (type.is_final || target.is_exact()) {
+    return type.has_descriptor()
+               ? SubtypeCheckExactness::kExactMatchLastSupertype
+               : SubtypeCheckExactness::kExactMatchOnly;
+  }
+  return SubtypeCheckExactness::kMayBeSubtype;
+}
 
 base::Vector<const char> GetDebugName(Zone* zone,
                                       const wasm::WasmModule* module,
@@ -41,18 +65,72 @@ base::Vector<const char> GetDebugName(Zone* zone,
 
   base::EmbeddedVector<char, kBufferLength> name_vector;
   int name_len = SNPrintF(name_vector, "wasm-function#%d", index);
-  DCHECK(name_len > 0 && name_len < name_vector.length());
+  DCHECK(name_len > 0 && static_cast<size_t>(name_len) < name_vector.size());
 
   char* index_name = zone->AllocateArray<char>(name_len);
   memcpy(index_name, name_vector.begin(), name_len);
   return base::Vector<const char>(index_name, name_len);
 }
 
+TrapId GetTrapIdForTrap(wasm::TrapReason reason) {
+  switch (reason) {
+#define TRAPREASON_TO_TRAPID(name)                                 \
+  case wasm::k##name:                                              \
+    static_assert(static_cast<int>(TrapId::k##name) ==             \
+                      static_cast<int>(Builtin::kThrowWasm##name), \
+                  "trap id mismatch");                             \
+    return TrapId::k##name;
+    FOREACH_WASM_TRAPREASON(TRAPREASON_TO_TRAPID)
+#undef TRAPREASON_TO_TRAPID
+    default:
+      UNREACHABLE();
+  }
+}
+
+namespace {
+CallDescriptor* GetContinuationResumeDescriptor(Zone* zone) {
+  MachineType target_type = MachineType::Pointer();
+  LinkageLocation target_loc = LinkageLocation::ForAnyRegister(target_type);
+  // TODO(thibaudm): Add support for arguments and return values.
+  LocationSignature::Builder locations(zone, 0, 2);
+  // The WasmFXResume builtin just forwards its register arguments (the stack
+  // pointer and the argument buffer) to the target stack, so expect them to be
+  // in the same registers on stack entry:
+  locations.AddParam(LinkageLocation(LinkageLocation::ForRegister(
+      WasmFXResumeDescriptor::GetRegisterParameter(0).code(),
+      MachineType::Pointer())));
+  locations.AddParam(LinkageLocation(LinkageLocation::ForRegister(
+      WasmFXResumeDescriptor::GetRegisterParameter(1).code(),
+      MachineType::Pointer())));
+  const RegList kCalleeSaveRegisters;
+  const DoubleRegList kCalleeSaveFPRegisters;
+  return zone->New<CallDescriptor>(                   // --
+      CallDescriptor::Kind::kResumeWasmContinuation,  // kind
+      kInvalidEntrypointTag,                          // tag
+                              // TODO(thibaudm): Use the CPT.
+      target_type,                        // target MachineType
+      target_loc,                         // target location
+      locations.Get(),                    // location_sig
+      0,                                  // parameter slot count
+      compiler::Operator::kNoProperties,  // properties
+      kCalleeSaveRegisters,               // callee-saved registers
+      kCalleeSaveFPRegisters,             // callee-saved fp regs
+      CallDescriptor::kNoFlags,           // flags
+      "wasm-resume",                      // debug name
+      RegList{},                          // allocatable registers
+      0,                                  // return slot count
+      0);                                 // signature hash
+}
+}  // namespace
+
 // General code uses the above configuration data.
 template <typename T>
 CallDescriptor* GetWasmCallDescriptor(Zone* zone, const Signature<T>* fsig,
                                       WasmCallKind call_kind,
                                       bool need_frame_state) {
+  if (call_kind == kWasmContinuation) {
+    return GetContinuationResumeDescriptor(zone);
+  }
   // The extra here is to accommodate the instance object as first parameter
   // and, when specified, the additional callable.
   bool extra_callable_param =
@@ -87,6 +165,8 @@ CallDescriptor* GetWasmCallDescriptor(Zone* zone, const Signature<T>* fsig,
     case kWasmCapiFunction:
       descriptor_kind = CallDescriptor::kCallWasmCapiFunction;
       break;
+    case kWasmContinuation:
+      UNREACHABLE();  // Already handled.
   }
 
   CallDescriptor::Flags flags = need_frame_state
@@ -104,7 +184,6 @@ CallDescriptor* GetWasmCallDescriptor(Zone* zone, const Signature<T>* fsig,
       kCalleeSaveFPRegisters,             // callee-saved fp regs
       flags,                              // flags
       "wasm-call",                        // debug name
-      StackArgumentOrder::kDefault,       // order of the arguments in the stack
       RegList{},                          // allocatable registers
       return_slots,                       // return slot count
       signature_hash);

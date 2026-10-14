@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --allow-natives-syntax --turbofan --no-always-turbofan
+// Flags: --allow-natives-syntax --turbofan
 
 var buffer = new ArrayBuffer(64);
 var dataview = new DataView(buffer, 8, 24);
@@ -99,6 +99,8 @@ writeUint32(0, 0xdeadbeef);
 assertEquals(0xdeadbeef, dataview.getUint32(0));
 writeUint32(0, 0xefbeadde, true);
 assertEquals(0xdeadbeef, dataview.getUint32(0));
+writeUint32(0, -1);
+assertEquals(0xffffffff, dataview.getUint32(0));
 
 // TurboFan valid setInt32.
 warmup(writeInt32);

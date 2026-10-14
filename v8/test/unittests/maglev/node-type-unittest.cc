@@ -4,7 +4,7 @@
 
 #ifdef V8_ENABLE_MAGLEV
 
-#include "src/maglev/maglev-ir.h"
+#include "src/maglev/maglev-node-type.h"
 #include "test/unittests/maglev/maglev-test.h"
 
 namespace v8 {
@@ -34,7 +34,7 @@ TEST_F(MaglevTest, NodeTypeSmokeTests) {
 TEST_F(MaglevTest, EmptyTypeIsAnything) {
   for (NodeType a : kAllNodeTypes) {
     if (NodeTypeIsNeverStandalone(a)) continue;
-    CHECK(NodeTypeIs(EmptyNodeType(), a));
+    CHECK(NodeTypeIs(EmptyNodeType(), a, NodeTypeIsVariant::kAllowNone));
   }
 }
 
@@ -55,9 +55,17 @@ TEST_F(MaglevTest, NodeTypeMissingEntriesExist) {
   }
 }
 
+#if V8_ENABLE_WEBASSEMBLY
+#define SKIP_INACCESSIBLE \
+  if (idx == RootIndex::kWasmNull) continue
+#else
+#define SKIP_INACCESSIBLE (void)0
+#endif
+
 // Ensure StaticTypeForConstant is consistent with actual objects.
 TEST_F(MaglevTest, ConstantNodeTypeApproximationIsConsistent) {
   for (auto idx = RootIndex::kFirstRoot; idx <= RootIndex::kLastRoot; ++idx) {
+    SKIP_INACCESSIBLE;
     Tagged<Object> obj = isolate()->roots_table().slot(idx).load(isolate());
     if (obj.ptr() == kNullAddress || !obj.IsHeapObject()) continue;
     compiler::HeapObjectRef ref = MakeRef(broker(), Cast<HeapObject>(obj));
@@ -76,6 +84,7 @@ TEST_F(MaglevTest, ConstantNodeTypeApproximationIsConsistent) {
 // Ensure StaticTypeForMap is consistent with actual maps.
 TEST_F(MaglevTest, NodeTypeApproximationIsConsistent) {
   for (auto idx = RootIndex::kFirstRoot; idx <= RootIndex::kLastRoot; ++idx) {
+    SKIP_INACCESSIBLE;
     Tagged<Object> obj = isolate()->roots_table().slot(idx).load(isolate());
     if (obj.ptr() == kNullAddress || !IsMap(obj)) continue;
     Tagged<Map> map = Cast<Map>(obj);
@@ -94,6 +103,7 @@ TEST_F(MaglevTest, NodeTypeApproximationIsConsistent) {
 // Ensure IntersectType is consistent with actual maps.
 TEST_F(MaglevTest, NodeTypeIntersectIsConsistent) {
   for (auto idx = RootIndex::kFirstRoot; idx <= RootIndex::kLastRoot; ++idx) {
+    SKIP_INACCESSIBLE;
     Tagged<Object> obj = isolate()->roots_table().slot(idx).load(isolate());
     if (obj.ptr() == kNullAddress || !IsMap(obj)) continue;
     Tagged<Map> map = Cast<Map>(obj);
@@ -119,6 +129,7 @@ TEST_F(MaglevTest, NodeTypeIntersectIsConsistent) {
 // Ensure UnionType is consistent with actual maps.
 TEST_F(MaglevTest, NodeTypeUnionIsConsistent) {
   for (auto idx = RootIndex::kFirstRoot; idx <= RootIndex::kLastRoot; ++idx) {
+    SKIP_INACCESSIBLE;
     Tagged<Object> obj = isolate()->roots_table().slot(idx).load(isolate());
     if (obj.ptr() == kNullAddress || !IsMap(obj)) continue;
     Tagged<Map> map = Cast<Map>(obj);

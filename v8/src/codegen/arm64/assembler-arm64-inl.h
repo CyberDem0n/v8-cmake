@@ -144,6 +144,11 @@ inline VRegister VRegister::VRegFromCode(unsigned code) {
   return VRegister::Create(code, kVRegSizeInBits);
 }
 
+inline ZRegister ZRegister::ZRegFromCode(unsigned code) {
+  DCHECK_LT(code, static_cast<unsigned>(kNumberOfZRegisters));
+  return ZRegister::Create(code);
+}
+
 inline Register CPURegister::W() const {
   DCHECK(IsRegister());
   return Register::WRegFromCode(code());
@@ -192,6 +197,11 @@ inline VRegister CPURegister::D() const {
 inline VRegister CPURegister::Q() const {
   DCHECK(IsVRegister());
   return VRegister::QRegFromCode(code());
+}
+
+inline ZRegister CPURegister::Z() const {
+  DCHECK(IsVRegister() || IsZRegister());
+  return ZRegister::ZRegFromCode(code());
 }
 
 // Immediate.
@@ -290,6 +300,22 @@ HeapNumberRequest Operand::heap_number_request() const {
 
 bool Operand::IsImmediate() const {
   return reg_ == NoReg && !IsHeapNumberRequest();
+}
+
+bool Operand::IsPlainRegister() const {
+  return reg_.is_valid() &&
+         (((shift_ == NO_SHIFT) && (extend_ == NO_EXTEND)) ||
+          // No-op shifts.
+          ((shift_ != NO_SHIFT) && (shift_amount_ == 0)) ||
+          // No-op extend operations.
+          // We can't include [US]XTW here without knowing more about the
+          // context; they are only no-ops for 32-bit operations.
+          //
+          // For example, this operand could be replaced with w1:
+          //   __ Add(w0, w0, Operand(w1, UXTW));
+          // However, no plain register can replace it in this context:
+          //   __ Add(x0, x0, Operand(w1, UXTW));
+          (((extend_ == UXTX) || (extend_ == SXTX)) && (shift_amount_ == 0)));
 }
 
 bool Operand::IsShiftedRegister() const {
@@ -500,7 +526,7 @@ Handle<Code> Assembler::code_target_object_handle_at(Address pc) {
   } else {
     DCHECK(instr->IsBranchAndLink() || instr->IsUnconditionalBranch());
     DCHECK_EQ(instr->ImmPCOffset() % kInstrSize, 0);
-    return Cast<Code>(
+    return TrustedCast<Code>(
         GetEmbeddedObject(instr->ImmPCOffset() >> kInstrSizeLog2));
   }
 }
@@ -566,11 +592,14 @@ void Assembler::set_target_address_at(Address pc, Address constant_pool,
                                       ICacheFlushMode icache_flush_mode) {
   Instruction* instr = reinterpret_cast<Instruction*>(pc);
   if (instr->IsLdrLiteralX()) {
+    // This function is reused for code serialization, where we do not care
+    // about alignment of the code object's start address, so the constant
+    // pool might inherit non-8-byte alignment.
     if (jit_allocation) {
-      jit_allocation->WriteValue<Address>(target_pointer_address_at(pc),
-                                          target);
+      jit_allocation->WriteUnalignedValue<Address>(
+          target_pointer_address_at(pc), target);
     } else {
-      Memory<Address>(target_pointer_address_at(pc)) = target;
+      WriteUnalignedValue(target_pointer_address_at(pc), target);
     }
     // Intuitively, we would think it is necessary to always flush the
     // instruction cache after patching a target address in the code. However,
@@ -649,7 +678,7 @@ Address RelocInfo::constant_pool_entry_address() {
   return Assembler::target_pointer_address_at(pc_);
 }
 
-Tagged<HeapObject> RelocInfo::target_object(PtrComprCageBase cage_base) {
+Tagged<HeapObject> RelocInfo::target_object() {
   DCHECK(IsCodeTarget(rmode_) || IsEmbeddedObjectMode(rmode_));
   if (IsCompressedEmbeddedObject(rmode_)) {
     Tagged_t compressed =
@@ -680,9 +709,10 @@ void WritableRelocInfo::set_target_object(Tagged<HeapObject> target,
     // We must not compress pointers to objects outside of the main pointer
     // compression cage as we wouldn't be able to decompress them with the
     // correct cage base.
-    DCHECK_IMPLIES(V8_ENABLE_SANDBOX_BOOL, !HeapLayout::InTrustedSpace(target));
+    DCHECK_IMPLIES(V8_ENABLE_SANDBOX_BOOL,
+                   !TrustedHeapLayout::InTrustedSpace(target));
     DCHECK_IMPLIES(V8_EXTERNAL_CODE_SPACE_BOOL,
-                   !HeapLayout::InCodeSpace(target));
+                   !TrustedHeapLayout::InCodeSpace(target));
     Assembler::set_target_compressed_address_at(
         pc_, constant_pool_,
         V8HeapCompressionScheme::CompressObject(target.ptr()), &jit_allocation_,
@@ -704,6 +734,19 @@ void WritableRelocInfo::set_target_external_reference(
   DCHECK(rmode_ == RelocInfo::EXTERNAL_REFERENCE);
   Assembler::set_target_address_at(pc_, constant_pool_, target,
                                    &jit_allocation_, icache_flush_mode);
+}
+
+Address RelocInfo::wasm_code_pointer() const {
+  DCHECK(rmode_ == RelocInfo::WASM_CODE_POINTER);
+  return Assembler::target_address_at(pc_, constant_pool_);
+}
+
+void WritableRelocInfo::set_wasm_code_pointer(Address target) {
+  DCHECK(rmode_ == RelocInfo::WASM_CODE_POINTER);
+  // We only call `set_wasm_code_pointer` while processing an entire code
+  // object, and will always flush the i-cache at the end of that operation.
+  Assembler::set_target_address_at(pc_, constant_pool_, target,
+                                   &jit_allocation_, SKIP_ICACHE_FLUSH);
 }
 
 WasmCodePointer RelocInfo::wasm_code_pointer_table_entry() const {

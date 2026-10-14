@@ -24,8 +24,8 @@ WasmEnabledFeatures WasmEnabledFeatures::FromFlags() {
   }
 #endif  // V8_ENABLE_DRUMBRAKE
 
-#define CHECK_FEATURE_FLAG(feat, ...)                              \
-  if (!v8_flags.wasm_jitless && v8_flags.experimental_wasm_##feat) \
+#define CHECK_FEATURE_FLAG(feat, ...)                 \
+  if (!v8_flags.wasm_jitless && v8_flags.wasm_##feat) \
     features.Add(WasmEnabledFeature::feat);
   FOREACH_WASM_FEATURE_FLAG(CHECK_FEATURE_FLAG)
 #undef CHECK_FEATURE_FLAG
@@ -41,17 +41,12 @@ WasmEnabledFeatures WasmEnabledFeatures::FromIsolate(Isolate* isolate) {
 WasmEnabledFeatures WasmEnabledFeatures::FromContext(
     Isolate* isolate, DirectHandle<NativeContext> context) {
   WasmEnabledFeatures features = WasmEnabledFeatures::FromFlags();
-  if (!v8_flags.wasm_jitless) {
-    if (isolate->IsWasmStringRefEnabled(context)) {
-      features.Add(WasmEnabledFeature::stringref);
-    }
-    if (isolate->IsWasmImportedStringsEnabled(context)) {
-      features.Add(WasmEnabledFeature::imported_strings);
-    }
-    if (isolate->IsWasmJSPIEnabled(context)) {
-      features.Add(WasmEnabledFeature::jspi);
-    }
+
+  if (!v8_flags.wasm_jitless &&
+      isolate->IsWasmCustomDescriptorsEnabled(context)) {
+    features.Add(WasmEnabledFeature::custom_descriptors);
   }
+
   // This space intentionally left blank for future Wasm origin trials.
   return features;
 }

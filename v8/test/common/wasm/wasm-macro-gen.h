@@ -702,6 +702,8 @@ inline uint16_t ExtractPrefixedOpcodeBytes(WasmOpcode opcode) {
 #define WASM_RESUME_THROW(cont, exc, count, ...)                           \
   kExprResumeThrow, static_cast<uint8_t>(cont), static_cast<uint8_t>(exc), \
       U32V_1(count), ##__VA_ARGS__
+#define WASM_RESUME_THROW_REF(cont, count, ...) \
+  kExprResumeThrowRef, static_cast<uint8_t>(cont), U32V_1(count), ##__VA_ARGS__
 #define WASM_SUSPEND(index) kExprSuspend, static_cast<uint8_t>(index)
 #define WASM_SWITCH(cont, tag) \
   kExprSwitch, static_cast<uint8_t>(cont), ToByte(tag)
@@ -761,24 +763,6 @@ inline uint16_t ExtractPrefixedOpcodeBytes(WasmOpcode opcode) {
 #define WASM_I32_CTZ(x) x, kExprI32Ctz
 #define WASM_I32_POPCNT(x) x, kExprI32Popcnt
 #define WASM_I32_EQZ(x) x, kExprI32Eqz
-
-//------------------------------------------------------------------------------
-// Asmjs Int32 operations
-//------------------------------------------------------------------------------
-#define WASM_ASMJS_OP(op) kAsmJsPrefix, static_cast<uint8_t>(op)
-
-#define WASM_I32_ASMJS_DIVS(x, y) x, y, WASM_ASMJS_OP(kExprI32AsmjsDivS)
-#define WASM_I32_ASMJS_REMS(x, y) x, y, WASM_ASMJS_OP(kExprI32AsmjsRemS)
-#define WASM_I32_ASMJS_DIVU(x, y) x, y, WASM_ASMJS_OP(kExprI32AsmjsDivU)
-#define WASM_I32_ASMJS_REMU(x, y) x, y, WASM_ASMJS_OP(kExprI32AsmjsRemU)
-#define WASM_I32_ASMJS_SCONVERTF32(x) x, WASM_ASMJS_OP(kExprI32AsmjsSConvertF32)
-#define WASM_I32_ASMJS_SCONVERTF64(x) x, WASM_ASMJS_OP(kExprI32AsmjsSConvertF64)
-#define WASM_I32_ASMJS_UCONVERTF32(x) x, WASM_ASMJS_OP(kExprI32AsmjsUConvertF32)
-#define WASM_I32_ASMJS_UCONVERTF64(x) x, WASM_ASMJS_OP(kExprI32AsmjsUConvertF64)
-#define WASM_I32_ASMJS_LOADMEM(x) x, WASM_ASMJS_OP(kExprI32AsmjsLoadMem)
-#define WASM_F32_ASMJS_LOADMEM(x) x, WASM_ASMJS_OP(kExprF32AsmjsLoadMem)
-#define WASM_F64_ASMJS_LOADMEM(x) x, WASM_ASMJS_OP(kExprF64AsmjsLoadMem)
-#define WASM_I32_ASMJS_STOREMEM(x, y) x, y, WASM_ASMJS_OP(kExprI32AsmjsStoreMem)
 
 //------------------------------------------------------------------------------
 // Int64 operations
@@ -1019,6 +1003,15 @@ inline uint16_t ExtractPrefixedOpcodeBytes(WasmOpcode opcode) {
                                value)                                       \
   struct_obj, value, WASM_ATOMICS_OP(kExprStructAtomicXor), memory_order,   \
       ToByte(typeidx), static_cast<uint8_t>(fieldidx)
+#define WASM_STRUCT_ATOMIC_EXCHANGE(memory_order, typeidx, fieldidx,           \
+                                    struct_obj, value)                         \
+  struct_obj, value, WASM_ATOMICS_OP(kExprStructAtomicExchange), memory_order, \
+      ToByte(typeidx), static_cast<uint8_t>(fieldidx)
+#define WASM_STRUCT_ATOMIC_COMPARE_EXCHANGE(                                \
+    memory_order, typeidx, fieldidx, struct_obj, expected_value, new_value) \
+  struct_obj, expected_value, new_value,                                    \
+      WASM_ATOMICS_OP(kExprStructAtomicCompareExchange), memory_order,      \
+      ToByte(typeidx), static_cast<uint8_t>(fieldidx)
 #define WASM_ARRAY_ATOMIC_GET(memory_order, typeidx, array_obj, index)  \
   array_obj, index, WASM_ATOMICS_OP(kExprArrayAtomicGet), memory_order, \
       ToByte(typeidx)
@@ -1045,6 +1038,15 @@ inline uint16_t ExtractPrefixedOpcodeBytes(WasmOpcode opcode) {
       ToByte(typeidx)
 #define WASM_ARRAY_ATOMIC_XOR(memory_order, typeidx, array_obj, index, value)  \
   array_obj, index, value, WASM_ATOMICS_OP(kExprArrayAtomicXor), memory_order, \
+      ToByte(typeidx)
+#define WASM_ARRAY_ATOMIC_EXCHANGE(memory_order, typeidx, array_obj, index, \
+                                   value)                                   \
+  array_obj, index, value, WASM_ATOMICS_OP(kExprArrayAtomicExchange),       \
+      memory_order, ToByte(typeidx)
+#define WASM_ARRAY_ATOMIC_COMPARE_EXCHANGE(memory_order, typeidx, array_obj, \
+                                           index, expected_value, new_value) \
+  array_obj, index, expected_value, new_value,                               \
+      WASM_ATOMICS_OP(kExprArrayAtomicCompareExchange), memory_order,        \
       ToByte(typeidx)
 
 //------------------------------------------------------------------------------
@@ -1155,26 +1157,44 @@ inline uint16_t ExtractPrefixedOpcodeBytes(WasmOpcode opcode) {
 #define WASM_SIMD_LOAD_OP_ALIGNMENT(opcode, index, alignment) \
   index, WASM_SIMD_OP(opcode), alignment, ZERO_OFFSET
 
-// Load a Simd lane from a numeric pointer. We need this because lanes are
-// reversed in big endian. Note: a Simd value has {kSimd128Size / sizeof(*ptr)}
-// lanes.
+// Load a Simd lane from a numeric pointer or array. We need this because lanes
+// are reversed in big endian. Note: a Simd value has
+// {kSimd128Size / sizeof(ptr[0])} lanes.
 #ifdef V8_TARGET_BIG_ENDIAN
-#define LANE(ptr, index) ptr[kSimd128Size / sizeof(*ptr) - (index)-1]
+#define LANE(ptr, index) ptr[kSimd128Size / sizeof(ptr[0]) - (index) - 1]
 #else
 #define LANE(ptr, index) ptr[index]
 #endif
 
-//------------------------------------------------------------------------------
-// Compilation Hints.
-//------------------------------------------------------------------------------
-#define COMPILE_STRATEGY_DEFAULT (0x00)
-#define COMPILE_STRATEGY_LAZY (0x01)
-#define COMPILE_STRATEGY_EAGER (0x02)
-#define BASELINE_TIER_DEFAULT (0x00 << 2)
-#define BASELINE_TIER_BASELINE (0x01 << 2)
-#define BASELINE_TIER_OPTIMIZED (0x02 << 2)
-#define TOP_TIER_DEFAULT (0x00 << 4)
-#define TOP_TIER_BASELINE (0x01 << 4)
-#define TOP_TIER_OPTIMIZED (0x02 << 4)
+#define ULANE(ptr, index) base::bits::Unsigned(LANE(ptr, index))
+
+// WasmGC type definitions.
+#define FIELD_COUNT(count) U32V_1(count)
+#define STRUCT_FIELD(type, mutability) type, (mutability ? 1 : 0)
+#define WASM_REF(index) kRefCode, index
+#define WASM_OPT_REF(index) kRefNullCode, index
+#define WASM_STRUCT_DEF(...) kWasmStructTypeCode, __VA_ARGS__
+#define WASM_ARRAY_DEF(type, mutability) \
+  kWasmArrayTypeCode, type, (mutability ? 1 : 0)
+#define WASM_FUNCTION_DEF(...) kWasmFunctionTypeCode, __VA_ARGS__
+#define WASM_REC_GROUP(...) kWasmRecursiveTypeGroupCode, __VA_ARGS__
+#define WASM_NONFINAL(...) kWasmSubtypeCode, 0, __VA_ARGS__
+#define WASM_NONFINAL_WITH_SUPERTYPE(supertype, ...) \
+  kWasmSubtypeCode, 1, supertype, __VA_ARGS__
+#define WASM_FINAL(...) kWasmSubtypeFinalCode, 0, __VA_ARGS__
+#define WASM_FINAL_WITH_SUPERTYPE(supertype, ...) \
+  kWasmSubtypeFinalCode, 1, supertype, __VA_ARGS__
+
+// Shared-everything definitions.
+#define WASM_SHARED_REF_NULL(type_encoding) \
+  kExprRefNull, kSharedFlagCode, ToByte(type_encoding)
+#define WASM_SHARED_REF_CAST(ref, type_encoding) \
+  ref, WASM_GC_OP(kExprRefCast), kSharedFlagCode, ToByte(type_encoding)
+#define WASM_SHARED_REF_CAST_NULL(ref, type_encoding) \
+  ref, WASM_GC_OP(kExprRefCastNull), kSharedFlagCode, ToByte(type_encoding)
+#define WASM_SHARED_REF_TEST(ref, type_encoding) \
+  ref, WASM_GC_OP(kExprRefTest), kSharedFlagCode, ToByte(type_encoding)
+#define WASM_SHARED_REF_TEST_NULL(ref, type_encoding) \
+  ref, WASM_GC_OP(kExprRefTestNull), kSharedFlagCode, ToByte(type_encoding)
 
 #endif  // V8_WASM_MACRO_GEN_H_

@@ -48,7 +48,8 @@ function main() {
     .version('0.0.1')
     .option('-i, --input_dir <path>', 'Input directory.')
     .option('-o, --output_dir <path>', 'Output directory.')
-    .option('-n, --no_of_files <n>', 'Output directory.', parseInt)
+    .option('-n, --no_of_files <n>', 'Number of testcases to generate.',
+      parseInt)
     .option('-c, --mutate_corpus <name>', 'Mutate single files in a corpus.')
     .option('-e, --extra_strict', 'Additionally parse files in strict mode.')
     .option('-m, --mutate <path>', 'Mutate a file and output results.')
@@ -68,6 +69,9 @@ function main() {
     overrideSettings(settings, program.setting);
   }
 
+  settings.input_dir = program.input_dir;
+  settings.no_of_files = program.no_of_files;
+
   let app_name = process.env.APP_NAME;
   if (app_name && app_name.endsWith('.exe')) {
     app_name = app_name.substr(0, app_name.length - 4);
@@ -79,6 +83,13 @@ function main() {
     // V8 supports running the raw d8 executable, the inspector fuzzer or
     // the differential fuzzing harness 'foozzie'.
     settings.engine = 'v8';
+
+    // Infer settings from V8's GN config.
+    const buildConfig = scriptMutator.loadJSONFromBuild(
+        'v8_build_config.json');
+    settings.is_sandbox_fuzzing = buildConfig.memory_corruption_api;
+    settings.is_x64_linux =
+        buildConfig.arch === 'x64' && buildConfig.is_linux;
   } else if (app_name === 'ch') {
     settings.engine = 'chakra';
   } else if (app_name === 'js') {
@@ -92,6 +103,10 @@ function main() {
 
   const mode = process.env.FUZZ_MODE || 'default';
   assert(mode in SCRIPT_MUTATORS, `Unknown mode ${mode}`);
+
+  // Switch for differential fuzzing.
+  settings.diff_fuzz = mode.startsWith('foozzie');
+
   const mutator = new SCRIPT_MUTATORS[mode](settings);
 
   if (program.mutate) {
@@ -111,8 +126,7 @@ function main() {
     testRunner = new runner.SingleCorpusRunner(
         program.input_dir, program.mutate_corpus, program.extra_strict);
   } else {
-    testRunner = new mutator.runnerClass(
-        program.input_dir, settings.engine, program.no_of_files);
+    testRunner = mutator.createRunner();
   }
 
   for (const [i, inputs] of testRunner.enumerateInputs()) {

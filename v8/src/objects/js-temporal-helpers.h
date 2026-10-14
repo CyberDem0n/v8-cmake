@@ -20,26 +20,24 @@
 
 #ifdef DEBUG
 #define TEMPORAL_DEBUG_INFO AT
-#define TEMPORAL_ENTER_FUNC()
-// #define TEMPORAL_ENTER_FUNC()  do { PrintF("Start: %s\n", __func__); } while
-// (false)
 #else
-// #define TEMPORAL_DEBUG_INFO ""
-#define TEMPORAL_DEBUG_INFO AT
-#define TEMPORAL_ENTER_FUNC()
-// #define TEMPORAL_ENTER_FUNC()  do { PrintF("Start: %s\n", __func__); } while
-// (false)
+#define TEMPORAL_DEBUG_INFO ""
 #endif  // DEBUG
 
-#define NEW_TEMPORAL_INVALID_ARG_TYPE_ERROR()       \
-  NewTypeError(                                     \
-      MessageTemplate::kInvalidArgumentForTemporal, \
-      isolate->factory()->NewStringFromStaticChars(TEMPORAL_DEBUG_INFO))
+#define NEW_TEMPORAL_TYPE_ERROR(str)       \
+  NewTypeError(MessageTemplate::kTemporal, \
+               isolate->factory()->NewStringFromStaticChars(str))
+#define NEW_TEMPORAL_RANGE_ERROR(str)       \
+  NewRangeError(MessageTemplate::kTemporal, \
+                isolate->factory()->NewStringFromStaticChars(str))
 
-#define NEW_TEMPORAL_INVALID_ARG_RANGE_ERROR()       \
-  NewRangeError(                                     \
-      MessageTemplate::kInvalidTimeValueForTemporal, \
-      isolate->factory()->NewStringFromStaticChars(TEMPORAL_DEBUG_INFO))
+#define NEW_TEMPORAL_RANGE_ERROR_WITH_ARG(str, arg) \
+  NewRangeError(MessageTemplate::kTemporalWithArg,  \
+                isolate->factory()->NewStringFromStaticChars(str), arg)
+
+#define NEW_TEMPORAL_TYPE_ERROR_WITH_ARG(str, arg) \
+  NewTypeError(MessageTemplate::kTemporalWithArg,  \
+               isolate->factory()->NewStringFromStaticChars(str), arg)
 
 namespace v8 {
 namespace internal {
@@ -47,7 +45,7 @@ namespace temporal {
 
 // For Intl.DurationFormat
 
-// #sec-temporal-time-duration-records
+// https://tc39.es/proposal-temporal/#sec-temporal-time-duration-records
 struct TimeDurationRecord {
   double days;
   double hours;
@@ -57,7 +55,7 @@ struct TimeDurationRecord {
   double microseconds;
   double nanoseconds;
 
-  // #sec-temporal-createtimedurationrecord
+  // https://tc39.es/proposal-temporal/#sec-temporal-createtimedurationrecord
   static Maybe<TimeDurationRecord> Create(Isolate* isolate, double days,
                                           double hours, double minutes,
                                           double seconds, double milliseconds,
@@ -65,14 +63,13 @@ struct TimeDurationRecord {
                                           double nanoseconds);
 };
 
-// #sec-temporal-duration-records
-// Cannot reuse DateDurationRecord here due to duplicate days.
+// https://tc39.es/proposal-temporal/#sec-temporal-duration-records
 struct DurationRecord {
   double years;
   double months;
   double weeks;
   TimeDurationRecord time_duration;
-  // #sec-temporal-createdurationrecord
+  // https://tc39.es/proposal-temporal/#sec-temporal-createdurationrecord
   static Maybe<DurationRecord> Create(Isolate* isolate, double years,
                                       double months, double weeks, double days,
                                       double hours, double minutes,
@@ -82,12 +79,12 @@ struct DurationRecord {
   static int32_t Sign(const DurationRecord& dur);
 };
 
-// #sec-temporal-topartialduration
-Maybe<DurationRecord> ToPartialDuration(
+// https://tc39.es/proposal-temporal/#sec-todurationrecord-deleted
+Maybe<DurationRecord> ToDurationRecord(
     Isolate* isolate, DirectHandle<Object> temporal_duration_like_obj,
     const DurationRecord& input);
 
-// #sec-temporal-isvalidduration
+// https://tc39.es/proposal-temporal/#sec-temporal-isvalidduration
 bool IsValidDuration(Isolate* isolate, const DurationRecord& dur);
 
 }  // namespace temporal

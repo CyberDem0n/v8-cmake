@@ -22,71 +22,66 @@
 
 // Helper macro to define qfma macro-assembler. This takes care of every
 // possible case of register aliasing to minimize the number of instructions.
-#define QFMA(ps_or_pd)                        \
-  if (CpuFeatures::IsSupported(FMA3)) {       \
-    CpuFeatureScope fma3_scope(this, FMA3);   \
-    if (dst == src1) {                        \
-      vfmadd213##ps_or_pd(dst, src2, src3);   \
-    } else if (dst == src2) {                 \
-      vfmadd213##ps_or_pd(dst, src1, src3);   \
-    } else if (dst == src3) {                 \
-      vfmadd231##ps_or_pd(dst, src2, src1);   \
-    } else {                                  \
-      CpuFeatureScope avx_scope(this, AVX);   \
-      vmovups(dst, src1);                     \
-      vfmadd213##ps_or_pd(dst, src2, src3);   \
-    }                                         \
-  } else if (CpuFeatures::IsSupported(AVX)) { \
-    CpuFeatureScope avx_scope(this, AVX);     \
-    vmul##ps_or_pd(tmp, src1, src2);          \
-    vadd##ps_or_pd(dst, tmp, src3);           \
-  } else {                                    \
-    if (dst == src1) {                        \
-      mul##ps_or_pd(dst, src2);               \
-      add##ps_or_pd(dst, src3);               \
-    } else if (dst == src2) {                 \
-      DCHECK_NE(src2, src1);                  \
-      mul##ps_or_pd(dst, src1);               \
-      add##ps_or_pd(dst, src3);               \
-    } else if (dst == src3) {                 \
-      DCHECK_NE(src3, src1);                  \
-      movaps(tmp, src1);                      \
-      mul##ps_or_pd(tmp, src2);               \
-      add##ps_or_pd(dst, tmp);                \
-    } else {                                  \
-      movaps(dst, src1);                      \
-      mul##ps_or_pd(dst, src2);               \
-      add##ps_or_pd(dst, src3);               \
-    }                                         \
+// Note: For determinism across compilers, we need all cases *for the same CPU
+// feature set* to produce the same result in the presence of NaNs.
+#define QFMA(ps_or_pd)                                      \
+  if (CpuFeatures::IsSupported(FMA3)) {                     \
+    CpuFeatureScope fma3_scope(this, FMA3);                 \
+    if (dst == src1) {                                      \
+      vfmadd132##ps_or_pd(dst, src3, src2);                 \
+    } else if (dst == src2) {                               \
+      vfmadd213##ps_or_pd(dst, src1, src3);                 \
+    } else if (dst == src3) {                               \
+      vfmadd231##ps_or_pd(dst, src1, src2);                 \
+    } else {                                                \
+      CpuFeatureScope avx_scope(this, AVX);                 \
+      vmovups(dst, src2);                                   \
+      vfmadd213##ps_or_pd(dst, src1, src3);                 \
+    }                                                       \
+  } else if (CpuFeatures::IsSupported(AVX)) {               \
+    CpuFeatureScope avx_scope(this, AVX);                   \
+    vmul##ps_or_pd(tmp, src1, src2);                        \
+    vadd##ps_or_pd(dst, tmp, src3);                         \
+  } else {                                                  \
+    /* Legacy hardware; performance doesn't matter much. */ \
+    movaps(tmp, src1);                                      \
+    mul##ps_or_pd(tmp, src2);                               \
+    if (dst != src3) {                                      \
+      movaps(dst, src3);                                    \
+    }                                                       \
+    add##ps_or_pd(dst, tmp);                                \
   }
 
 // Helper macro to define qfms macro-assembler. This takes care of every
 // possible case of register aliasing to minimize the number of instructions.
-#define QFMS(ps_or_pd)                        \
-  if (CpuFeatures::IsSupported(FMA3)) {       \
-    CpuFeatureScope fma3_scope(this, FMA3);   \
-    if (dst == src1) {                        \
-      vfnmadd213##ps_or_pd(dst, src2, src3);  \
-    } else if (dst == src2) {                 \
-      vfnmadd213##ps_or_pd(dst, src1, src3);  \
-    } else if (dst == src3) {                 \
-      vfnmadd231##ps_or_pd(dst, src2, src1);  \
-    } else {                                  \
-      CpuFeatureScope avx_scope(this, AVX);   \
-      vmovups(dst, src1);                     \
-      vfnmadd213##ps_or_pd(dst, src2, src3);  \
-    }                                         \
-  } else if (CpuFeatures::IsSupported(AVX)) { \
-    CpuFeatureScope avx_scope(this, AVX);     \
-    vmul##ps_or_pd(tmp, src1, src2);          \
-    vsub##ps_or_pd(dst, src3, tmp);           \
-  } else {                                    \
-    movaps(tmp, src1);                        \
-    mul##ps_or_pd(tmp, src2);                 \
-    if (dst != src3) {                        \
-      movaps(dst, src3);                      \
-    }                                         \
-    sub##ps_or_pd(dst, tmp);                  \
+// Note: For determinism across compilers, we need all cases *for the same CPU
+// feature set* to produce the same result in the presence of NaNs.
+#define QFMS(ps_or_pd)                                      \
+  if (CpuFeatures::IsSupported(FMA3)) {                     \
+    CpuFeatureScope fma3_scope(this, FMA3);                 \
+    if (dst == src1) {                                      \
+      vfnmadd132##ps_or_pd(dst, src3, src2);                \
+    } else if (dst == src2) {                               \
+      vfnmadd213##ps_or_pd(dst, src1, src3);                \
+    } else if (dst == src3) {                               \
+      vfnmadd231##ps_or_pd(dst, src1, src2);                \
+    } else {                                                \
+      CpuFeatureScope avx_scope(this, AVX);                 \
+      vmovups(dst, src2);                                   \
+      vfnmadd213##ps_or_pd(dst, src1, src3);                \
+    }                                                       \
+  } else if (CpuFeatures::IsSupported(AVX)) {               \
+    CpuFeatureScope avx_scope(this, AVX);                   \
+    vmul##ps_or_pd(tmp, src1, src2);                        \
+    vsub##ps_or_pd(dst, src3, tmp);                         \
+  } else {                                                  \
+    /* Legacy hardware; performance doesn't matter much. */ \
+    movaps(tmp, src1);                                      \
+    mul##ps_or_pd(tmp, src2);                               \
+    if (dst != src3) {                                      \
+      movaps(dst, src3);                                    \
+    }                                                       \
+    sub##ps_or_pd(dst, tmp);                                \
   }
 
 namespace v8 {
@@ -167,6 +162,9 @@ class V8_EXPORT_PRIVATE SharedMacroAssemblerBase : public MacroAssemblerBase {
   // Shufps that will mov src1 into dst if AVX is not supported.
   void Shufps(XMMRegister dst, XMMRegister src1, XMMRegister src2,
               uint8_t imm8);
+
+  void Pshufd(XMMRegister dst, XMMRegister src, uint8_t shuffle);
+  void Pshufd(XMMRegister dst, Operand src, uint8_t shuffle);
 
   // Helper struct to implement functions that check for AVX support and
   // dispatch to the appropriate AVX/SSE instruction.
@@ -373,7 +371,6 @@ class V8_EXPORT_PRIVATE SharedMacroAssemblerBase : public MacroAssemblerBase {
   AVX_OP(Pmovmskb, pmovmskb)
   AVX_OP(Pmullw, pmullw)
   AVX_OP(Pmuludq, pmuludq)
-  AVX_OP(Pshufd, pshufd)
   AVX_OP(Pshufhw, pshufhw)
   AVX_OP(Pshuflw, pshuflw)
   AVX_OP(Pslld, pslld)
@@ -530,27 +527,27 @@ class V8_EXPORT_PRIVATE SharedMacroAssemblerBase : public MacroAssemblerBase {
   void I32x4UConvertI16x8High(XMMRegister dst, XMMRegister src,
                               XMMRegister scratch);
   void I64x2Neg(XMMRegister dst, XMMRegister src, XMMRegister scratch);
-  void I64x2Abs(XMMRegister dst, XMMRegister src, XMMRegister scratch);
+  void I64x2AbsPreAvx10(XMMRegister dst, XMMRegister src, XMMRegister scratch);
   void I64x2GtS(XMMRegister dst, XMMRegister src0, XMMRegister src1,
                 XMMRegister scratch);
   void I64x2GeS(XMMRegister dst, XMMRegister src0, XMMRegister src1,
                 XMMRegister scratch);
-  void I64x2ShrS(XMMRegister dst, XMMRegister src, uint8_t shift,
-                 XMMRegister xmm_tmp);
-  void I64x2ShrS(XMMRegister dst, XMMRegister src, Register shift,
-                 XMMRegister xmm_tmp, XMMRegister xmm_shift,
-                 Register tmp_shift);
-  void I64x2Mul(XMMRegister dst, XMMRegister lhs, XMMRegister rhs,
-                XMMRegister tmp1, XMMRegister tmp2);
+  void I64x2ShrSPreAvx10(XMMRegister dst, XMMRegister src, uint8_t shift,
+                         XMMRegister xmm_tmp);
+  void I64x2ShrSPreAvx10(XMMRegister dst, XMMRegister src, Register shift,
+                         XMMRegister xmm_tmp, XMMRegister xmm_shift,
+                         Register tmp_shift);
+  void I64x2MulPreAvx10(XMMRegister dst, XMMRegister lhs, XMMRegister rhs,
+                        XMMRegister tmp1, XMMRegister tmp2);
   void I64x2ExtMul(XMMRegister dst, XMMRegister src1, XMMRegister src2,
                    XMMRegister scratch, bool low, bool is_signed);
   void I64x2SConvertI32x4High(XMMRegister dst, XMMRegister src);
   void I64x2UConvertI32x4High(XMMRegister dst, XMMRegister src,
                               XMMRegister scratch);
-  void S128Not(XMMRegister dst, XMMRegister src, XMMRegister scratch);
+  void S128NotPreAvx10(XMMRegister dst, XMMRegister src, XMMRegister scratch);
   // Requires dst == mask when AVX is not supported.
-  void S128Select(XMMRegister dst, XMMRegister mask, XMMRegister src1,
-                  XMMRegister src2, XMMRegister scratch);
+  void S128SelectPreAvx10(XMMRegister dst, XMMRegister mask, XMMRegister src1,
+                          XMMRegister src2, XMMRegister scratch);
   void S128Load8Splat(XMMRegister dst, Operand src, XMMRegister scratch);
   void S128Load16Splat(XMMRegister dst, Operand src, XMMRegister scratch);
   void S128Load32Splat(XMMRegister dst, Operand src);
@@ -952,8 +949,8 @@ class V8_EXPORT_PRIVATE SharedMacroAssembler : public SharedMacroAssemblerBase {
     }
   }
 
-  void I8x16Popcnt(XMMRegister dst, XMMRegister src, XMMRegister tmp1,
-                   XMMRegister tmp2, Register scratch) {
+  void I8x16PopcntPreAvx10(XMMRegister dst, XMMRegister src, XMMRegister tmp1,
+                           XMMRegister tmp2, Register scratch) {
     ASM_CODE_COMMENT(this);
     DCHECK_NE(dst, tmp1);
     DCHECK_NE(src, tmp1);

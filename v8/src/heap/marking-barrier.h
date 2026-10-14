@@ -9,10 +9,11 @@
 
 #include "include/v8-internal.h"
 #include "src/base/hashing.h"
+#include "src/base/logging.h"
 #include "src/common/globals.h"
 #include "src/heap/mark-compact.h"
 #include "src/heap/marking-worklist.h"
-#include "src/heap/mutable-page-metadata.h"
+#include "src/heap/mutable-page.h"
 
 namespace v8 {
 namespace internal {
@@ -44,13 +45,12 @@ class MarkingBarrier {
   static void DeactivateYoung(Heap* heap);
   V8_EXPORT_PRIVATE static void PublishYoung(Heap* heap);
 
-  template <typename TSlot>
+  template <typename TSlot, RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
   void Write(Tagged<HeapObject> host, TSlot slot, Tagged<HeapObject> value);
   void Write(Tagged<HeapObject> host, IndirectPointerSlot slot);
   void Write(Tagged<InstructionStream> host, RelocInfo*,
              Tagged<HeapObject> value);
   void Write(Tagged<JSArrayBuffer> host, ArrayBufferExtension*);
-  void Write(Tagged<DescriptorArray>, int number_of_own_descriptors);
   // Only usable when there's no valid JS host object for this write, e.g., when
   // value is held alive from a global handle.
   void WriteWithoutHost(Tagged<HeapObject> value);
@@ -67,6 +67,7 @@ class MarkingBarrier {
       case MarkingMode::kMinorMarking:
         return true;
     }
+    UNREACHABLE();
   }
 
   Heap* heap() const { return heap_; }
@@ -74,8 +75,11 @@ class MarkingBarrier {
 #if DEBUG
   void AssertMarkingIsActivated() const;
   void AssertSharedMarkingIsActivated() const;
-  bool IsMarked(const Tagged<HeapObject> value) const;
 #endif  // DEBUG
+
+#if V8_VERIFY_WRITE_BARRIERS
+  bool IsMarked(const Tagged<HeapObject> value) const;
+#endif  // V8_VERIFY_WRITE_BARRIERS
 
  private:
   inline void MarkValueShared(Tagged<HeapObject> value);
@@ -102,8 +106,8 @@ class MarkingBarrier {
   std::unique_ptr<MarkingWorklists::Local> current_worklists_;
   std::optional<MarkingWorklists::Local> shared_heap_worklists_;
   MarkingState marking_state_;
-  std::unordered_map<MutablePageMetadata*, std::unique_ptr<TypedSlots>,
-                     base::hash<MutablePageMetadata*>>
+  std::unordered_map<MutablePage*, std::unique_ptr<TypedSlots>,
+                     base::hash<MutablePage*>>
       typed_slots_map_;
   bool is_compacting_ = false;
   bool is_activated_ = false;

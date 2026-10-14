@@ -71,19 +71,35 @@ class V8_EXPORT_PRIVATE Sandbox {
    * */
   static constexpr bool kFallbackToPartiallyReservedSandboxAllowed = true;
 
+  // The name for the virtual address space reservation backing the sandbox.
+  static constexpr const char* kSandboxAddressSpaceName = "v8-sandbox";
+
+  static constexpr size_t kSmiAddressRange = 4UL * GB;
+
+  // We assume that the Smi<->HeapObject corruption can lead to accesses of
+  // in-object properties. We add some padding to also catch these kinds of
+  // accesses.
+  static constexpr size_t kSmiAddressRangePadding = 4 * KB;
+
+  // A heuristic used by the sandbox crash filter to identify crashes on
+  // unaddressable accesses (e.g. on ARM64). Note that this is only a testing
+  // heuristic and does not reflect the actual virtual address space size,
+  // which is determined dynamically during sandbox initialization.
+  static constexpr int kMaxVirtualAddressBitsForCrashFilter = 48;
+
   /**
    * Initializes this sandbox.
    *
    * This will allocate the virtual address subspace for the sandbox inside the
    * provided virtual address space. If a subspace of the required size cannot
-   * be allocated, this method will insted initialize this sandbox as a
+   * be allocated, this method will instead initialize this sandbox as a
    * partially-reserved sandbox. In that case, a smaller virtual address space
    * reservation will be used and an EmulatedVirtualAddressSubspace instance
    * will be created on top of it to back the sandbox. If not enough virtual
    * address space can be allocated for even a partially-reserved sandbox, then
    * this method will fail with an OOM crash.
    */
-  void Initialize(v8::VirtualAddressSpace* vas);
+  void Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas);
 
   /**
    * Tear down this sandbox.
@@ -118,7 +134,7 @@ class V8_EXPORT_PRIVATE Sandbox {
    * Smi is treated as a pointer and dereferenced.
    */
   bool smi_address_range_is_inaccessible() const {
-    return first_four_gb_of_address_space_are_reserved_;
+    return smi_address_range_reserved_;
   }
 
   /**
@@ -165,6 +181,14 @@ class V8_EXPORT_PRIVATE Sandbox {
    */
   v8::PageAllocator* page_allocator() const {
     return sandbox_page_allocator_.get();
+  }
+
+  /**
+   * Returns a PageAllocator weak pointer instance that allocates pages inside
+   * the sandbox. This version is for BackingStores that can outlive sandbox.
+   */
+  std::weak_ptr<v8::PageAllocator> page_allocator_weak() const {
+    return sandbox_page_allocator_;
   }
 
   /**
@@ -222,13 +246,14 @@ class V8_EXPORT_PRIVATE Sandbox {
   Address end_address() const { return reinterpret_cast<Address>(&end_); }
   Address size_address() const { return reinterpret_cast<Address>(&size_); }
 
-  static void InitializeDefaultOncePerProcess(v8::VirtualAddressSpace* vas);
+  static void InitializeDefaultOncePerProcess(v8::Platform* platform,
+                                              v8::VirtualAddressSpace* vas);
   static void TearDownDefault();
 
   // Create a new sandbox allocating a fresh pointer cage.
   // If new sandboxes cannot be created in this build configuration, abort.
   //
-  static Sandbox* New(v8::VirtualAddressSpace* vas);
+  static Sandbox* New(v8::Platform* platform, v8::VirtualAddressSpace* vas);
 
 #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
 #ifdef USING_V8_SHARED_PRIVATE
@@ -245,6 +270,15 @@ class V8_EXPORT_PRIVATE Sandbox {
 #endif  // !V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
 
   V8_INLINE static Sandbox* GetDefault() { return default_sandbox_; }
+
+  // Allocator that can be used for in-sandbox allocations. The sandbox will
+  // provide a default allocator which can be overridden with
+  // `set_in_sandbox_allocator()`.
+  Allocator* in_sandbox_allocator() { return in_sandbox_allocator_.get(); }
+
+  // Sets a custom in-sandbox allocator that can be retrieved with
+  // `in_sandbox_allocator()`.
+  void set_in_sandbox_allocator(std::shared_ptr<Allocator> allocator);
 
  private:
   // The SequentialUnmapperTest calls the private Initialize method to create a
@@ -264,15 +298,16 @@ class V8_EXPORT_PRIVATE Sandbox {
   // regions. The provided virtual address space must be able to allocate
   // subspaces. The size must be a multiple of the allocation granularity of the
   // virtual memory space.
-  bool Initialize(v8::VirtualAddressSpace* vas, size_t size,
-                  bool use_guard_regions);
+  bool Initialize(v8::Platform* platform, v8::VirtualAddressSpace* vas,
+                  size_t size, bool use_guard_regions);
 
   // Used when reserving virtual memory is too expensive. A partially reserved
   // sandbox does not reserve all of its virtual memory and so doesn't have the
   // desired security properties as unrelated mappings could end up inside of
   // it and be corrupted. The size and size_to_reserve parameters must be
   // multiples of the allocation granularity of the virtual address space.
-  bool InitializeAsPartiallyReservedSandbox(v8::VirtualAddressSpace* vas,
+  bool InitializeAsPartiallyReservedSandbox(v8::Platform* platform,
+                                            v8::VirtualAddressSpace* vas,
                                             size_t size,
                                             size_t size_to_reserve);
 
@@ -310,7 +345,10 @@ class V8_EXPORT_PRIVATE Sandbox {
   std::unique_ptr<v8::VirtualAddressSpace> address_space_;
 
   // The page allocator instance for this sandbox.
-  std::unique_ptr<v8::PageAllocator> sandbox_page_allocator_;
+  std::shared_ptr<v8::PageAllocator> sandbox_page_allocator_;
+
+  // An allocator that can be used to allocate in-sandbox memory.
+  std::shared_ptr<v8::Allocator> in_sandbox_allocator_;
 
   // Constant objects inside this sandbox.
   SandboxedPointerConstants constants_;
@@ -319,7 +357,7 @@ class V8_EXPORT_PRIVATE Sandbox {
   // reserve the first four gigabytes of the virtual address space (with an
   // inaccessible mapping). This for example mitigates Smi<->HeapObject
   // confusion bugs in which we treat a Smi value as a pointer and access it.
-  static bool first_four_gb_of_address_space_are_reserved_;
+  static bool smi_address_range_reserved_;
 
 #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
   thread_local static Sandbox* current_;
@@ -330,15 +368,25 @@ class V8_EXPORT_PRIVATE Sandbox {
 
 // Helper function that can be used to ensure that certain objects are not
 // located inside the sandbox. Typically used for trusted objects.
-// Will always return false when the sandbox is disabled or partially reserved.
-V8_INLINE bool InsideSandbox(uintptr_t address) {
+// Returns true when the sandbox is disabled, or when the sandbox is partially
+// reserved and the address is outside the reservation.
+V8_INLINE bool OutsideSandbox(uintptr_t address) {
 #ifdef V8_ENABLE_SANDBOX
   Sandbox* sandbox = Sandbox::current();
   // Use ReservationContains (instead of just Contains) to correctly handle the
   // case of partially-reserved sandboxes.
-  return sandbox->ReservationContains(address);
+  return !sandbox->ReservationContains(address);
 #else
-  return false;
+  return true;
+#endif
+}
+
+V8_INLINE bool InsideSandbox(uintptr_t address) {
+#ifdef V8_ENABLE_SANDBOX
+  Sandbox* sandbox = Sandbox::current();
+  return sandbox->Contains(address);
+#else
+  return true;
 #endif
 }
 

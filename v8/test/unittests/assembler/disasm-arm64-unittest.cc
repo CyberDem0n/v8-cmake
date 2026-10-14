@@ -52,7 +52,7 @@ using DisasmArm64Test = TestWithIsolate;
   uint8_t* buf = static_cast<uint8_t*>(malloc(INSTR_SIZE));                   \
   uint32_t encoding = 0;                                                      \
   MacroAssembler* assm =                                                      \
-      new MacroAssembler((isolate()), v8::internal::CodeObjectRequired::kYes, \
+      new MacroAssembler((isolate()), v8::internal::CodeObjectRequired{true}, \
                          ExternalAssemblerBuffer(buf, INSTR_SIZE));           \
   Decoder<DispatchingDecoderVisitor>* decoder =                               \
       new Decoder<DispatchingDecoderVisitor>();                               \
@@ -131,6 +131,9 @@ TEST_F(DisasmArm64Test, bootstrap) {
   COMPARE(dci(0x93407c00), "sxtw x0, w0");
   COMPARE(dci(0x2a000020), "orr w0, w1, w0");
   COMPARE(dci(0xa8c67bfd), "ldp fp, lr, [sp], #96");
+  COMPARE(dci(0xf9800800), "prfm pldl1keep, [x0, #16]");
+  COMPARE(dci(0xf8b7c973), "prfm pstl2strm, [x11, w23, sxtw]");
+  COMPARE(dci(0xf98003e4), "prfm pldl3keep, [sp]");
 
   CLEANUP();
 }
@@ -1703,18 +1706,27 @@ TEST_F(DisasmArm64Test, fmov_imm) {
 }
 
 TEST_F(DisasmArm64Test, fmov_reg) {
-  SET_UP_ASM();
-
-  COMPARE(fmov(w3, s13), "fmov w3, s13");
-  COMPARE(fmov(x6, d26), "fmov x6, d26");
-  COMPARE(fmov(s11, w30), "fmov s11, w30");
-  COMPARE(fmov(d31, x2), "fmov d31, x2");
-  COMPARE(fmov(s12, s13), "fmov s12, s13");
-  COMPARE(fmov(d22, d23), "fmov d22, d23");
-  COMPARE(fmov(v0.D(), 1, x13), "fmov v0.D[1], x13");
-  COMPARE(fmov(x13, v0.D(), 1), "fmov x13, v0.D[1]");
-
-  CLEANUP();
+  {
+    SET_UP_ASM();
+    COMPARE(fmov(w3, s13), "fmov w3, s13");
+    COMPARE(fmov(x6, d26), "fmov x6, d26");
+    COMPARE(fmov(s11, w30), "fmov s11, w30");
+    COMPARE(fmov(d31, x2), "fmov d31, x2");
+    COMPARE(fmov(s12, s13), "fmov s12, s13");
+    COMPARE(fmov(d22, d23), "fmov d22, d23");
+    COMPARE(fmov(v0.D(), 1, x13), "fmov v0.D[1], x13");
+    COMPARE(fmov(x13, v0.D(), 1), "fmov x13, v0.D[1]");
+    CLEANUP();
+  }
+  {
+    SET_UP_MASM();
+    COMPARE(Mov(v1.V2S(), v1.V2S()), "mov v1.8b, v1.8b");
+    COMPARE(Mov(v2.V4S(), v2.V4S()), "mov v2.16b, v2.16b");
+    COMPARE(Mov(v3.V2D(), v3.V2D()), "mov v3.16b, v3.16b");
+    COMPARE(Fmov(s4, s4), "fmov s4, s4");
+    COMPARE(Fmov(d5, d5), "fmov d5, d5");
+    CLEANUP();
+  }
 }
 
 TEST_F(DisasmArm64Test, fp_dp1) {
@@ -4729,6 +4741,9 @@ TEST_F(DisasmArm64Test, neon_sha3) {
           "bcax v0.16b, v1.16b, v2.16b, v3.16b");
   COMPARE(Eor3(v10.V16B(), v11.V16B(), v12.V16B(), v13.V16B()),
           "eor3 v10.16b, v11.16b, v12.16b, v13.16b");
+  COMPARE(Xar(v2.V2D(), v4.V2D(), v6.V2D(), 1), "xar v2.2d, v4.2d, v6.2d, #1");
+  COMPARE(Xar(v3.V2D(), v21.V2D(), v24.V2D(), 63),
+          "xar v3.2d, v21.2d, v24.2d, #63");
 
   CLEANUP();
 }
@@ -5140,6 +5155,21 @@ TEST_F(DisasmArm64Test, neon_shift_immediate) {
   CLEANUP();
 }
 
+TEST_F(DisasmArm64Test, mops) {
+  SET_UP_MASM();
+  CpuFeatureScope feature_scope(assm, MOPS,
+                                CpuFeatureScope::kDontCheckSupported);
+
+  COMPARE(cpyp(x0, x30, x28), "cpyp [x0]!, [lr]!, x28!");
+  COMPARE(cpym(x1, x10, x23), "cpym [x1]!, [x10]!, x23!");
+  COMPARE(cpye(x14, x15, x19), "cpye [x14]!, [x15]!, x19!");
+
+  COMPARE(setp(x7, x17, x11), "setp [x7]!, x17!, x11");
+  COMPARE(setm(x8, x7, x9), "setm [x8]!, x7!, x9");
+  COMPARE(sete(x3, x23, x1), "sete [x3]!, x23!, x1");
+  CLEANUP();
+}
+
 TEST_F(DisasmArm64Test, cssc) {
   SET_UP_MASM();
 
@@ -5153,6 +5183,37 @@ TEST_F(DisasmArm64Test, cssc) {
   COMPARE(Ctz(w3, w5), "ctz w3, w5");
   COMPARE(Ctz(x3, x28), "ctz x3, x28");
   COMPARE(Ctz(w0, wzr), "ctz w0, wzr");
+
+  COMPARE(Smax(w5, w9, w10), "smax w5, w9, w10");
+  COMPARE(Smax(x6, x8, x9), "smax x6, x8, x9");
+  COMPARE(Smin(w11, w8, w17), "smin w11, w8, w17");
+  COMPARE(Smin(x12, x10, x20), "smin x12, x10, x20");
+  COMPARE(Umax(w5, w9, w10), "umax w5, w9, w10");
+  COMPARE(Umax(x6, x8, x9), "umax x6, x8, x9");
+  COMPARE(Umin(w11, w8, w17), "umin w11, w8, w17");
+  COMPARE(Umin(x12, x10, x20), "umin x12, x10, x20");
+
+  COMPARE(Smax(w5, w9, 127), "smax w5, w9, #127");
+  COMPARE(Smax(x6, x8, -128), "smax x6, x8, #-128");
+  COMPARE(Smin(w19, w20, -1), "smin w19, w20, #-1");
+  COMPARE(Smin(x30, xzr, 0), "smin lr, xzr, #0");
+  COMPARE(Umax(w5, w9, 255), "umax w5, w9, #255");
+  COMPARE(Umax(x6, x8, 128), "umax x6, x8, #128");
+  COMPARE(Umin(x30, xzr, 0), "umin lr, xzr, #0");
+
+  CLEANUP();
+}
+
+TEST_F(DisasmArm64Test, sve_bit_permute) {
+  SET_UP_MASM();
+
+  CpuFeatureScope feature_scope(assm, SVEBITPERM,
+                                CpuFeatureScope::kDontCheckSupported);
+
+  COMPARE(Bext(z6.VnB(), z2.VnB(), z5.VnB()), "bext z6.b, z2.b, z5.b");
+  COMPARE(Bext(z6.VnD(), z2.VnD(), z5.VnD()), "bext z6.d, z2.d, z5.d");
+  COMPARE(Bext(z6.VnH(), z2.VnH(), z5.VnH()), "bext z6.h, z2.h, z5.h");
+  COMPARE(Bext(z6.VnS(), z2.VnS(), z5.VnS()), "bext z6.s, z2.s, z5.s");
 
   CLEANUP();
 }

@@ -42,7 +42,6 @@ from testrunner.outproc import test262
 #
 # Multiple flags are allowed, separated by space.
 FEATURE_FLAGS = {
-    'Intl.Locale-info': '--harmony-intl-locale-info-func',
     'FinalizationRegistry': '--harmony-weak-refs-with-cleanup-some',
     'WeakRef': '--harmony-weak-refs-with-cleanup-some',
     'host-gc-required': '--expose-gc-as=v8GC',
@@ -51,24 +50,24 @@ FEATURE_FLAGS = {
     'Temporal': '--harmony-temporal',
     'array-find-from-last': '--harmony-array-find-last',
     'ShadowRealm': '--harmony-shadow-realm',
-    'regexp-v-flag': '--harmony-regexp-unicode-sets',
     'String.prototype.isWellFormed': '--harmony-string-is-well-formed',
     'String.prototype.toWellFormed': '--harmony-string-is-well-formed',
     'json-parse-with-source': '--harmony-json-parse-with-source',
+    'iterator-sequencing': '--js-iterator-sequencing',
     'iterator-helpers': '--harmony-iterator-helpers',
     'set-methods': '--harmony-set-methods',
     'import-attributes': '--harmony-import-attributes',
-    'regexp-duplicate-named-groups': '--js-regexp-duplicate-named-groups',
     'regexp-modifiers': '--js-regexp-modifiers',
-    'Float16Array': '--js-float16array',
-    'explicit-resource-management': '--js-explicit-resource-management',
     'decorators': '--js-decorators',
-    'promise-try': '--js-promise-try',
-    'Atomics.pause': '--js-atomics-pause',
     'source-phase-imports': '--js-source-phase-imports --allow-natives-syntax',
-    'Error.isError': '--js-error-iserror',
-    'uint8array-base64': '--js-base-64',
-    'RegExp.escape': '--js-regexp-escape',
+    'nonextensible-applies-to-private': '--js-nonextensible-applies-to-private',
+    'immutable-arraybuffer': '--js-immutable-arraybuffer',
+    'import-defer': '--js-defer-import-eval',
+    'Iterator.prototype.join': '--js-iterator-join',
+    'joint-iteration': '--js-joint-iteration',
+    'import-text': '--js-import-text',
+    'import-bytes': '--js-import-bytes',
+    'iterator-includes': '--js-iterator-includes',
 }
 
 SKIPPED_FEATURES = set([])
@@ -100,7 +99,7 @@ class VariantsGenerator(testsuite.VariantsGenerator):
 
     for phase_var in phase_variants:
       for n, variant in enumerate(self._get_variants(test)):
-        flags = flags_set[variant][0]
+        flags = flags_set[variant]
         if 'noStrict' in test_record:
           yield (variant, flags, str(n) + phase_var)
         elif 'onlyStrict' in test_record:
@@ -223,21 +222,21 @@ class TestCase(testcase.D8TestCase):
     harness_args = []
     if "raw" not in self.test_record.get("flags", []):
       harness_args = list(self.suite.harness)
-    return (harness_args +
-            ([self.suite.root /
-              "harness-agent.js"] if self.__needs_harness_agent() else []) +
-            ([self.suite.root / "harness-ishtmldda.js"]
-             if "IsHTMLDDA" in self.test_record.get("features", []) else []) +
-            ([self.suite.root /
-              "harness-abstractmodulesource.js"] if "source-phase-imports"
-             in self.test_record.get("features", []) else []) +
-            ([self.suite.root / "harness-adapt-donotevaluate.js"]
-             if self.fail_phase_only and not self._fail_phase_reverse else []) +
-            ([self.suite.root / "harness-done.js"]
-             if "async" in self.test_record.get("flags", []) else []) +
-            self._get_includes() +
-            (["--module"] if "module" in self.test_record else []) +
-            [self._get_source_path()])
+    return (
+        harness_args +
+        ([self.suite.root /
+          "harness-agent.js"] if self.__needs_harness_agent() else []) +
+        ([self.suite.root / "harness-ishtmldda.js"]
+         if "IsHTMLDDA" in self.test_record.get("features", []) else []) +
+        ([self.suite.root / "harness-abstractmodulesource.js"] if
+         "source-phase-imports" in self.test_record.get("features", []) else [])
+        + ([self.suite.root / "harness-adapt-donotevaluate.js"]
+           if self.fail_phase_only and not self._fail_phase_reverse else []) +
+        ([self.suite.root / "harness-done.js"] if "async"
+         in self.test_record.get("flags", []) else []) + self._get_includes() +
+        (["--module"] if "module" in self.test_record else []) +
+        (["--no-can-block"] if "CanBlockIsFalse" in self.test_record else []) +
+        [self._get_source_path()])
 
   def _get_suite_flags(self):
     feature_flags = []

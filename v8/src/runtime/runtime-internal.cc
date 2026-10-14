@@ -4,15 +4,17 @@
 
 #include <memory>
 
-#include "src/api/api-inl.h"
-#include "src/api/api.h"
+#include "src/builtins/builtins-utils.h"
 #include "src/builtins/builtins.h"
+#include "src/builtins/superspread.h"
 #include "src/common/message-template.h"
+#include "src/compiler-dispatcher/optimizing-compile-dispatcher.h"
 #include "src/execution/arguments-inl.h"
 #include "src/execution/isolate-inl.h"
 #include "src/execution/messages.h"
 #include "src/execution/protectors-inl.h"
 #include "src/execution/tiering-manager.h"
+#include "src/handles/handle-scope-implementer-inl.h"
 #include "src/handles/maybe-handles.h"
 #include "src/logging/counters.h"
 #include "src/numbers/conversions.h"
@@ -78,6 +80,59 @@ RUNTIME_FUNCTION(Runtime_ReThrowWithMessage) {
 RUNTIME_FUNCTION(Runtime_ThrowStackOverflow) {
   SealHandleScope shs(isolate);
   DCHECK_LE(0, args.length());
+  return isolate->StackOverflow();
+}
+
+RUNTIME_FUNCTION(Runtime_VarargStackOverflow) {
+  HandleScope scope(isolate);
+
+  StackLimitCheck check(isolate);
+  if (check.JsHasOverflowed()) {
+    return isolate->StackOverflow();
+  }
+
+  int nargs = args.length();
+  if (nargs >= SuperSpreadArgs::kNumExtraArgs) {
+    auto maybe_receiver =
+        args.at<JSAny>(nargs - SuperSpreadArgs::kReceiverOffsetFromEnd);
+    auto maybe_target =
+        args.at<JSAny>(nargs - SuperSpreadArgs::kTargetOffsetFromEnd);
+    auto maybe_arglist =
+        args.at<Object>(nargs - SuperSpreadArgs::kArglistOffsetFromEnd);
+    int args_length =
+        args.smi_value_at(nargs - SuperSpreadArgs::kArglistLengthOffsetFromEnd);
+
+    if (v8_flags.superspreading) {
+      Handle<JSFunction> target;
+      Handle<FixedArray> arglist;
+      if (TryCast(maybe_target, &target) && Is<JSReceiver>(maybe_receiver) &&
+          TryCast(maybe_arglist, &arglist)) {
+        Handle<JSReceiver> receiver = Cast<JSReceiver>(maybe_receiver);
+        auto GetMergedArglist = [&]() {
+          int stack_arg_count = nargs - SuperSpreadArgs::kNumExtraArgs;
+          int total_args = stack_arg_count + args_length;
+          if (stack_arg_count == 0) {
+            return isolate->factory()->CopyFixedArrayUpTo(arglist, args_length);
+          }
+          Handle<FixedArray> merged =
+              isolate->factory()->NewFixedArray(total_args);
+          for (int i = 0; i < stack_arg_count; ++i) {
+            merged->set(i, *args.at(stack_arg_count - i - 1));
+          }
+          merged->CopyElements(isolate, stack_arg_count, *arglist, 0,
+                               args_length, UPDATE_WRITE_BARRIER);
+          return merged;
+        };
+
+#define CASE(Name, Handler)                                      \
+  if (target->code(isolate)->builtin_id() == Builtin::k##Name) { \
+    return Handler(isolate, receiver, GetMergedArglist());       \
+  }
+        SUPERSPREAD_BUILTINS(CASE)
+#undef CASE
+      }
+    }
+  }
   return isolate->StackOverflow();
 }
 
@@ -299,15 +354,20 @@ RUNTIME_FUNCTION(Runtime_ThrowNotConstructor) {
       isolate, NewTypeError(MessageTemplate::kNotConstructor, object));
 }
 
-RUNTIME_FUNCTION(Runtime_ThrowApplyNonFunction) {
+RUNTIME_FUNCTION(Runtime_ThrowTargetNonFunction) {
   HandleScope scope(isolate);
-  DCHECK_EQ(1, args.length());
+  DCHECK_EQ(2, args.length());
   Handle<Object> object = args.at(0);
+
+  Handle<String> target = args.at<String>(1);
   Handle<String> type = Object::TypeOf(isolate, object);
   Handle<String> msg;
   if (IsNull(*object)) {
     // "which is null"
-    msg = isolate->factory()->NewStringFromAsciiChecked("null");
+    msg = isolate->factory()->null_string();
+  } else if (IsUndefined(*object)) {
+    // "which is undefined"
+    msg = isolate->factory()->undefined_string();
   } else if (isolate->factory()->object_string()->Equals(*type)) {
     // "which is an object"
     msg = isolate->factory()->NewStringFromAsciiChecked("an object");
@@ -319,13 +379,14 @@ RUNTIME_FUNCTION(Runtime_ThrowApplyNonFunction) {
               .ToHandleChecked();
   }
   THROW_NEW_ERROR_RETURN_FAILURE(
-      isolate, NewTypeError(MessageTemplate::kApplyNonFunction, object, msg));
+      isolate,
+      NewTypeError(MessageTemplate::kTargetNonFunction, target, object, msg));
 }
 
 RUNTIME_FUNCTION(Runtime_StackGuard) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(0, args.length());
-  TRACE_EVENT0("v8.execute", "V8.StackGuard");
+  TRACE_EVENT("v8.execute", "V8.StackGuard");
 
   // First check if this is a real stack overflow.
   StackLimitCheck check(isolate);
@@ -340,7 +401,7 @@ RUNTIME_FUNCTION(Runtime_StackGuard) {
 RUNTIME_FUNCTION(Runtime_HandleNoHeapWritesInterrupts) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(0, args.length());
-  TRACE_EVENT0("v8.execute", "V8.StackGuard");
+  TRACE_EVENT("v8.execute", "V8.StackGuard");
 
   // First check if this is a real stack overflow.
   StackLimitCheck check(isolate);
@@ -356,7 +417,7 @@ RUNTIME_FUNCTION(Runtime_StackGuardWithGap) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(args.length(), 1);
   uint32_t gap = args.positive_smi_value_at(0);
-  TRACE_EVENT0("v8.execute", "V8.StackGuard");
+  TRACE_EVENT("v8.execute", "V8.StackGuard");
 
   // First check if this is a real stack overflow.
   StackLimitCheck check(isolate);
@@ -376,7 +437,7 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
   DirectHandle<JSFunction> function = args.at<JSFunction>(0);
-  TRACE_EVENT0("v8.execute", "V8.BytecodeBudgetInterruptWithStackCheck");
+  TRACE_EVENT("v8.execute", "V8.BytecodeBudgetInterruptWithStackCheck");
 
   // Check for stack interrupts here so that we can fold the interrupt check
   // into bytecode budget interrupts.
@@ -388,7 +449,7 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
     return isolate->StackOverflow();
   } else if (check.InterruptRequested()) {
     Tagged<Object> return_value = isolate->stack_guard()->HandleInterrupts();
-    if (!IsUndefined(return_value, isolate)) {
+    if (!IsUndefined(return_value)) {
       return return_value;
     }
   }
@@ -400,11 +461,12 @@ Tagged<Object> BytecodeBudgetInterruptWithStackCheck(Isolate* isolate,
 Tagged<Object> BytecodeBudgetInterrupt(Isolate* isolate, RuntimeArguments& args,
                                        CodeKind code_kind) {
   HandleScope scope(isolate);
-  DCHECK_EQ(1, args.length());
+  DCHECK(args.length() == 1 ||
+         (code_kind == CodeKind::MAGLEV && args.length() == 2));
   DirectHandle<JSFunction> function = args.at<JSFunction>(0);
   function->TraceOptimizationStatus("budget from %s",
                                     CodeKindToString(code_kind));
-  TRACE_EVENT0("v8.execute", "V8.BytecodeBudgetInterrupt");
+  TRACE_EVENT("v8.execute", "V8.BytecodeBudgetInterrupt");
 
   isolate->tiering_manager()->OnInterruptTick(function, code_kind);
   return ReadOnlyRoots(isolate).undefined_value();
@@ -431,11 +493,36 @@ RUNTIME_FUNCTION(Runtime_BytecodeBudgetInterrupt_Sparkplug) {
 }
 
 RUNTIME_FUNCTION(Runtime_BytecodeBudgetInterrupt_Maglev) {
+  DCHECK_EQ(1, args.length());
   return BytecodeBudgetInterrupt(isolate, args, CodeKind::MAGLEV);
 }
 
-RUNTIME_FUNCTION(Runtime_BytecodeBudgetInterruptWithStackCheck_Maglev) {
-  return BytecodeBudgetInterruptWithStackCheck(isolate, args, CodeKind::MAGLEV);
+RUNTIME_FUNCTION(Runtime_BytecodeBudgetLoopInterrupt_Maglev) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(2, args.length());
+  DirectHandle<JSFunction> function = args.at<JSFunction>(0);
+  BytecodeOffset osr_offset = BytecodeOffset(args.smi_value_at(1));
+
+  // Check for stack interrupts here so that we can fold the interrupt check
+  // into bytecode budget interrupts.
+  StackLimitCheck check(isolate);
+  if (check.JsHasOverflowed()) {
+    return isolate->StackOverflow();
+  } else if (check.InterruptRequested(
+                 StackGuard::InterruptLevel::kNoHeapWrites)) {
+    Tagged<Object> return_value = isolate->stack_guard()->HandleInterrupts(
+        StackGuard::InterruptLevel::kNoHeapWrites);
+    if (!IsUndefined(return_value)) {
+      return return_value;
+    }
+  }
+
+  if (!osr_offset.IsNone() && isolate->concurrent_recompilation_enabled() &&
+      isolate->stack_guard()->CheckInstallCode()) {
+    isolate->optimizing_compile_dispatcher()->InstallOptimizedFunctionsIfReady(
+        function, osr_offset);
+  }
+  return BytecodeBudgetInterrupt(isolate, args, CodeKind::MAGLEV);
 }
 
 RUNTIME_FUNCTION(Runtime_AllocateInYoungGeneration) {
@@ -447,11 +534,6 @@ RUNTIME_FUNCTION(Runtime_AllocateInYoungGeneration) {
   AllocationAlignment alignment = static_cast<AllocationAlignment>(flags);
   CHECK(IsAligned(size, kTaggedSize));
   CHECK_GT(size, 0);
-
-  // When this is called from WasmGC code, clear the "thread in wasm" flag,
-  // which is important in case any GC needs to happen.
-  // TODO(40192807): Find a better fix, likely by replacing the global flag.
-  SaveAndClearThreadInWasmFlag clear_wasm_flag(isolate);
 
   // TODO(v8:9472): Until double-aligned allocation is fixed for new-space
   // allocations, don't request it.
@@ -468,11 +550,6 @@ RUNTIME_FUNCTION(Runtime_AllocateInOldGeneration) {
   // TODO(v8:13070): Align allocations in the builtins that call this.
   int size = ALIGN_TO_ALLOCATION_ALIGNMENT(args.smi_value_at(0));
   int flags = args.smi_value_at(1);
-
-  // When this is called from WasmGC code, clear the "thread in wasm" flag,
-  // which is important in case any GC needs to happen.
-  // TODO(40192807): Find a better fix, likely by replacing the global flag.
-  SaveAndClearThreadInWasmFlag clear_wasm_flag(isolate);
 
   AllocationAlignment alignment = static_cast<AllocationAlignment>(flags);
   CHECK(IsAligned(size, kTaggedSize));
@@ -491,14 +568,6 @@ RUNTIME_FUNCTION(Runtime_AllocateInSharedHeap) {
   CHECK(IsAligned(size, kTaggedSize));
   CHECK_GT(size, 0);
 
-#if V8_ENABLE_WEBASSEMBLY
-  // When this is called from WasmGC code, clear the "thread in wasm" flag,
-  // which is important in case any GC needs to happen.
-  // TODO(chromium:1236668): Find a better fix, likely by replacing the global
-  // flag.
-  SaveAndClearThreadInWasmFlag clear_wasm_flag(isolate);
-#endif  // V8_ENABLE_WEBASSEMBLY
-
   Tagged<HeapObject> result = *isolate->factory()->NewFillerObject(
       size, alignment, AllocationType::kSharedOld,
       AllocationOrigin::kGeneratedCode);
@@ -510,8 +579,8 @@ RUNTIME_FUNCTION(Runtime_AllocateInSharedHeap) {
 RUNTIME_FUNCTION(Runtime_AllocateByteArray) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
-  int length = args.smi_value_at(0);
-  DCHECK_LT(0, length);
+  uint32_t length = args.positive_smi_value_at(0);
+  DCHECK_LT(0u, length);
   return *isolate->factory()->NewByteArray(length);
 }
 
@@ -734,6 +803,9 @@ RUNTIME_FUNCTION(Runtime_ReportMessageFromMicrotask) {
   HandleScope scope(isolate);
   DCHECK_EQ(1, args.length());
 
+  // Valid context is required for reporting an unhandled exception.
+  DCHECK(!isolate->context().is_null());
+
   DirectHandle<Object> exception = args.at(0);
 
   DCHECK(!isolate->has_exception());
@@ -798,6 +870,10 @@ RUNTIME_FUNCTION(Runtime_InvalidateStringWrapperToPrimitiveProtector) {
 }
 
 RUNTIME_FUNCTION(Runtime_AddLhsIsStringConstantInternalize) {
+  UNREACHABLE();  // Lowered to a builtin call instead.
+}
+
+RUNTIME_FUNCTION(Runtime_AddRhsIsStringConstantInternalize) {
   UNREACHABLE();  // Lowered to a builtin call instead.
 }
 

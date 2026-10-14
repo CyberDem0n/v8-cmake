@@ -20,6 +20,7 @@
 #include "src/api/api-inl.h"
 #include "src/base/macros.h"
 #include "src/base/utils/random-number-generator.h"
+#include "src/flags/save-flags.h"
 #include "src/handles/handles.h"
 #include "src/heap/parked-scope.h"
 #include "src/logging/log.h"
@@ -30,6 +31,24 @@
 #include "testing/gtest-support.h"
 
 namespace v8 {
+
+// This tag value has been picked arbitrarily between 0 and
+// V8_EXTERNAL_POINTER_TAG_COUNT.
+constexpr v8::ExternalPointerTypeTag kTestConfigTag = 14;
+static_assert(kTestConfigTag < V8_EXTERNAL_POINTER_TAG_COUNT);
+
+// Used for wrapping passing raw pointers to Api callbacks.
+static v8::Local<v8::External> MakeData(v8::Isolate* isolate, void* pointer) {
+  return v8::External::New(isolate, pointer, kTestConfigTag);
+}
+
+// Unwraps raw pointer passed to Api callbacks.
+template <typename T, typename TCallbackInfo>
+static T* GetData(const TCallbackInfo& info) {
+  USE(MakeData);
+  return reinterpret_cast<T*>(
+      v8::External::Cast(*info.Data())->Value(kTestConfigTag));
+}
 
 class ArrayBufferAllocator;
 
@@ -64,6 +83,14 @@ template <typename TMixin>
 class WithJSSharedMemoryFeatureFlagsMixin : public TMixin {
  public:
   WithJSSharedMemoryFeatureFlagsMixin() { i::v8_flags.harmony_struct = true; }
+};
+
+template <typename TMixin>
+class WithShadowRealmFeatureFlagsMixin : public TMixin {
+ public:
+  WithShadowRealmFeatureFlagsMixin() {
+    i::v8_flags.harmony_shadow_realm = true;
+  }
 };
 
 using CounterMap = std::map<std::string, int>;
@@ -241,6 +268,10 @@ class WithIsolateScopeMixin : public TMixin {
     return v8::String::NewFromUtf8(this->v8_isolate(), string).ToLocalChecked();
   }
 
+  v8::Local<v8::Number> NewNumber(double value) {
+    return v8::Number::New(this->v8_isolate(), value);
+  }
+
   void EmptyMessageQueues() {
     while (v8::platform::PumpMessageLoop(internal::V8::GetCurrentPlatform(),
                                          this->v8_isolate())) {
@@ -322,7 +353,8 @@ using TestWithContext =                    //
                     ::testing::Test>>>>;
 
 // Use v8::internal::TestJSSharedMemoryWithNativeContext if you are testing
-// internals, aka. directly work with Handles.
+// internals, aka. directly work with Handles and require --harmony-struct
+// feature.
 //
 // Using this will FATAL when !V8_CAN_CREATE_SHARED_HEAP_BOOL
 using TestJSSharedMemoryWithContext =                     //
@@ -333,9 +365,21 @@ using TestJSSharedMemoryWithContext =                     //
                     WithJSSharedMemoryFeatureFlagsMixin<  //
                         ::testing::Test>>>>>;
 
+// Use v8::internal::TestShadowRealmWithContext if you are testing
+// internals, aka. directly work with Handles and require
+// --harmony-shadow-realm feature.
+using TestShadowRealmWithContext =                     //
+    WithContextMixin<                                  //
+        WithIsolateScopeMixin<                         //
+            WithIsolateMixin<                          //
+                WithDefaultPlatformMixin<              //
+                    WithShadowRealmFeatureFlagsMixin<  //
+                        ::testing::Test>>>>>;
+
 class PrintExtension : public v8::Extension {
  public:
-  PrintExtension() : v8::Extension("v8/print", "native function print();") {}
+  static constexpr const char* kName = "v8/print";
+  PrintExtension() : v8::Extension(kName, "native function print();") {}
   v8::Local<v8::FunctionTemplate> GetNativeFunctionTemplate(
       v8::Isolate* isolate, v8::Local<v8::String> name) override {
     return v8::FunctionTemplate::New(isolate, PrintExtension::Print);
@@ -351,24 +395,6 @@ class PrintExtension : public v8::Extension {
     }
     printf("\n");
   }
-};
-
-template <typename TMixin>
-class WithPrintExtensionMixin : public TMixin {
- public:
-  WithPrintExtensionMixin() = default;
-  ~WithPrintExtensionMixin() override = default;
-  WithPrintExtensionMixin(const WithPrintExtensionMixin&) = delete;
-  WithPrintExtensionMixin& operator=(const WithPrintExtensionMixin&) = delete;
-
-  static void SetUpTestSuite() {
-    v8::RegisterExtension(std::make_unique<PrintExtension>());
-    TMixin::SetUpTestSuite();
-  }
-
-  static void TearDownTestSuite() { TMixin::TearDownTestSuite(); }
-
-  static constexpr const char* kPrintExtensionName = "v8/print";
 };
 
 // Run a ScriptStreamingTask in a separate thread.
@@ -414,8 +440,18 @@ class WithInternalIsolateMixin : public TMixin {
     return Cast<T>(RunJSInternal(source));
   }
 
+  template <typename T = Object>
+  Handle<T> RunJS(v8::Local<v8::Context> context, const char* source) {
+    return Cast<T>(RunJSInternal(context, source));
+  }
+
   Handle<Object> RunJSInternal(const char* source) {
     return Utils::OpenHandle(*TMixin::RunJS(source));
+  }
+
+  Handle<Object> RunJSInternal(v8::Local<v8::Context> context,
+                               const char* source) {
+    return Utils::OpenHandle(*TMixin::RunJS(context, source));
   }
 
   template <typename T = Object>
@@ -436,8 +472,7 @@ class WithInternalIsolateMixin : public TMixin {
 template <typename TMixin>
 class WithZoneMixin : public TMixin {
  public:
-  explicit WithZoneMixin(bool support_zone_compression = false)
-      : zone_(&allocator_, ZONE_NAME, support_zone_compression) {}
+  WithZoneMixin() : zone_(&allocator_, ZONE_NAME) {}
   WithZoneMixin(const WithZoneMixin&) = delete;
   WithZoneMixin& operator=(const WithZoneMixin&) = delete;
 
@@ -520,19 +555,6 @@ using TestJSSharedMemoryWithNativeContext =  //
                 WithIsolateMixin<            //
                     TestJSSharedMemoryWithPlatform>>>>;
 
-class V8_NODISCARD SaveFlags {
- public:
-  SaveFlags();
-  ~SaveFlags();
-  SaveFlags(const SaveFlags&) = delete;
-  SaveFlags& operator=(const SaveFlags&) = delete;
-
- private:
-#define FLAG_MODE_APPLY(ftype, ctype, nam, def, cmt) ctype SAVED_##nam;
-#include "src/flags/flag-definitions.h"
-#undef FLAG_MODE_APPLY
-};
-
 // For GTest.
 inline void PrintTo(Tagged<Object> o, ::std::ostream* os) {
   *os << reinterpret_cast<void*>(o.ptr());
@@ -576,9 +598,10 @@ class FeedbackVectorHelper {
  public:
   explicit FeedbackVectorHelper(Handle<FeedbackVector> vector)
       : vector_(vector) {
-    int slot_count = vector->length();
+    uint32_t slot_count = vector->length().value();
     slots_.reserve(slot_count);
-    FeedbackMetadataIterator iter(vector->metadata());
+    DisallowGarbageCollection no_gc;
+    FeedbackMetadataIterator iter(vector->metadata(), no_gc);
     while (iter.HasNext()) {
       FeedbackSlot slot = iter.Next();
       slots_.push_back(slot);
@@ -625,6 +648,45 @@ class FakeCodeEventLogger : public i::CodeEventLogger {
   void LogRecordedBuffer(const i::wasm::WasmCode* code, const char* name,
                          size_t length) override {}
 #endif  // V8_ENABLE_WEBASSEMBLY
+};
+
+class CrashKeyStore {
+ public:
+  explicit CrashKeyStore(Isolate* isolate) : isolate_(isolate) {
+    InstallCallbacks();
+  }
+
+  CrashKeyStore(const CrashKeyStore&) = delete;
+  CrashKeyStore& operator=(const CrashKeyStore&) = delete;
+
+  ~CrashKeyStore() { isolate_->SetCrashKeyStringCallbacks({}, {}); }
+
+  const std::string& ValueForKey(const std::string& name) const {
+    auto it = entries_.find(name);
+    CHECK(it != entries_.end());
+    CHECK_NOT_NULL(it->second.get());
+    return it->second->value;
+  }
+
+  bool HasKey(const std::string& name) const {
+    return entries_.find(name) != entries_.end();
+  }
+
+  size_t size() const { return entries_.size(); }
+  std::unordered_set<std::string> KeyNames() const;
+
+ private:
+  struct Entry {
+    CrashKeySize size;
+    std::string value;
+  };
+
+  void InstallCallbacks();
+  CrashKey AllocateKey(const char key[], CrashKeySize size);
+  void SetValue(CrashKey crash_key, const std::string_view value);
+
+  Isolate* isolate_;
+  std::unordered_map<std::string, std::unique_ptr<Entry>> entries_;
 };
 
 #ifdef V8_CC_GNU

@@ -302,6 +302,59 @@ CheckMapsParameters const& CheckMapsParametersOf(Operator const* op) {
   return OpParameter<CheckMapsParameters>(op);
 }
 
+bool operator==(LoadDictionaryFieldParameters const& lhs,
+                LoadDictionaryFieldParameters const& rhs) {
+  return lhs.dictionary_index() == rhs.dictionary_index() &&
+         lhs.name() == rhs.name() && lhs.feedback() == rhs.feedback() &&
+         lhs.is_super() == rhs.is_super();
+}
+
+size_t hash_value(LoadDictionaryFieldParameters const& p) {
+  FeedbackSource::Hash feedback_hash;
+  return base::hash_combine(p.dictionary_index().raw_value(), p.name(),
+                            feedback_hash(p.feedback()), p.is_super());
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         LoadDictionaryFieldParameters const& p) {
+  return os << p.dictionary_index().raw_value() << ", " << p.name() << ", "
+            << p.feedback() << ", is_super: " << p.is_super();
+}
+
+LoadDictionaryFieldParameters const& LoadDictionaryFieldParametersOf(
+    Operator const* op) {
+  DCHECK_EQ(IrOpcode::kLoadDictionaryField, op->opcode());
+  return OpParameter<LoadDictionaryFieldParameters>(op);
+}
+
+bool operator==(CheckHomomorphicParameters const& lhs,
+                CheckHomomorphicParameters const& rhs) {
+  return lhs.name() == rhs.name() &&
+         lhs.homomorphic_array() == rhs.homomorphic_array() &&
+         lhs.handler_value() == rhs.handler_value() &&
+         lhs.check_heap_object() == rhs.check_heap_object() &&
+         lhs.feedback() == rhs.feedback();
+}
+
+size_t hash_value(CheckHomomorphicParameters const& p) {
+  FeedbackSource::Hash feedback_hash;
+  return base::hash_combine(p.name(), p.homomorphic_array(), p.handler_value(),
+                            p.check_heap_object(), feedback_hash(p.feedback()));
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         CheckHomomorphicParameters const& p) {
+  return os << p.name() << ", " << p.homomorphic_array() << ", "
+            << p.handler_value() << ", " << p.check_heap_object() << ", "
+            << p.feedback();
+}
+
+CheckHomomorphicParameters const& CheckHomomorphicParametersOf(
+    Operator const* op) {
+  DCHECK_EQ(IrOpcode::kCheckHomomorphic, op->opcode());
+  return OpParameter<CheckHomomorphicParameters>(op);
+}
+
 ZoneRefSet<Map> const& CompareMapsParametersOf(Operator const* op) {
   DCHECK_EQ(IrOpcode::kCompareMaps, op->opcode());
   return OpParameter<ZoneRefSet<Map>>(op);
@@ -765,9 +818,11 @@ bool operator==(CheckTaggedInputParameters const& lhs,
 
 const CheckMinusZeroParameters& CheckMinusZeroParametersOf(const Operator* op) {
   DCHECK(op->opcode() == IrOpcode::kCheckedTaggedToInt32 ||
+         op->opcode() == IrOpcode::kCheckedTaggedToUint64 ||
          op->opcode() == IrOpcode::kCheckedTaggedToAdditiveSafeInteger ||
          op->opcode() == IrOpcode::kCheckedTaggedToInt64 ||
          op->opcode() == IrOpcode::kCheckedFloat64ToInt32 ||
+         op->opcode() == IrOpcode::kCheckedFloat64ToUint64 ||
          op->opcode() == IrOpcode::kCheckedFloat64ToAdditiveSafeInteger ||
          op->opcode() == IrOpcode::kCheckedFloat64ToInt64);
   return OpParameter<CheckMinusZeroParameters>(op);
@@ -870,8 +925,6 @@ bool operator==(AssertNotNullParameters const& lhs,
   V(StringIndexOf, Operator::kNoProperties, 3, 0)                            \
   V(StringLength, Operator::kNoProperties, 1, 0)                             \
   V(StringWrapperLength, Operator::kNoProperties, 1, 0)                      \
-  V(StringToLowerCaseIntl, Operator::kNoProperties, 1, 0)                    \
-  V(StringToUpperCaseIntl, Operator::kNoProperties, 1, 0)                    \
   V(TypeOf, Operator::kNoProperties, 1, 1)                                   \
   V(PlainPrimitiveToNumber, Operator::kNoProperties, 1, 0)                   \
   V(PlainPrimitiveToWord32, Operator::kNoProperties, 1, 0)                   \
@@ -883,6 +936,8 @@ bool operator==(AssertNotNullParameters const& lhs,
   V(ChangeTaggedToUint32, Operator::kNoProperties, 1, 0)                     \
   V(ChangeTaggedToFloat64, Operator::kNoProperties, 1, 0)                    \
   V(ChangeTaggedToTaggedSigned, Operator::kNoProperties, 1, 0)               \
+  V(ChangeSmiOrHoleToFloat64, Operator::kNoProperties, 1, 0)                 \
+  V(ChangeNumberOrHoleToFloat64, Operator::kNoProperties, 1, 0)              \
   V(ChangeFloat64ToTaggedPointer, Operator::kNoProperties, 1, 0)             \
   V(ChangeFloat64HoleToTagged, Operator::kNoProperties, 1, 0)                \
   V(ChangeFloat64OrUndefinedOrHoleToTagged, Operator::kNoProperties, 1, 0)   \
@@ -898,7 +953,9 @@ bool operator==(AssertNotNullParameters const& lhs,
   V(ChangeUint64ToBigInt, Operator::kNoProperties, 1, 0)                     \
   V(TruncateTaggedToBit, Operator::kNoProperties, 1, 0)                      \
   V(TruncateTaggedPointerToBit, Operator::kNoProperties, 1, 0)               \
-  V(TruncateTaggedToWord32, Operator::kNoProperties, 1, 0)                   \
+  V(TruncateNumberOrOddballToWord32, Operator::kNoProperties, 1, 0)          \
+  V(TruncateSmiOrHoleToWord32, Operator::kNoProperties, 1, 0)                \
+  V(TruncateNumberOrOddballOrHoleToWord32, Operator::kNoProperties, 1, 0)    \
   V(TruncateTaggedToFloat64, Operator::kNoProperties, 1, 0)                  \
   V(TruncateTaggedToFloat64PreserveUndefined, Operator::kNoProperties, 1, 0) \
   V(ObjectIsArrayBufferView, Operator::kNoProperties, 1, 0)                  \
@@ -932,6 +989,7 @@ bool operator==(AssertNotNullParameters const& lhs,
   V(StringEqual, Operator::kCommutative, 2, 0)                               \
   V(StringLessThan, Operator::kNoProperties, 2, 0)                           \
   V(StringLessThanOrEqual, Operator::kNoProperties, 2, 0)                    \
+  V(StringOrOddballStrictEqual, Operator::kCommutative, 2, 0)                \
   V(ToBoolean, Operator::kNoProperties, 1, 0)                                \
   V(NewConsString, Operator::kNoProperties, 3, 0)                            \
   V(Unsigned32Divide, Operator::kNoProperties, 2, 0)
@@ -984,26 +1042,30 @@ bool operator==(AssertNotNullParameters const& lhs,
   V(CheckedInt64Div, 2, 1)                \
   V(CheckedInt64Mod, 2, 1)
 
-#define CHECKED_WITH_FEEDBACK_OP_LIST(V) \
-  V(CheckNumber, 1, 1)                   \
-  V(CheckNumberFitsInt32, 1, 1)          \
-  V(CheckNumberOrUndefined, 1, 1)        \
-  V(CheckSmi, 1, 1)                      \
-  V(CheckString, 1, 1)                   \
-  V(CheckStringOrStringWrapper, 1, 1)    \
-  V(CheckBigInt, 1, 1)                   \
-  V(CheckedBigIntToBigInt64, 1, 1)       \
-  V(CheckedInt32ToTaggedSigned, 1, 1)    \
-  V(CheckedInt64ToInt32, 1, 1)           \
-  V(CheckedInt64ToTaggedSigned, 1, 1)    \
-  V(CheckedTaggedToArrayIndex, 1, 1)     \
-  V(CheckedTaggedSignedToInt32, 1, 1)    \
-  V(CheckedTaggedToTaggedPointer, 1, 1)  \
-  V(CheckedTaggedToTaggedSigned, 1, 1)   \
-  V(CheckedUint32ToInt32, 1, 1)          \
-  V(CheckedUint32ToTaggedSigned, 1, 1)   \
-  V(CheckedUint64ToInt32, 1, 1)          \
-  V(CheckedUint64ToInt64, 1, 1)          \
+#define CHECKED_WITH_FEEDBACK_OP_LIST(V)     \
+  V(CheckNumber, 1, 1)                       \
+  V(CheckNumberFitsInt32, 1, 1)              \
+  V(CheckNumberOrUndefined, 1, 1)            \
+  V(CheckSmi, 1, 1)                          \
+  V(CheckString, 1, 1)                       \
+  V(CheckStringOrStringWrapper, 1, 1)        \
+  V(CheckStringOrOddball, 1, 1)              \
+  V(CheckBigInt, 1, 1)                       \
+  V(CheckedBigIntToBigInt64, 1, 1)           \
+  V(CheckedInt32ToTaggedSigned, 1, 1)        \
+  V(CheckedInt64ToInt32, 1, 1)               \
+  V(CheckedInt64ToTaggedSigned, 1, 1)        \
+  V(CheckedInt64ToAdditiveSafeInteger, 1, 1) \
+  V(CheckedTaggedToArrayIndex, 1, 1)         \
+  V(CheckedTaggedSignedToInt32, 1, 1)        \
+  V(CheckedTaggedToTaggedPointer, 1, 1)      \
+  V(CheckedTaggedToTaggedSigned, 1, 1)       \
+  V(CheckedUint32ToInt32, 1, 1)              \
+  V(CheckedUint32ToTaggedSigned, 1, 1)       \
+  V(CheckedUint64ToInt32, 1, 1)              \
+  V(CheckedInt32ToUint64, 1, 1)              \
+  V(CheckedInt64ToUint64, 1, 1)              \
+  V(CheckedUint64ToInt64, 1, 1)              \
   V(CheckedUint64ToTaggedSigned, 1, 1)
 
 #define CHECKED_BOUNDS_OP_LIST(V) \
@@ -1070,12 +1132,26 @@ struct SimplifiedOperatorGlobalCache final {
   CHECKED_BOUNDS_OP_LIST(CHECKED_BOUNDS)
   CHECKED_BOUNDS(CheckBounds)
   // For IrOpcode::kCheckBounds, we allow additional flags:
+  CheckBoundsOperator kCheckBoundsAllow64BitBounds = {
+      FeedbackSource(), CheckBoundsFlag::kAllow64BitBounds};
+  CheckBoundsOperator kCheckBoundsAbortingAndAllow64BitBounds = {
+      FeedbackSource(), CheckBoundsFlag::kAbortOnOutOfBounds |
+                            CheckBoundsFlag::kAllow64BitBounds};
   CheckBoundsOperator kCheckBoundsConverting = {
       FeedbackSource(), CheckBoundsFlag::kConvertStringAndMinusZero};
+  CheckBoundsOperator kCheckBoundsConvertingAndAllow64BitBounds = {
+      FeedbackSource(), CheckBoundsFlag::kConvertStringAndMinusZero |
+                            CheckBoundsFlag::kAllow64BitBounds};
   CheckBoundsOperator kCheckBoundsAbortingAndConverting = {
       FeedbackSource(),
       CheckBoundsFlags(CheckBoundsFlag::kAbortOnOutOfBounds) |
           CheckBoundsFlags(CheckBoundsFlag::kConvertStringAndMinusZero)};
+  CheckBoundsOperator kCheckBoundsAbortingAndConvertingAndAllow64BitBounds = {
+      FeedbackSource(),
+      CheckBoundsFlags(CheckBoundsFlag::kAbortOnOutOfBounds) |
+          CheckBoundsFlags(CheckBoundsFlag::kConvertStringAndMinusZero) |
+          CheckBoundsFlags(CheckBoundsFlag::kAllow64BitBounds)};
+
 #undef CHECKED_BOUNDS
 
   template <DeoptimizeReason kDeoptimizeReason>
@@ -1086,7 +1162,7 @@ struct SimplifiedOperatorGlobalCache final {
               "CheckIf", 1, 1, 1, 0, 1, 0,
               CheckIfParameters(kDeoptimizeReason, FeedbackSource())) {}
   };
-#define CHECK_IF(Name, message) \
+#define CHECK_IF(Name, message, ...) \
   CheckIfOperator<DeoptimizeReason::k##Name> kCheckIf##Name;
   DEOPTIMIZE_REASON_LIST(CHECK_IF)
 #undef CHECK_IF
@@ -1113,6 +1189,15 @@ struct SimplifiedOperatorGlobalCache final {
                    "FindOrderedHashSetEntry", 2, 1, 1, 1, 1, 0) {}
   };
   FindOrderedHashSetEntryOperator kFindOrderedHashSetEntry;
+
+  // Inputs: receiver (JSWeakCollection), key (Object).
+  // Output: looked-up value (Object) or undefined.
+  struct WeakCollectionGetOperator final : public Operator {
+    WeakCollectionGetOperator()
+        : Operator(IrOpcode::kWeakCollectionGet, Operator::kEliminatable,
+                   "WeakCollectionGet", 2, 1, 1, 1, 1, 0) {}
+  };
+  WeakCollectionGetOperator kWeakCollectionGet;
 
   template <CheckForMinusZeroMode kMode>
   struct ChangeFloat64ToTaggedOperator final
@@ -1204,6 +1289,21 @@ struct SimplifiedOperatorGlobalCache final {
       kCheckedFloat64ToInt64DontCheckForMinusZeroOperator;
 
   template <CheckForMinusZeroMode kMode>
+  struct CheckedFloat64ToUint64Operator final
+      : public Operator1<CheckMinusZeroParameters> {
+    CheckedFloat64ToUint64Operator()
+        : Operator1<CheckMinusZeroParameters>(
+              IrOpcode::kCheckedFloat64ToUint64,
+              Operator::kFoldable | Operator::kNoThrow,
+              "CheckedFloat64ToUint64", 1, 1, 1, 1, 1, 0,
+              CheckMinusZeroParameters(kMode, FeedbackSource())) {}
+  };
+  CheckedFloat64ToUint64Operator<CheckForMinusZeroMode::kCheckForMinusZero>
+      kCheckedFloat64ToUint64CheckForMinusZeroOperator;
+  CheckedFloat64ToUint64Operator<CheckForMinusZeroMode::kDontCheckForMinusZero>
+      kCheckedFloat64ToUint64DontCheckForMinusZeroOperator;
+
+  template <CheckForMinusZeroMode kMode>
   struct CheckedTaggedToInt32Operator final
       : public Operator1<CheckMinusZeroParameters> {
     CheckedTaggedToInt32Operator()
@@ -1249,6 +1349,21 @@ struct SimplifiedOperatorGlobalCache final {
       kCheckedTaggedToInt64CheckForMinusZeroOperator;
   CheckedTaggedToInt64Operator<CheckForMinusZeroMode::kDontCheckForMinusZero>
       kCheckedTaggedToInt64DontCheckForMinusZeroOperator;
+
+  template <CheckForMinusZeroMode kMode>
+  struct CheckedTaggedToUint64Operator final
+      : public Operator1<CheckMinusZeroParameters> {
+    CheckedTaggedToUint64Operator()
+        : Operator1<CheckMinusZeroParameters>(
+              IrOpcode::kCheckedTaggedToUint64,
+              Operator::kFoldable | Operator::kNoThrow, "CheckedTaggedToUint64",
+              1, 1, 1, 1, 1, 0,
+              CheckMinusZeroParameters(kMode, FeedbackSource())) {}
+  };
+  CheckedTaggedToUint64Operator<CheckForMinusZeroMode::kCheckForMinusZero>
+      kCheckedTaggedToUint64CheckForMinusZeroOperator;
+  CheckedTaggedToUint64Operator<CheckForMinusZeroMode::kDontCheckForMinusZero>
+      kCheckedTaggedToUint64DontCheckForMinusZeroOperator;
 
   template <CheckTaggedInputMode kMode>
   struct CheckedTaggedToFloat64Operator final
@@ -1393,8 +1508,30 @@ struct SimplifiedOperatorGlobalCache final {
                    1, 3, 1, 1) {}
   };
   StringPrepareForGetCodeunitOperator kStringPrepareForGetCodeunit;
-
 #endif
+
+  struct StringToLowerCaseIntlOperator final : public Operator {
+    StringToLowerCaseIntlOperator()
+        : Operator(IrOpcode::kStringToLowerCaseIntl,
+                   Operator::kFoldable | Operator::kIdempotent,
+                   "StringToLowerCaseIntl", 3, 1, 1, 1, 1, 2) {}
+  };
+  StringToLowerCaseIntlOperator kStringToLowerCaseIntl;
+
+  struct StringToUpperCaseIntlOperator final : public Operator {
+    StringToUpperCaseIntlOperator()
+        : Operator(IrOpcode::kStringToUpperCaseIntl,
+                   Operator::kFoldable | Operator::kIdempotent,
+                   "StringToUpperCaseIntl", 3, 1, 1, 1, 1, 2) {}
+  };
+  StringToUpperCaseIntlOperator kStringToUpperCaseIntl;
+
+  struct StringLocaleCompareIntlOperator final : public Operator {
+    StringLocaleCompareIntlOperator()
+        : Operator(IrOpcode::kStringLocaleCompareIntl, Operator::kNoProperties,
+                   "StringLocaleCompareIntl", 6, 1, 1, 1, 1, 2) {}
+  };
+  StringLocaleCompareIntlOperator kStringLocaleCompareIntl;
 
 #define SPECULATIVE_NUMBER_BINOP(Name)                                     \
   template <NumberOperationHint kHint>                                     \
@@ -1498,7 +1635,20 @@ EFFECT_DEPENDENT_OP_LIST(GET_FROM_CACHE)
 CHECKED_OP_LIST(GET_FROM_CACHE)
 GET_FROM_CACHE(FindOrderedHashMapEntryForInt32Key)
 GET_FROM_CACHE(LoadFieldByIndex)
+GET_FROM_CACHE(StringToLowerCaseIntl)
+GET_FROM_CACHE(StringToUpperCaseIntl)
+GET_FROM_CACHE(StringLocaleCompareIntl)
 #undef GET_FROM_CACHE
+
+const Operator* SimplifiedOperatorBuilder::LoadDictionaryField(
+    InternalIndex dictionary_index, NameRef name,
+    const FeedbackSource& feedback, bool is_super) {
+  return zone()->New<Operator1<LoadDictionaryFieldParameters>>(
+      IrOpcode::kLoadDictionaryField, Operator::kNoProperties,
+      "LoadDictionaryField", 4, 1, 1, 1, 1, 2,
+      LoadDictionaryFieldParameters(dictionary_index, name, feedback,
+                                    is_super));
+}
 
 const Operator* SimplifiedOperatorBuilder::FindOrderedCollectionEntry(
     CollectionKind collection_kind) {
@@ -1508,6 +1658,11 @@ const Operator* SimplifiedOperatorBuilder::FindOrderedCollectionEntry(
     case CollectionKind::kSet:
       return &cache_.kFindOrderedHashSetEntry;
   }
+  UNREACHABLE();
+}
+
+const Operator* SimplifiedOperatorBuilder::WeakCollectionGet() {
+  return &cache_.kWeakCollectionGet;
 }
 
 #define GET_FROM_CACHE_WITH_FEEDBACK(Name, value_input_count,               \
@@ -1548,15 +1703,31 @@ const Operator* SimplifiedOperatorBuilder::CheckBounds(
   if (!feedback.IsValid()) {
     if (flags & CheckBoundsFlag::kAbortOnOutOfBounds) {
       if (flags & CheckBoundsFlag::kConvertStringAndMinusZero) {
-        return &cache_.kCheckBoundsAbortingAndConverting;
+        if (flags & CheckBoundsFlag::kAllow64BitBounds) {
+          return &cache_.kCheckBoundsAbortingAndConvertingAndAllow64BitBounds;
+        } else {
+          return &cache_.kCheckBoundsAbortingAndConverting;
+        }
       } else {
-        return &cache_.kCheckBoundsAborting;
+        if (flags & CheckBoundsFlag::kAllow64BitBounds) {
+          return &cache_.kCheckBoundsAbortingAndAllow64BitBounds;
+        } else {
+          return &cache_.kCheckBoundsAborting;
+        }
       }
     } else {
       if (flags & CheckBoundsFlag::kConvertStringAndMinusZero) {
-        return &cache_.kCheckBoundsConverting;
+        if (flags & CheckBoundsFlag::kAllow64BitBounds) {
+          return &cache_.kCheckBoundsConvertingAndAllow64BitBounds;
+        } else {
+          return &cache_.kCheckBoundsConverting;
+        }
       } else {
-        return &cache_.kCheckBounds;
+        if (flags & CheckBoundsFlag::kAllow64BitBounds) {
+          return &cache_.kCheckBoundsAllow64BitBounds;
+        } else {
+          return &cache_.kCheckBounds;
+        }
       }
     }
   }
@@ -1582,6 +1753,7 @@ const Operator* SimplifiedOperatorBuilder::NumberSilenceNaN(
     case SilenceNanMode::kPreserveUndefined:
       return &cache_.kNumberSilenceNanPreserveUndefinedOperator;
   }
+  UNREACHABLE();
 }
 
 const Operator* SimplifiedOperatorBuilder::RuntimeAbort(AbortReason reason) {
@@ -1782,10 +1954,10 @@ const Operator* SimplifiedOperatorBuilder::CheckIf(
     DeoptimizeReason reason, const FeedbackSource& feedback) {
   if (!feedback.IsValid()) {
     switch (reason) {
-#define CHECK_IF(Name, message)   \
-  case DeoptimizeReason::k##Name: \
+#define CHECK_IF(Name, message, ...) \
+  case DeoptimizeReason::k##Name:    \
     return &cache_.kCheckIf##Name;
-    DEOPTIMIZE_REASON_LIST(CHECK_IF)
+      DEOPTIMIZE_REASON_LIST(CHECK_IF)
 #undef CHECK_IF
     }
   }
@@ -1877,6 +2049,22 @@ const Operator* SimplifiedOperatorBuilder::CheckedFloat64ToInt64(
       1, 1, 1, 0, CheckMinusZeroParameters(mode, feedback));
 }
 
+const Operator* SimplifiedOperatorBuilder::CheckedFloat64ToUint64(
+    CheckForMinusZeroMode mode, const FeedbackSource& feedback) {
+  if (!feedback.IsValid()) {
+    switch (mode) {
+      case CheckForMinusZeroMode::kCheckForMinusZero:
+        return &cache_.kCheckedFloat64ToUint64CheckForMinusZeroOperator;
+      case CheckForMinusZeroMode::kDontCheckForMinusZero:
+        return &cache_.kCheckedFloat64ToUint64DontCheckForMinusZeroOperator;
+    }
+  }
+  return zone()->New<Operator1<CheckMinusZeroParameters>>(
+      IrOpcode::kCheckedFloat64ToUint64,
+      Operator::kFoldable | Operator::kNoThrow, "CheckedFloat64ToUint64", 1, 1,
+      1, 1, 1, 0, CheckMinusZeroParameters(mode, feedback));
+}
+
 const Operator* SimplifiedOperatorBuilder::CheckedTaggedToInt32(
     CheckForMinusZeroMode mode, const FeedbackSource& feedback) {
   if (!feedback.IsValid()) {
@@ -1924,6 +2112,22 @@ const Operator* SimplifiedOperatorBuilder::CheckedTaggedToInt64(
       IrOpcode::kCheckedTaggedToInt64, Operator::kFoldable | Operator::kNoThrow,
       "CheckedTaggedToInt64", 1, 1, 1, 1, 1, 0,
       CheckMinusZeroParameters(mode, feedback));
+}
+
+const Operator* SimplifiedOperatorBuilder::CheckedTaggedToUint64(
+    CheckForMinusZeroMode mode, const FeedbackSource& feedback) {
+  if (!feedback.IsValid()) {
+    switch (mode) {
+      case CheckForMinusZeroMode::kCheckForMinusZero:
+        return &cache_.kCheckedTaggedToUint64CheckForMinusZeroOperator;
+      case CheckForMinusZeroMode::kDontCheckForMinusZero:
+        return &cache_.kCheckedTaggedToUint64DontCheckForMinusZeroOperator;
+    }
+  }
+  return zone()->New<Operator1<CheckMinusZeroParameters>>(
+      IrOpcode::kCheckedTaggedToUint64,
+      Operator::kFoldable | Operator::kNoThrow, "CheckedTaggedToUint64", 1, 1,
+      1, 1, 1, 0, CheckMinusZeroParameters(mode, feedback));
 }
 
 const Operator* SimplifiedOperatorBuilder::CheckedTaggedToFloat64(
@@ -1983,6 +2187,20 @@ const Operator* SimplifiedOperatorBuilder::CheckMaps(
       "CheckMaps",                                     // name
       1, 1, 1, 0, 1, 0,                                // counts
       parameters);                                     // parameter
+}
+
+const Operator* SimplifiedOperatorBuilder::CheckHomomorphic(
+    NameRef name, WeakHomomorphicFixedArrayRef homomorphic_array,
+    int handler_value, bool check_heap_object, const FeedbackSource& feedback) {
+  CheckHomomorphicParameters const parameters(
+      name, homomorphic_array, handler_value, check_heap_object, feedback);
+  Operator::Properties operator_props = Operator::kNoThrow | Operator::kNoWrite;
+  return zone()->New<Operator1<CheckHomomorphicParameters>>(  // --
+      IrOpcode::kCheckHomomorphic,                            // opcode
+      operator_props,                                         // flags
+      "CheckHomomorphic",                                     // name
+      1, 1, 1, 0, 1, 0,                                       // counts
+      parameters);                                            // parameter
 }
 
 const Operator* SimplifiedOperatorBuilder::MapGuard(ZoneRefSet<Map> maps) {
@@ -2176,7 +2394,7 @@ const Operator* SimplifiedOperatorBuilder::TypedArrayLength(
       IrOpcode::kTypedArrayLength,                                   // opcode
       Operator::kNoWrite | Operator::kNoThrow | Operator::kNoDeopt,  // flags
       "TypedArrayLength",                                            // name
-      1, 0, 0, 1, 0, 0,                                              // counts
+      1, 1, 1, 1, 1, 0,                                              // counts
       elements_kind);  // parameter
 }
 

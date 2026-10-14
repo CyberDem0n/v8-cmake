@@ -11,10 +11,13 @@
 #include <set>
 #include <string>
 
+#include "include/v8-internal.h"
+#include "src/base/compiler-specific.h"
 #include "src/base/timezone-cache.h"
 #include "src/objects/contexts.h"
 #include "src/objects/managed.h"
 #include "src/objects/objects.h"
+#include "unicode/brkiter.h"
 #include "unicode/locid.h"
 #include "unicode/uversion.h"
 
@@ -25,7 +28,6 @@
 #define V8_MINIMUM_ICU_VERSION 73
 
 namespace U_ICU_NAMESPACE {
-class BreakIterator;
 class Locale;
 class ListFormatter;
 class RelativeDateTimeFormatter;
@@ -39,24 +41,26 @@ class TimeZone;
 class UnicodeString;
 namespace number {
 class LocalizedNumberFormatter;
+class Notation;
 }  //  namespace number
 }  // namespace U_ICU_NAMESPACE
 
 namespace v8::internal {
 
-#define ICU_EXTERNAL_POINTER_TAG_LIST(V)                              \
-  V(icu::UnicodeString, kIcuUnicodeStringTag)                         \
-  V(icu::BreakIterator, kIcuBreakIteratorTag)                         \
-  V(icu::Locale, kIcuLocaleTag)                                       \
-  V(icu::SimpleDateFormat, kIcuSimpleDateFormatTag)                   \
-  V(icu::DateIntervalFormat, kIcuDateIntervalFormatTag)               \
-  V(icu::RelativeDateTimeFormatter, kIcuRelativeDateTimeFormatterTag) \
-  V(icu::ListFormatter, kIcuListFormatterTag)                         \
-  V(icu::Collator, kIcuCollatorTag)                                   \
-  V(icu::PluralRules, kIcuPluralRulesTag)                             \
-  V(icu::number::LocalizedNumberFormatter, kIcuLocalizedNumberFormatterTag)
-ICU_EXTERNAL_POINTER_TAG_LIST(ASSIGN_EXTERNAL_POINTER_TAG_FOR_MANAGED)
-#undef ICU_EXTERNAL_POINTER_TAG_LIST
+#define ICU_MANAGED_TYPE_ID_LIST(V)                                   \
+  V(icu::BreakIterator, ManagedTypeId::kIcuBreakIterator)             \
+  V(icu::Locale, ManagedTypeId::kIcuLocale)                           \
+  V(icu::SimpleDateFormat, ManagedTypeId::kIcuSimpleDateFormat)       \
+  V(icu::DateIntervalFormat, ManagedTypeId::kIcuDateIntervalFormat)   \
+  V(icu::RelativeDateTimeFormatter,                                   \
+    ManagedTypeId::kIcuRelativeDateTimeFormatter)                     \
+  V(icu::ListFormatter, ManagedTypeId::kIcuListFormatter)             \
+  V(icu::Collator, ManagedTypeId::kIcuCollator)                       \
+  V(icu::PluralRules, ManagedTypeId::kIcuPluralRules)                 \
+  V(icu::number::LocalizedNumberFormatter,                            \
+    ManagedTypeId::kIcuLocalizedNumberFormatter)
+ICU_MANAGED_TYPE_ID_LIST(ASSIGN_MANAGED_TYPE_ID_FOR_MANAGED)
+#undef ICU_MANAGED_TYPE_ID_LIST
 
 struct NumberFormatSpan {
   int32_t field_id;
@@ -73,11 +77,66 @@ V8_EXPORT_PRIVATE std::vector<NumberFormatSpan> FlattenRegionsToParts(
 
 class JSCollator;
 
+// Owns the ICU break iterator together with the string buffer it refers to.
+class IcuBreakIteratorWithText final {
+ public:
+  static constexpr ManagedTypeId kTypeID =
+      ManagedTypeId::kIcuBreakIteratorWithText;
+
+  // Adopts the given iterator with an empty string.
+  explicit IcuBreakIteratorWithText(
+      std::unique_ptr<icu::BreakIterator> iterator);
+  // Clones the given iterator and the string.
+  IcuBreakIteratorWithText(Isolate* isolate,
+                           std::unique_ptr<icu::BreakIterator> iterator,
+                           DirectHandle<String> string);
+  IcuBreakIteratorWithText(const IcuBreakIteratorWithText&) = delete;
+  IcuBreakIteratorWithText(IcuBreakIteratorWithText&&) V8_NOEXCEPT;
+  IcuBreakIteratorWithText& operator=(const IcuBreakIteratorWithText&) = delete;
+  IcuBreakIteratorWithText& operator=(IcuBreakIteratorWithText&&) V8_NOEXCEPT;
+  ~IcuBreakIteratorWithText();
+
+  const icu::BreakIterator* iterator() const { return iterator_.get(); }
+  icu::BreakIterator* iterator() { return iterator_.get(); }
+  const icu::UnicodeString* text() const { return text_.get(); }
+  icu::UnicodeString* text() { return text_.get(); }
+
+  void SetText(Isolate* isolate, DirectHandle<String> string);
+
+ private:
+  std::unique_ptr<icu::UnicodeString> text_;
+  std::unique_ptr<icu::BreakIterator> iterator_;  // may refer to `text_` buffer
+};
+
 class Intl {
  public:
   enum class BoundFunctionContextSlot {
     kBoundFunction = Context::MIN_CONTEXT_SLOTS,
     kLength
+  };
+
+  // [[Notation]] is one of the String values "standard", "scientific",
+  // "engineering", or "compact", specifying whether the number should be
+  // displayed without scaling, scaled to the units place with the power of ten
+  // in scientific notation, scaled to the nearest thousand with the power of
+  // ten in scientific notation, or scaled to the nearest locale-dependent
+  // compact decimal notation power of ten with the corresponding compact
+  // decimal notation affix.
+
+  enum class Notation {
+    STANDARD,
+    SCIENTIFIC,
+    ENGINEERING,
+    COMPACT,
+  };
+
+  // [[CompactDisplay]] is one of the String values "short" or "long",
+  // specifying whether to display compact notation affixes in short form ("5K")
+  // or long form ("5 thousand") if formatting with the "compact" notation. It
+  // is only used when [[Notation]] has the value "compact".
+  enum class CompactDisplay {
+    SHORT,
+    LONG,
   };
 
   enum class FormatRangeSource { kShared, kStartRange, kEndRange };
@@ -125,18 +184,18 @@ class Intl {
       const std::set<std::string>& available_locales,
       DirectHandle<Object> locales_in, DirectHandle<Object> options_in);
 
-  // https://tc39.github.io/ecma402/#sec-canonicalizelocalelist
+  // https://tc39.es/ecma402/#sec-canonicalizelocalelist
   // {only_return_one_result} is an optimization for callers that only
   // care about the first result.
   static Maybe<std::vector<std::string>> CanonicalizeLocaleList(
       Isolate* isolate, DirectHandle<Object> locales,
       bool only_return_one_result = false);
 
-  // ecma-402 #sec-intl.getcanonicallocales
+  // ecma-402 https://tc39.es/ecma262/#sec-intl.getcanonicallocales
   V8_WARN_UNUSED_RESULT static MaybeDirectHandle<JSArray> GetCanonicalLocales(
       Isolate* isolate, DirectHandle<Object> locales);
 
-  // ecma-402 #sec-intl.supportedvaluesof
+  // ecma-402 https://tc39.es/ecma262/#sec-intl.supportedvaluesof
   V8_WARN_UNUSED_RESULT static MaybeDirectHandle<JSArray> SupportedValuesOf(
       Isolate* isolate, DirectHandle<Object> key);
 
@@ -170,7 +229,7 @@ class Intl {
       CompareStringsOptions compare_strings_options =
           CompareStringsOptions::kNone);
 
-  // ecma402/#sup-properties-of-the-number-prototype-object
+  // https://tc39.es/ecma402/#sup-properties-of-the-number-prototype-object
   V8_WARN_UNUSED_RESULT static MaybeDirectHandle<String> NumberToLocaleString(
       Isolate* isolate, Handle<Object> num, DirectHandle<Object> locales,
       DirectHandle<Object> options, const char* method_name);
@@ -213,7 +272,7 @@ class Intl {
     kStripIfInteger,
   };
 
-  // ecma402/#sec-setnfdigitoptions
+  // https://tc39.es/ecma402/#sec-setnfdigitoptions
   struct NumberFormatDigitOptions {
     int minimum_integer_digits;
     int minimum_fraction_digits;
@@ -254,7 +313,7 @@ class Intl {
   // A helper function to implement formatToParts which add element to array as
   // $array[$index] = { type: $field_type_string, value: $value }
   static void AddElement(Isolate* isolate, DirectHandle<JSArray> array,
-                         int index, DirectHandle<String> field_type_string,
+                         uint32_t index, DirectHandle<String> field_type_string,
                          DirectHandle<String> value);
 
   // A helper function to implement formatToParts which add element to array as
@@ -263,7 +322,7 @@ class Intl {
   //   $additional_property_name: $additional_property_value
   // }
   static void AddElement(Isolate* isolate, DirectHandle<JSArray> array,
-                         int index, DirectHandle<String> field_type_string,
+                         uint32_t index, DirectHandle<String> field_type_string,
                          DirectHandle<String> value,
                          DirectHandle<String> additional_property_name,
                          DirectHandle<String> additional_property_value);
@@ -284,7 +343,7 @@ class Intl {
   // which chains the underlying Intl instance on any object, when the
   // constructor is called
   //
-  // See ecma402/#legacy-constructor.
+  // See https://tc39.es/ecma402/#legacy-constructor.
   V8_WARN_UNUSED_RESULT static MaybeDirectHandle<Object> LegacyUnwrapReceiver(
       Isolate* isolate, DirectHandle<JSReceiver> receiver,
       DirectHandle<JSFunction> constructor, bool has_initialized_slot);
@@ -300,7 +359,7 @@ class Intl {
   // Shared function to read the "numberingSystem" option.
   V8_WARN_UNUSED_RESULT static Maybe<bool> GetNumberingSystem(
       Isolate* isolate, DirectHandle<JSReceiver> options,
-      const char* method_name, std::unique_ptr<char[]>* result);
+      const char* method_name, std::string& result);
 
   // Check the calendar is valid or not for that locale.
   static bool IsValidCalendar(const icu::Locale& locale,
@@ -314,10 +373,10 @@ class Intl {
   static bool IsValidNumberingSystem(const std::string& value);
 
   // Check the calendar is well formed.
-  static bool IsWellFormedCalendar(const std::string& value);
+  static bool IsWellFormedCalendar(std::string_view value);
 
   // Check the currency is well formed.
-  static bool IsWellFormedCurrency(const std::string& value);
+  static bool IsWellFormedCurrency(std::string_view value);
 
   struct ResolvedLocale {
     std::string locale;
@@ -372,12 +431,7 @@ class Intl {
     std::set<std::string> set_;
   };
 
-  // Utility function to set text to BreakIterator.
-  static DirectHandle<Managed<icu::UnicodeString>> SetTextToBreakIterator(
-      Isolate* isolate, DirectHandle<String> text,
-      icu::BreakIterator* break_iterator);
-
-  // ecma262 #sec-string.prototype.normalize
+  // https://tc39.es/ecma262/#sec-string.prototype.normalize
   V8_WARN_UNUSED_RESULT static MaybeDirectHandle<String> Normalize(
       Isolate* isolate, DirectHandle<String> string,
       DirectHandle<Object> form_input);
@@ -386,13 +440,17 @@ class Intl {
   // Convert a Handle<String> to icu::UnicodeString
   static icu::UnicodeString ToICUUnicodeString(Isolate* isolate,
                                                DirectHandle<String> string,
-                                               int offset = 0);
+                                               uint32_t offset = 0);
 
   static const uint8_t* ToLatin1LowerTable();
 
   static const uint8_t* AsciiCollationWeightsL1();
   static const uint8_t* AsciiCollationWeightsL3();
   static const int kAsciiCollationWeightsLength;
+
+  // Maximum min(left.length, right.length) for which the localeCompare
+  // ASCII fast path is inlined; longer inputs go straight to the builtin.
+  static constexpr int kInlineLocaleCompareMaxMinLength = 32;
 
   static Tagged<String> ConvertOneByteToLower(Tagged<String> src,
                                               Tagged<String> dst);
@@ -402,7 +460,8 @@ class Intl {
   static const std::set<std::string>& GetAvailableLocalesForDateFormat();
 
   V8_WARN_UNUSED_RESULT static MaybeDirectHandle<JSArray> ToJSArray(
-      Isolate* isolate, const char* unicode_key,
+      Isolate* isolate,
+      const std::function<std::string(const char*)>& transforms,
       icu::StringEnumeration* enumeration,
       const std::function<bool(const char*)>& removes, bool sort);
 
@@ -461,15 +520,21 @@ class Intl {
       Isolate* isolate, int32_t time_zone_index,
       DirectHandle<BigInt> nanosecond_epoch);
 
-  static DirectHandle<String> DefaultTimeZone(Isolate* isolate);
+  V8_WARN_UNUSED_RESULT static MaybeHandle<String> TimeZoneIdToString(
+      Isolate* isolate, const icu::UnicodeString& id);
+  static std::string TimeZoneIdToString(const icu::UnicodeString& id);
+  static std::string DefaultTimeZone();
 
-  V8_WARN_UNUSED_RESULT static MaybeHandle<String> CanonicalizeTimeZoneName(
-      Isolate* isolate, DirectHandle<String> identifier);
+  static icu::number::Notation ToICUNotation(
+      Intl::Notation notation, Intl::CompactDisplay compact_display);
 
-  // ecma402/#sec-coerceoptionstoobject
-  V8_WARN_UNUSED_RESULT static MaybeDirectHandle<JSReceiver>
-  CoerceOptionsToObject(Isolate* isolate, DirectHandle<Object> options,
-                        const char* service);
+  V8_WARN_UNUSED_RESULT static Notation NotationFromSkeleton(
+      const icu::UnicodeString& skeleton);
+  V8_WARN_UNUSED_RESULT static DirectHandle<String> NotationAsString(
+      Isolate* isolate, Notation notation);
+
+  V8_WARN_UNUSED_RESULT static DirectHandle<String> CompactDisplayString(
+      Isolate* isolate, const icu::UnicodeString& skeleton);
 };
 
 }  // namespace v8::internal

@@ -64,6 +64,10 @@ namespace internal {
 
 class SafepointTableBuilder;
 
+namespace regexp {
+class RegExpMacroAssemblerS390;
+}
+
 // -----------------------------------------------------------------------------
 // Machine instruction Operands
 
@@ -231,6 +235,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
 
   // Unused on this architecture.
   void MaybeEmitOutOfLineConstantPool() {}
+  void ClearInternalState() {}
 
   // Label operations & relative jumps (PPUM Appendix D)
   //
@@ -1047,6 +1052,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void DataAlign(int m);
   // Aligns code to something that's optimal for a jump target for the platform.
   void CodeTargetAlign();
+  void SwitchTargetAlign() { CodeTargetAlign(); }
+  void BranchTargetAlign() {}
   void LoopHeaderAlign() { CodeTargetAlign(); }
 
   void breakpoint(bool do_print) {
@@ -1376,9 +1383,6 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data = 0);
 
  private:
-  // Avoid overflows for displacements etc.
-  static const int kMaximalBufferSize = 512 * MB;
-
   // Relocation info generation
   // Each relocation is encoded as a variable size value
   static constexpr int kMaxRelocSize = RelocInfoWriter::kMaxSize;
@@ -1461,11 +1465,11 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void bind_to(Label* L, int pos);
   void next(Label* L);
 
-  void AllocateAndInstallRequestedHeapNumbers(LocalIsolate* isolate);
+  void PatchInHeapNumberRequest(Address pc, Handle<HeapNumber> object) override;
 
   int WriteCodeComments();
 
-  friend class RegExpMacroAssemblerS390;
+  friend class regexp::RegExpMacroAssemblerS390;
   friend class RelocInfo;
   friend class EnsureSpace;
   friend class UseScratchRegisterScope;

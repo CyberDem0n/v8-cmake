@@ -16,33 +16,31 @@ namespace v8::internal {
 
 class Undefined;
 
-#include "torque-generated/src/objects/feedback-cell-tq.inc"
-
 // This is a special cell used to maintain both the link between a
 // closure and its feedback vector, as well as a way to count the
 // number of closures created for a certain function per native
 // context. There's at most one FeedbackCell for each function in
 // a native context.
-class FeedbackCell : public TorqueGeneratedFeedbackCell<FeedbackCell, Struct> {
+V8_OBJECT class FeedbackCell : public Struct {
  public:
-  // Dispatched behavior.
-  DECL_PRINTER(FeedbackCell)
+  using Value = UnionOf<Undefined, FeedbackVector, ClosureFeedbackCellArray>;
 
-  static const int kUnalignedSize = kSize;
-  static const int kAlignedSize = RoundUp<kObjectAlignment>(int{kSize});
+  // Accessors
+  inline Tagged<Value> value() const;
+  inline Tagged<Value> value(AcquireLoadTag) const;
+  inline void set_value(Tagged<Value> value,
+                        WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
+  inline void set_value(Tagged<Value> value, ReleaseStoreTag,
+                        WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
-  using TorqueGeneratedFeedbackCell<FeedbackCell, Struct>::value;
-  using TorqueGeneratedFeedbackCell<FeedbackCell, Struct>::set_value;
+  inline int32_t interrupt_budget() const;
+  inline void set_interrupt_budget(int32_t value);
 
-  DECL_RELEASE_ACQUIRE_ACCESSORS(value, Tagged<HeapObject>)
+  inline JSDispatchHandle dispatch_handle() const;
+  inline void set_dispatch_handle(JSDispatchHandle new_handle);
 
   inline void clear_interrupt_budget();
   inline void clear_dispatch_handle();
-
-#ifdef V8_ENABLE_LEAPTIERING
-  inline JSDispatchHandle dispatch_handle() const;
-  inline void set_dispatch_handle(JSDispatchHandle new_handle);
-#endif  // V8_ENABLE_LEAPTIERING
 
   inline void clear_padding();
   inline void reset_feedback_vector(
@@ -57,12 +55,19 @@ class FeedbackCell : public TorqueGeneratedFeedbackCell<FeedbackCell, Struct> {
   // creation by updating the map.
   inline ClosureCountTransition IncrementClosureCount(Isolate* isolate);
 
+  DECL_PRINTER(FeedbackCell)
   DECL_VERIFIER(FeedbackCell)
 
   class BodyDescriptor;
 
-  TQ_OBJECT_CONSTRUCTORS(FeedbackCell)
-};
+ public:
+  TaggedMember<Value> value_;
+  JSDispatchHandleMember dispatch_handle_;
+  int32_t interrupt_budget_;
+} V8_OBJECT_END;
+
+static_assert(sizeof(FeedbackCell) ==
+              sizeof(Struct) + kTaggedSize + 2 * kInt32Size);
 
 }  // namespace v8::internal
 

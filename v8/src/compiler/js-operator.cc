@@ -28,7 +28,8 @@ namespace {
 
 // Returns properties for the given binary op.
 constexpr Operator::Properties BinopProperties(Operator::Opcode opcode) {
-  DCHECK(JSOperator::IsBinaryWithFeedback(opcode));
+  DCHECK(JSOperator::IsBinaryWithFeedback(opcode) ||
+         JSOperator::IsBinaryWithEmbeddedFeedback(opcode));
   return opcode == IrOpcode::kJSStrictEqual ? Operator::kPure
                                             : Operator::kNoProperties;
 }
@@ -151,15 +152,13 @@ const CallRuntimeParameters& CallRuntimeParametersOf(const Operator* op) {
   return OpParameter<CallRuntimeParameters>(op);
 }
 
-
 ContextAccess::ContextAccess(size_t depth, size_t index, bool immutable)
-    : immutable_(immutable),
-      depth_(static_cast<uint16_t>(depth)),
+    : immutable_and_depth_(ImmutableField::encode(immutable) |
+                           DepthField::encode(static_cast<uint32_t>(depth))),
       index_(static_cast<uint32_t>(index)) {
-  DCHECK(depth <= std::numeric_limits<uint16_t>::max());
+  CHECK_EQ(depth, DepthField::decode(immutable_and_depth_));
   DCHECK(index <= std::numeric_limits<uint32_t>::max());
 }
-
 
 bool operator==(ContextAccess const& lhs, ContextAccess const& rhs) {
   return lhs.depth() == rhs.depth() && lhs.index() == rhs.index() &&
@@ -223,7 +222,8 @@ CreateFunctionContextParameters const& CreateFunctionContextParametersOf(
 
 bool operator==(DefineNamedOwnPropertyParameters const& lhs,
                 DefineNamedOwnPropertyParameters const& rhs) {
-  return lhs.name_.object().location() == rhs.name_.object().location() &&
+  return lhs.in_literal() == rhs.in_literal() &&
+         lhs.name_.object().location() == rhs.name_.object().location() &&
          lhs.feedback() == rhs.feedback();
 }
 
@@ -233,7 +233,7 @@ bool operator!=(DefineNamedOwnPropertyParameters const& lhs,
 }
 
 size_t hash_value(DefineNamedOwnPropertyParameters const& p) {
-  return base::hash_combine(p.name_.object().location(),
+  return base::hash_combine(p.in_literal(), p.name_.object().location(),
                             FeedbackSource::Hash()(p.feedback()));
 }
 
@@ -265,13 +265,59 @@ std::ostream& operator<<(std::ostream& os, FeedbackParameter const& p) {
 }
 
 FeedbackParameter const& FeedbackParameterOf(const Operator* op) {
-  DCHECK(JSOperator::IsUnaryWithFeedback(op->opcode()) ||
-         JSOperator::IsBinaryWithFeedback(op->opcode()) ||
+  DCHECK(JSOperator::IsBinaryWithFeedback(op->opcode()) ||
          op->opcode() == IrOpcode::kJSCreateEmptyLiteralArray ||
          op->opcode() == IrOpcode::kJSInstanceOf ||
          op->opcode() == IrOpcode::kJSDefineKeyedOwnPropertyInLiteral ||
          op->opcode() == IrOpcode::kJSStoreInArrayLiteral);
   return OpParameter<FeedbackParameter>(op);
+}
+
+bool operator==(EmbeddedHintParameter const& lhs,
+                EmbeddedHintParameter const& rhs) {
+  return lhs.hint() == rhs.hint();
+}
+
+bool operator!=(EmbeddedHintParameter const& lhs,
+                EmbeddedHintParameter const& rhs) {
+  return !(lhs == rhs);
+}
+
+size_t hash_value(EmbeddedHintParameter const& p) {
+  return std::visit(
+      [](auto const& hint) {
+        using T = std::decay_t<decltype(hint)>;
+        if constexpr (std::is_same_v<T, CompareOperationHint>) {
+          return static_cast<size_t>(hint);
+        } else if constexpr (std::is_same_v<T, BinaryOperationHint>) {
+          return static_cast<size_t>(hint);
+        } else if constexpr (std::is_same_v<T, std::monostate>) {
+          return size_t{0};
+        } else {
+          UNREACHABLE();
+        }
+      },
+      p.hint());
+}
+
+std::ostream& operator<<(std::ostream& os, EmbeddedHintParameter const& p) {
+  std::visit(
+      [&os](auto const& hint) {
+        using T = std::decay_t<decltype(hint)>;
+        if constexpr (std::is_same_v<T, std::monostate>) {
+          os << "Invalid";
+        } else {
+          os << hint;
+        }
+      },
+      p.hint());
+  return os;
+}
+
+EmbeddedHintParameter const& EmbeddedHintParameterOf(const Operator* op) {
+  DCHECK(JSOperator::IsBinaryWithEmbeddedFeedback(op->opcode()) ||
+         JSOperator::IsUnaryWithEmbeddedFeedback(op->opcode()));
+  return OpParameter<EmbeddedHintParameter>(op);
 }
 
 bool operator==(NamedAccess const& lhs, NamedAccess const& rhs) {
@@ -335,6 +381,30 @@ size_t hash_value(PropertyAccess const& p) {
                             FeedbackSource::Hash()(p.feedback()));
 }
 
+bool operator==(CreateGeneratorObjectParameters const& lhs,
+                CreateGeneratorObjectParameters const& rhs) {
+  return lhs.bytecode_array.location() == rhs.bytecode_array.location();
+}
+
+bool operator!=(CreateGeneratorObjectParameters const& lhs,
+                CreateGeneratorObjectParameters const& rhs) {
+  return !(lhs == rhs);
+}
+
+size_t hash_value(CreateGeneratorObjectParameters const& p) {
+  return base::hash_combine(p.bytecode_array.location());
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         CreateGeneratorObjectParameters const& p) {
+  return os << Brief(*p.bytecode_array);
+}
+
+const CreateGeneratorObjectParameters& CreateGeneratorObjectParametersOf(
+    const Operator* op) {
+  DCHECK_EQ(IrOpcode::kJSCreateGeneratorObject, op->opcode());
+  return OpParameter<CreateGeneratorObjectParameters>(op);
+}
 
 bool operator==(LoadGlobalParameters const& lhs,
                 LoadGlobalParameters const& rhs) {
@@ -407,7 +477,8 @@ CreateArgumentsType const& CreateArgumentsTypeOf(const Operator* op) {
 bool operator==(CreateArrayParameters const& lhs,
                 CreateArrayParameters const& rhs) {
   return lhs.arity() == rhs.arity() &&
-         AddressOrNull(lhs.site_) == AddressOrNull(rhs.site_);
+         AddressOrNull(lhs.site_) == AddressOrNull(rhs.site_) &&
+         lhs.call_feedback() == rhs.call_feedback();
 }
 
 
@@ -418,7 +489,8 @@ bool operator!=(CreateArrayParameters const& lhs,
 
 
 size_t hash_value(CreateArrayParameters const& p) {
-  return base::hash_combine(p.arity(), AddressOrNull(p.site_));
+  return base::hash_combine(p.arity(), AddressOrNull(p.site_),
+                            FeedbackSource::Hash()(p.feedback_));
 }
 
 
@@ -427,6 +499,7 @@ std::ostream& operator<<(std::ostream& os, CreateArrayParameters const& p) {
   if (p.site_.has_value()) {
     os << ", " << Brief(*p.site_->object());
   }
+  os << ", " << p.call_feedback();
   return os;
 }
 
@@ -600,12 +673,36 @@ size_t hash_value(CreateLiteralParameters const& p) {
                             p.flags());
 }
 
-
 std::ostream& operator<<(std::ostream& os, CreateLiteralParameters const& p) {
   return os << Brief(*p.constant_.object()) << ", " << p.length() << ", "
             << p.flags();
 }
 
+bool operator==(SetPrototypePropertiesParameters const& lhs,
+                SetPrototypePropertiesParameters const& rhs) {
+  return lhs.constant.object().location() == rhs.constant.object().location() &&
+         lhs.source == rhs.source;
+}
+
+bool operator!=(SetPrototypePropertiesParameters const& lhs,
+                SetPrototypePropertiesParameters const& rhs) {
+  return !(lhs == rhs);
+}
+
+size_t hash_value(SetPrototypePropertiesParameters const& p) {
+  return base::hash_combine(p.constant.object().location(), p.source);
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         SetPrototypePropertiesParameters const& p) {
+  return os << Brief(*p.constant.object()) << "\nslot: " << p.source;
+}
+
+SetPrototypePropertiesParameters SetPrototypePropertiesParametersOf(
+    const Operator* op) {
+  DCHECK_EQ(IrOpcode::kJSSetPrototypeProperties, op->opcode());
+  return OpParameter<SetPrototypePropertiesParameters>(op);
+}
 
 const CreateLiteralParameters& CreateLiteralParametersOf(const Operator* op) {
   DCHECK(op->opcode() == IrOpcode::kJSCreateLiteralArray ||
@@ -662,6 +759,29 @@ size_t hash_value(GetIteratorParameters const& p) {
                             FeedbackSource::Hash()(p.callFeedback()));
 }
 
+std::ostream& operator<<(std::ostream& os, ForOfNextParameters const& p) {
+  return os << p.callFeedback();
+}
+
+bool operator==(ForOfNextParameters const& lhs,
+                ForOfNextParameters const& rhs) {
+  return lhs.callFeedback() == rhs.callFeedback();
+}
+
+bool operator!=(ForOfNextParameters const& lhs,
+                ForOfNextParameters const& rhs) {
+  return !(lhs == rhs);
+}
+
+ForOfNextParameters const& ForOfNextParametersOf(const Operator* op) {
+  DCHECK(op->opcode() == IrOpcode::kJSForOfNext);
+  return OpParameter<ForOfNextParameters>(op);
+}
+
+size_t hash_value(ForOfNextParameters const& p) {
+  return FeedbackSource::Hash()(p.callFeedback());
+}
+
 size_t hash_value(ForInMode const& mode) { return static_cast<uint8_t>(mode); }
 
 std::ostream& operator<<(std::ostream& os, ForInMode const& mode) {
@@ -700,18 +820,12 @@ ForInParameters const& ForInParametersOf(const Operator* op) {
 
 #if V8_ENABLE_WEBASSEMBLY
 JSWasmCallParameters::JSWasmCallParameters(
-    const wasm::WasmModule* module, const wasm::CanonicalSig* signature,
-    int function_index, SharedFunctionInfoRef shared_fct_info,
-    wasm::NativeModule* native_module, FeedbackSource const& feedback)
-    : module_(module),
-      signature_(signature),
+    wasm::NativeModule* native_module, int function_index,
+    SharedFunctionInfoRef shared_fct_info, FeedbackSource const& feedback)
+    : native_module_(native_module),
       function_index_(function_index),
       shared_fct_info_(shared_fct_info),
-      native_module_(native_module),
-      feedback_(feedback) {
-  DCHECK_NOT_NULL(module);
-  DCHECK(wasm::GetTypeCanonicalizer()->Contains(signature));
-}
+      feedback_(feedback) {}
 
 JSWasmCallParameters const& JSWasmCallParametersOf(const Operator* op) {
   DCHECK_EQ(IrOpcode::kJSWasmCall, op->opcode());
@@ -719,32 +833,35 @@ JSWasmCallParameters const& JSWasmCallParametersOf(const Operator* op) {
 }
 
 std::ostream& operator<<(std::ostream& os, JSWasmCallParameters const& p) {
-  return os << p.module() << ", " << p.signature() << ", " << p.feedback();
+  return os << p.native_module() << ", " << p.function_index() << ", "
+            << p.feedback();
 }
 
 size_t hash_value(JSWasmCallParameters const& p) {
-  return base::hash_combine(p.module(), p.signature(),
+  return base::hash_combine(p.native_module(), p.function_index(),
                             FeedbackSource::Hash()(p.feedback()));
 }
 
 bool operator==(JSWasmCallParameters const& lhs,
                 JSWasmCallParameters const& rhs) {
-  return lhs.module() == rhs.module() && lhs.signature() == rhs.signature() &&
+  return lhs.native_module() == rhs.native_module() &&
+         lhs.function_index() == rhs.function_index() &&
          lhs.feedback() == rhs.feedback();
 }
 
 int JSWasmCallParameters::arity_without_implicit_args() const {
-  return static_cast<int>(signature_->parameter_count());
+  const wasm::WasmModule* module = native_module_->module();
+  const wasm::FunctionSig* sig = module->functions[function_index_].sig;
+  return static_cast<int>(sig->parameter_count());
 }
 
 int JSWasmCallParameters::input_count() const {
-  return static_cast<int>(signature_->parameter_count()) +
-         JSWasmCallNode::kExtraInputCount;
+  return arity_without_implicit_args() + JSWasmCallNode::kExtraInputCount;
 }
 
 // static
-Type JSWasmCallNode::TypeForWasmReturnType(wasm::CanonicalValueType type) {
-  switch (type.kind()) {
+Type JSWasmCallNode::TypeForWasmReturnKind(wasm::ValueKind kind) {
+  switch (kind) {
     case wasm::kI32:
       return Type::Signed32();
     case wasm::kI64:
@@ -754,7 +871,6 @@ Type JSWasmCallNode::TypeForWasmReturnType(wasm::CanonicalValueType type) {
       return Type::Number();
     case wasm::kRef:
     case wasm::kRefNull:
-      CHECK(type.is_reference_to(wasm::HeapType::kExtern));
       return Type::Any();
     default:
       UNREACHABLE();
@@ -784,6 +900,7 @@ Type JSWasmCallNode::TypeForWasmReturnType(wasm::CanonicalValueType type) {
   V(HasInPrototypeChain, Operator::kNoProperties, 2, 1)                  \
   V(OrdinaryHasInstance, Operator::kNoProperties, 2, 1)                  \
   V(ForInEnumerate, Operator::kNoProperties, 1, 1)                       \
+  V(AsyncFunctionAwait, Operator::kNoDeopt, 2, 1)                        \
   V(AsyncFunctionEnter, Operator::kNoProperties, 2, 1)                   \
   V(AsyncFunctionReject, Operator::kNoDeopt | Operator::kNoThrow, 2, 1)  \
   V(AsyncFunctionResolve, Operator::kNoDeopt | Operator::kNoThrow, 2, 1) \
@@ -832,15 +949,15 @@ JSOperatorBuilder::JSOperatorBuilder(Zone* zone)
 CACHED_OP_LIST(CACHED_OP)
 #undef CACHED_OP
 
-#define UNARY_OP(JSName, Name)                                                \
-  const Operator* JSOperatorBuilder::Name(FeedbackSource const& feedback) {   \
-    FeedbackParameter parameters(feedback);                                   \
-    return zone()->New<Operator1<FeedbackParameter>>(                         \
-        IrOpcode::k##JSName, Operator::kNoProperties, #JSName, 2, 1, 1, 1, 1, \
-        2, parameters);                                                       \
+#define UNOP_WITH_EMBEDDED_FEEDBACK(JSName, Name)                             \
+  const Operator* JSOperatorBuilder::Name(BinaryOperationHint hint) {         \
+    EmbeddedHintParameter hint_parameter(hint);                               \
+    return zone()->New<Operator1<EmbeddedHintParameter>>(                     \
+        IrOpcode::k##JSName, Operator::kNoProperties, #JSName, 1, 1, 1, 1, 1, \
+        2, hint_parameter);                                                   \
   }
-JS_UNOP_WITH_FEEDBACK(UNARY_OP)
-#undef UNARY_OP
+JS_UNOP_WITH_EMBEDDED_FEEDBACK(UNOP_WITH_EMBEDDED_FEEDBACK)
+#undef UNOP_WITH_EMBEDDED_FEEDBACK
 
 #define BINARY_OP(JSName, Name)                                               \
   const Operator* JSOperatorBuilder::Name(FeedbackSource const& feedback) {   \
@@ -852,6 +969,29 @@ JS_UNOP_WITH_FEEDBACK(UNARY_OP)
   }
 JS_BINOP_WITH_FEEDBACK(BINARY_OP)
 #undef BINARY_OP
+
+#define COMPARE_OP_WITH_EMBEDDED_FEEDBACK(JSName, Name)                       \
+  const Operator* JSOperatorBuilder::Name(CompareOperationHint feedback) {    \
+    static constexpr auto kProperties = BinopProperties(IrOpcode::k##JSName); \
+    EmbeddedHintParameter hint_parameter(feedback);                           \
+    return zone()->New<Operator1<EmbeddedHintParameter>>(                     \
+        IrOpcode::k##JSName, kProperties, #JSName, 2, 1, 1, 1, 1,             \
+        Operator::ZeroIfNoThrow(kProperties), hint_parameter);                \
+  }
+JS_COMPARE_BINOP_COMMON_LIST(COMPARE_OP_WITH_EMBEDDED_FEEDBACK)
+#undef COMPARE_OP_WITH_EMBEDDED_FEEDBACK
+
+#define BINOP_WITH_EMBEDDED_FEEDBACK(JSName, Name)                            \
+  const Operator* JSOperatorBuilder::Name(BinaryOperationHint hint) {         \
+    static constexpr auto kProperties = BinopProperties(IrOpcode::k##JSName); \
+    EmbeddedHintParameter hint_parameter(hint);                               \
+    return zone()->New<Operator1<EmbeddedHintParameter>>(                     \
+        IrOpcode::k##JSName, kProperties, #JSName, 2, 1, 1, 1, 1,             \
+        Operator::ZeroIfNoThrow(kProperties), hint_parameter);                \
+  }
+JS_ARITH_BINOP_LIST(BINOP_WITH_EMBEDDED_FEEDBACK)
+JS_BITWISE_BINOP_LIST(BINOP_WITH_EMBEDDED_FEEDBACK)
+#undef BINOP_WITH_EMBEDDED_FEEDBACK
 
 const Operator* JSOperatorBuilder::DefineKeyedOwnPropertyInLiteral(
     const FeedbackSource& feedback) {
@@ -964,15 +1104,10 @@ const Operator* JSOperatorBuilder::CallRuntime(
 
 #if V8_ENABLE_WEBASSEMBLY
 const Operator* JSOperatorBuilder::CallWasm(
-    const wasm::WasmModule* wasm_module,
-    const wasm::CanonicalSig* wasm_signature, int wasm_function_index,
-    SharedFunctionInfoRef shared_fct_info, wasm::NativeModule* native_module,
-    FeedbackSource const& feedback) {
-  // TODO(clemensb): Drop wasm_module.
-  DCHECK_EQ(wasm_module, native_module->module());
-  JSWasmCallParameters parameters(wasm_module, wasm_signature,
-                                  wasm_function_index, shared_fct_info,
-                                  native_module, feedback);
+    wasm::NativeModule* native_module, int wasm_function_index,
+    SharedFunctionInfoRef shared_fct_info, FeedbackSource const& feedback) {
+  JSWasmCallParameters parameters(native_module, wasm_function_index,
+                                  shared_fct_info, feedback);
   return zone()->New<Operator1<JSWasmCallParameters>>(
       IrOpcode::kJSWasmCall, Operator::kNoProperties,  // opcode
       "JSWasmCall",                                    // name
@@ -1090,6 +1225,16 @@ const Operator* JSOperatorBuilder::GetIterator(
       access);                                            // parameter
 }
 
+const Operator* JSOperatorBuilder::ForOfNext(
+    FeedbackSource const& call_feedback) {
+  ForOfNextParameters access(call_feedback);
+  return zone()->New<Operator1<ForOfNextParameters>>(   // --
+      IrOpcode::kJSForOfNext, Operator::kNoProperties,  // opcode
+      "JSForOfNext",                                    // name
+      3, 1, 1, 1, 1, 2,                                 // counts
+      access);                                          // parameter
+}
+
 const Operator* JSOperatorBuilder::HasProperty(FeedbackSource const& feedback) {
   PropertyAccess access(LanguageMode::kSloppy, feedback);
   return zone()->New<Operator1<PropertyAccess>>(          // --
@@ -1192,12 +1337,12 @@ const Operator* JSOperatorBuilder::DefineKeyedOwnProperty(
 }
 
 const Operator* JSOperatorBuilder::DefineNamedOwnProperty(
-    NameRef name, FeedbackSource const& feedback) {
+    bool in_literal, NameRef name, FeedbackSource const& feedback) {
   static constexpr int kObject = 1;
   static constexpr int kValue = 1;
   static constexpr int kFeedbackVector = 1;
   static constexpr int kArity = kObject + kValue + kFeedbackVector;
-  DefineNamedOwnPropertyParameters parameters(name, feedback);
+  DefineNamedOwnPropertyParameters parameters(in_literal, name, feedback);
   return zone()->New<Operator1<DefineNamedOwnPropertyParameters>>(   // --
       IrOpcode::kJSDefineNamedOwnProperty, Operator::kNoProperties,  // opcode
       "JSDefineNamedOwnProperty",                                    // name
@@ -1212,11 +1357,14 @@ const Operator* JSOperatorBuilder::DeleteProperty() {
       3, 1, 1, 1, 1, 2);                                     // counts
 }
 
-const Operator* JSOperatorBuilder::CreateGeneratorObject() {
-  return zone()->New<Operator>(                                     // --
-      IrOpcode::kJSCreateGeneratorObject, Operator::kEliminatable,  // opcode
-      "JSCreateGeneratorObject",                                    // name
-      2, 1, 1, 1, 1, 0);                                            // counts
+const Operator* JSOperatorBuilder::CreateGeneratorObject(
+    IndirectHandle<BytecodeArray> bytecode_array) {
+  CreateGeneratorObjectParameters parameters(bytecode_array);
+  return zone()->New<Operator1<CreateGeneratorObjectParameters>>(  // --
+      IrOpcode::kJSCreateGeneratorObject, Operator::kNoThrow,      // opcode
+      "JSCreateGeneratorObject",                                   // name
+      2, 1, 1, 1, 1, 0,                                            // counts
+      parameters);                                                 // parameters
 }
 
 const Operator* JSOperatorBuilder::LoadGlobal(NameRef name,
@@ -1332,10 +1480,11 @@ const Operator* JSOperatorBuilder::CreateArguments(CreateArgumentsType type) {
 }
 
 const Operator* JSOperatorBuilder::CreateArray(size_t arity,
-                                               OptionalAllocationSiteRef site) {
+                                               OptionalAllocationSiteRef site,
+                                               const FeedbackSource& feedback) {
   // constructor, new_target, arg1, ..., argN
   int const value_input_count = static_cast<int>(arity) + 2;
-  CreateArrayParameters parameters(arity, site);
+  CreateArrayParameters parameters(arity, site, feedback);
   return zone()->New<Operator1<CreateArrayParameters>>(   // --
       IrOpcode::kJSCreateArray, Operator::kNoProperties,  // opcode
       "JSCreateArray",                                    // name
@@ -1442,6 +1591,18 @@ const Operator* JSOperatorBuilder::CreateLiteralObject(
       "JSCreateLiteralObject",                             // name
       1, 1, 1, 1, 1, 2,                                    // counts
       parameters);                                         // parameter
+}
+
+const Operator* JSOperatorBuilder::SetPrototypeProperties(
+    ObjectBoilerplateDescriptionRef constant_properties,
+    FeedbackSource source) {
+  SetPrototypePropertiesParameters parameters(constant_properties, source);
+  return zone()->New<Operator1<SetPrototypePropertiesParameters>>(  // --
+      IrOpcode::kJSSetPrototypeProperties,                          // opcode
+      Operator::kNoProperties,     // properties
+      "JSSetPrototypeProperties",  // name
+      1, 1, 1, 0, 1, 2,            // counts
+      parameters);                 // parameter
 }
 
 const Operator* JSOperatorBuilder::GetTemplateObject(

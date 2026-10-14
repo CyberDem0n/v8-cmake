@@ -7,6 +7,7 @@
 
 #include <optional>
 
+#include "src/base/fpu.h"
 #include "src/base/macros.h"
 #include "src/execution/mutex-guard-if-off-thread.h"
 #include "src/execution/thread-id.h"
@@ -95,6 +96,8 @@ class V8_EXPORT_PRIVATE LocalIsolate final : private HiddenLocalFactory {
     return isolate_->is_precise_binary_code_coverage();
   }
 
+  inline bool is_short_builtin_calls_enabled() const;
+
   v8::internal::LocalFactory* factory() {
     // Upcast to the privately inherited base-class using c-style casts to avoid
     // undefined behavior (as static_cast cannot cast across private bases).
@@ -117,6 +120,10 @@ class V8_EXPORT_PRIVATE LocalIsolate final : private HiddenLocalFactory {
     UNREACHABLE();
   }
 
+  JSDispatchTable& js_dispatch_table() const {
+    return isolate_->js_dispatch_table();
+  }
+
   int GetNextScriptId();
   uint32_t GetAndIncNextUniqueSfiId() {
     return isolate_->GetAndIncNextUniqueSfiId();
@@ -137,11 +144,9 @@ class V8_EXPORT_PRIVATE LocalIsolate final : private HiddenLocalFactory {
     return bigint_processor_;
   }
 
-#ifdef V8_ENABLE_LEAPTIERING
   JSDispatchTable::Space* GetJSDispatchTableSpaceFor(Address owning_slot) {
     return isolate_->GetJSDispatchTableSpaceFor(owning_slot);
   }
-#endif  // V8_ENABLE_LEAPTIERING
 
   // AsIsolate is only allowed on the main-thread.
   Isolate* AsIsolate() {

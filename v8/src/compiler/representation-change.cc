@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "src/base/numerics/safe_conversions.h"
+#include "src/common/globals.h"
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/machine-operator.h"
 #include "src/compiler/node-matchers.h"
@@ -223,7 +224,9 @@ Node* RepresentationChanger::GetRepresentationFor(
       // this behavior is disabled only for TypeCheckKind::kBigInt, but should
       // be fixed for all other type checks.
       (output_rep != MachineRepresentation::kWord32 &&
-       !TypeCheckIsBigInt(use_info.type_check()))) {
+       (use_info.type_check() != TypeCheckKind::kAdditiveSafeInteger &&
+        use_info.type_check() != TypeCheckKind::kUnsigned64 &&
+        !TypeCheckIsBigInt(use_info.type_check())))) {
     if (use_info.representation() == output_rep) {
       // Representations are the same. That's a no-op.
       return node;
@@ -279,6 +282,7 @@ Node* RepresentationChanger::GetRepresentationFor(
     case MachineRepresentation::kWord64:
       DCHECK(use_info.type_check() == TypeCheckKind::kNone ||
              use_info.type_check() == TypeCheckKind::kSigned64 ||
+             use_info.type_check() == TypeCheckKind::kUnsigned64 ||
              use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger ||
              TypeCheckIsBigInt(use_info.type_check()) ||
              use_info.type_check() == TypeCheckKind::kArrayIndex);
@@ -697,7 +701,7 @@ Node* RepresentationChanger::GetFloat16RawBitsRepresentationFor(
   switch (node->opcode()) {
     case IrOpcode::kFloat64Constant:
       return jsgraph()->Uint32Constant(
-          DoubleToFloat16(OpParameter<double>(node->op())));
+          DoubleToFloat16(OpParameter<Float64>(node->op()).get_scalar()));
     case IrOpcode::kNumberConstant:
     case IrOpcode::kInt32Constant:
     case IrOpcode::kFloat32Constant:
@@ -805,11 +809,16 @@ Node* RepresentationChanger::GetFloat64RepresentationFor(
       case TypeCheckKind::kHeapObject:
       case TypeCheckKind::kSigned32:
       case TypeCheckKind::kSigned64:
+      case TypeCheckKind::kUnsigned64:
       case TypeCheckKind::kSignedSmall:
       case TypeCheckKind::kArrayIndex:
       case TypeCheckKind::kAdditiveSafeInteger:
         break;
     }
+  }
+  HeapObjectMatcher hm(node);
+  if (hm.Is(factory()->the_hole_value())) {
+    return jsgraph()->Float64Constant(Float64::FromBits(kHoleNanInt64));
   }
 
   // Select the correct X -> Float64 operator.
@@ -854,11 +863,11 @@ Node* RepresentationChanger::GetFloat64RepresentationFor(
             std::numeric_limits<double>::quiet_NaN());
       } else if (use_info.truncation()
                      .TruncatesBooleanAndNullAndBigIntToNumber()) {
-#ifdef V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
-        return jsgraph()->Float64Constant(UndefinedNan());
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
+        return jsgraph()->Float64Constant(Float64::undefined_nan());
 #else
         UNREACHABLE();
-#endif  // V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
       } else {
         DCHECK(use_info.type_check() == TypeCheckKind::kNone ||
                use_info.type_check() == TypeCheckKind::kNumber ||
@@ -876,9 +885,8 @@ Node* RepresentationChanger::GetFloat64RepresentationFor(
       op = machine()->ChangeInt32ToFloat64();
     } else if (output_type.Is(Type::Number())) {
       op = simplified()->ChangeTaggedToFloat64();
-    } else if ((output_type.Is(Type::NumberOrOddball()) &&
-                use_info.truncation().TruncatesOddballAndBigIntToNumber()) ||
-               output_type.Is(Type::NumberOrHole())) {
+    } else if (output_type.Is(Type::NumberOrOddball()) &&
+               use_info.truncation().TruncatesOddballAndBigIntToNumber()) {
       // JavaScript 'null' is an Oddball that results in +0 when truncated to
       // Number. In a context like -0 == null, which must evaluate to false,
       // this truncation must not happen. For this reason we restrict this
@@ -904,6 +912,11 @@ Node* RepresentationChanger::GetFloat64RepresentationFor(
     } else if (use_info.type_check() == TypeCheckKind::kNumberOrOddball) {
       op = simplified()->CheckedTaggedToFloat64(
           CheckTaggedInputMode::kNumberOrOddball, use_info.feedback());
+    } else if (output_type.Is(Type::Union(Type::SignedSmall(), Type::Hole(),
+                                          jsgraph()->zone()))) {
+      op = simplified()->ChangeSmiOrHoleToFloat64();
+    } else if (output_type.Is(Type::NumberOrHole())) {
+      op = simplified()->ChangeNumberOrHoleToFloat64();
     }
   } else if (output_rep == MachineRepresentation::kFloat32) {
     op = machine()->ChangeFloat32ToFloat64();
@@ -1001,13 +1014,17 @@ Node* RepresentationChanger::GetWord32RepresentationFor(
       op = machine()->ChangeFloat64ToUint32();
     } else if (use_info.truncation().IsUsedAsWord32()) {
       if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
-        op = simplified()->CheckedFloat64ToAdditiveSafeInteger(
-            output_type.Maybe(Type::MinusZero())
-                ? use_info.minus_zero_check()
-                : CheckForMinusZeroMode::kDontCheckForMinusZero,
-            use_info.feedback());
-        node = InsertConversion(node, op, use_node);
-        op = machine()->TruncateInt64ToInt32();
+        if (output_type.Is(cache_->kAdditiveSafeIntegerFeedback)) {
+          op = machine()->TruncateFloat64ToWord32();
+        } else {
+          op = simplified()->CheckedFloat64ToAdditiveSafeInteger(
+              output_type.Maybe(Type::MinusZero())
+                  ? use_info.minus_zero_check()
+                  : CheckForMinusZeroMode::kDontCheckForMinusZero,
+              use_info.feedback());
+          node = InsertConversion(node, op, use_node);
+          op = machine()->TruncateInt64ToInt32();
+        }
       } else {
         op = machine()->TruncateFloat64ToWord32();
       }
@@ -1031,13 +1048,17 @@ Node* RepresentationChanger::GetWord32RepresentationFor(
       op = machine()->ChangeFloat64ToUint32();
     } else if (use_info.truncation().IsUsedAsWord32()) {
       if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
-        op = simplified()->CheckedFloat64ToAdditiveSafeInteger(
-            output_type.Maybe(Type::MinusZero())
-                ? use_info.minus_zero_check()
-                : CheckForMinusZeroMode::kDontCheckForMinusZero,
-            use_info.feedback());
-        node = InsertConversion(node, op, use_node);
-        op = machine()->TruncateInt64ToInt32();
+        if (output_type.Is(cache_->kAdditiveSafeIntegerFeedback)) {
+          op = machine()->TruncateFloat64ToWord32();
+        } else {
+          op = simplified()->CheckedFloat64ToAdditiveSafeInteger(
+              output_type.Maybe(Type::MinusZero())
+                  ? use_info.minus_zero_check()
+                  : CheckForMinusZeroMode::kDontCheckForMinusZero,
+              use_info.feedback());
+          node = InsertConversion(node, op, use_node);
+          op = machine()->TruncateInt64ToInt32();
+        }
       } else {
         op = machine()->TruncateFloat64ToWord32();
       }
@@ -1067,8 +1088,20 @@ Node* RepresentationChanger::GetWord32RepresentationFor(
       op = simplified()->CheckedTruncateTaggedToWord32(
           CheckTaggedInputMode::kAdditiveSafeInteger, use_info.feedback());
     } else if (use_info.truncation().IsUsedAsWord32()) {
-      if (output_type.Is(Type::NumberOrOddballOrHole())) {
-        op = simplified()->TruncateTaggedToWord32();
+      if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
+        if (output_type.Is(cache_->kAdditiveSafeIntegerFeedback)) {
+          op = simplified()->TruncateNumberOrOddballToWord32();
+        } else {
+          op = simplified()->CheckedTruncateTaggedToWord32(
+              CheckTaggedInputMode::kAdditiveSafeInteger, use_info.feedback());
+        }
+      } else if (output_type.Is(Type::Union(Type::SignedSmall(), Type::Hole(),
+                                            jsgraph()->zone()))) {
+        op = simplified()->TruncateSmiOrHoleToWord32();
+      } else if (output_type.Is(Type::NumberOrOddball())) {
+        op = simplified()->TruncateNumberOrOddballToWord32();
+      } else if (output_type.Is(Type::NumberOrOddballOrHole())) {
+        op = simplified()->TruncateNumberOrOddballOrHoleToWord32();
       } else if (use_info.type_check() == TypeCheckKind::kNumber) {
         op = simplified()->CheckedTruncateTaggedToWord32(
             CheckTaggedInputMode::kNumber, use_info.feedback());
@@ -1110,7 +1143,8 @@ Node* RepresentationChanger::GetWord32RepresentationFor(
              output_rep == MachineRepresentation::kWord16) {
     DCHECK_EQ(MachineRepresentation::kWord32, use_info.representation());
     DCHECK(use_info.type_check() == TypeCheckKind::kSignedSmall ||
-           use_info.type_check() == TypeCheckKind::kSigned32);
+           use_info.type_check() == TypeCheckKind::kSigned32 ||
+           use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger);
     return node;
   } else if (output_rep == MachineRepresentation::kWord64) {
     if (output_type.Is(Type::Signed32()) ||
@@ -1246,12 +1280,29 @@ Node* RepresentationChanger::GetWord64RepresentationFor(
     case IrOpcode::kNumberConstant: {
       if (!TypeCheckIsBigInt(use_info.type_check())) {
         double const fv = OpParameter<double>(node->op());
+        if (use_info.type_check() == TypeCheckKind::kUnsigned64) {
+          if (base::IsValueInRangeForNumericType<uint64_t>(fv)) {
+            uint64_t const uv = static_cast<uint64_t>(fv);
+            if (static_cast<double>(uv) == fv) {
+              if (uv == 0 && std::signbit(fv) &&
+                  use_info.minus_zero_check() ==
+                      CheckForMinusZeroMode::kCheckForMinusZero) {
+                break;
+              }
+              return InsertTypeOverrideForVerifier(
+                  NodeProperties::GetType(node), jsgraph()->Uint64Constant(uv));
+            }
+          }
+          break;
+        }
+
         if (base::IsValueInRangeForNumericType<int64_t>(fv)) {
           int64_t const iv = static_cast<int64_t>(fv);
           if (static_cast<double>(iv) == fv) {
             if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
-              if (iv < kMinAdditiveSafeInteger ||
-                  kMaxAdditiveSafeInteger < iv) {
+              if (iv < kMinAdditiveSafeIntegerFeedback ||
+                  kMaxAdditiveSafeIntegerFeedback < iv ||
+                  (iv == 0 && std::signbit(fv))) {
                 Node* unreachable = InsertUnconditionalDeopt(
                     use_node, DeoptimizeReason::kNotAdditiveSafeInteger,
                     use_info.feedback());
@@ -1320,19 +1371,29 @@ Node* RepresentationChanger::GetWord64RepresentationFor(
                     use_info.truncation().IdentifiesZeroAndMinusZero());
       op = machine()->ChangeUint32ToUint64();
     } else if (output_type.Is(Type::Signed32OrMinusZero())) {
-      // int32 -> int64
       CHECK_IMPLIES(output_type.Maybe(Type::MinusZero()),
                     use_info.truncation().IdentifiesZeroAndMinusZero());
-      op = machine()->ChangeInt32ToInt64();
+      if (use_info.type_check() == TypeCheckKind::kUnsigned64) {
+        op = simplified()->CheckedInt32ToUint64(use_info.feedback());
+      } else {
+        op = machine()->ChangeInt32ToInt64();
+      }
+    } else if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
+      // If it is a word representation, but not word32 type, then it is not an
+      // integer.
+      Node* unreachable = InsertUnconditionalDeopt(
+          use_node, DeoptimizeReason::kNotAdditiveSafeInteger,
+          use_info.feedback());
+      return jsgraph()->graph()->NewNode(
+          jsgraph()->common()->DeadValue(output_rep), unreachable);
     } else {
       return TypeError(node, output_rep, output_type,
                        MachineRepresentation::kWord64);
     }
   } else if (output_rep == MachineRepresentation::kFloat32) {
+    node = InsertChangeFloat32ToFloat64(node);
     if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
-      // float32 -> float64 -> int64
-      node = InsertChangeFloat32ToFloat64(node);
-      if (output_type.Is(cache_->kAdditiveSafeInteger)) {
+      if (output_type.Is(cache_->kAdditiveSafeIntegerFeedback)) {
         op = machine()->ChangeFloat64ToInt64();
       } else {
         op = simplified()->CheckedFloat64ToAdditiveSafeInteger(
@@ -1341,35 +1402,68 @@ Node* RepresentationChanger::GetWord64RepresentationFor(
                 : CheckForMinusZeroMode::kDontCheckForMinusZero,
             use_info.feedback());
       }
+    } else if (use_info.type_check() == TypeCheckKind::kSigned64 ||
+               use_info.type_check() == TypeCheckKind::kArrayIndex) {
+      if (output_type.Is(cache_->kDoubleRepresentableInt64) ||
+          (output_type.Is(cache_->kDoubleRepresentableInt64OrMinusZero) &&
+           use_info.truncation().IdentifiesZeroAndMinusZero())) {
+        op = machine()->ChangeFloat64ToInt64();
+      } else {
+        op = simplified()->CheckedFloat64ToInt64(
+            output_type.Maybe(Type::MinusZero())
+                ? use_info.minus_zero_check()
+                : CheckForMinusZeroMode::kDontCheckForMinusZero,
+            use_info.feedback());
+      }
+    } else if (use_info.type_check() == TypeCheckKind::kUnsigned64) {
+      if (output_type.Is(cache_->kDoubleRepresentableUint64)) {
+        op = machine()->ChangeFloat64ToUint64();
+      } else {
+        op = simplified()->CheckedFloat64ToUint64(
+            output_type.Maybe(Type::MinusZero())
+                ? use_info.minus_zero_check()
+                : CheckForMinusZeroMode::kDontCheckForMinusZero,
+            use_info.feedback());
+      }
     } else if (output_type.Is(cache_->kDoubleRepresentableInt64) ||
                (output_type.Is(cache_->kDoubleRepresentableInt64OrMinusZero) &&
                 use_info.truncation().IdentifiesZeroAndMinusZero())) {
-      // float32 -> float64 -> int64
-      node = InsertChangeFloat32ToFloat64(node);
       op = machine()->ChangeFloat64ToInt64();
     } else if (output_type.Is(cache_->kDoubleRepresentableUint64)) {
-      // float32 -> float64 -> uint64
-      node = InsertChangeFloat32ToFloat64(node);
       op = machine()->ChangeFloat64ToUint64();
-    } else if (use_info.type_check() == TypeCheckKind::kSigned64 ||
-               use_info.type_check() == TypeCheckKind::kArrayIndex) {
-      // float32 -> float64 -> int64
-      node = InsertChangeFloat32ToFloat64(node);
-      op = simplified()->CheckedFloat64ToInt64(
-          output_type.Maybe(Type::MinusZero())
-              ? use_info.minus_zero_check()
-              : CheckForMinusZeroMode::kDontCheckForMinusZero,
-          use_info.feedback());
     } else {
       return TypeError(node, output_rep, output_type,
                        MachineRepresentation::kWord64);
     }
   } else if (output_rep == MachineRepresentation::kFloat64) {
     if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
-      if (output_type.Is(cache_->kAdditiveSafeInteger)) {
+      if (output_type.Is(cache_->kAdditiveSafeIntegerFeedback)) {
         op = machine()->ChangeFloat64ToInt64();
       } else {
         op = simplified()->CheckedFloat64ToAdditiveSafeInteger(
+            output_type.Maybe(Type::MinusZero())
+                ? use_info.minus_zero_check()
+                : CheckForMinusZeroMode::kDontCheckForMinusZero,
+            use_info.feedback());
+      }
+    } else if (use_info.type_check() == TypeCheckKind::kSigned64 ||
+               use_info.type_check() == TypeCheckKind::kArrayIndex) {
+      if (output_type.Is(cache_->kDoubleRepresentableInt64) ||
+          (output_type.Is(cache_->kDoubleRepresentableInt64OrMinusZero) &&
+           use_info.truncation().IdentifiesZeroAndMinusZero())) {
+        op = machine()->ChangeFloat64ToInt64();
+      } else {
+        op = simplified()->CheckedFloat64ToInt64(
+            output_type.Maybe(Type::MinusZero())
+                ? use_info.minus_zero_check()
+                : CheckForMinusZeroMode::kDontCheckForMinusZero,
+            use_info.feedback());
+      }
+    } else if (use_info.type_check() == TypeCheckKind::kUnsigned64) {
+      if (output_type.Is(cache_->kDoubleRepresentableUint64)) {
+        op = machine()->ChangeFloat64ToUint64();
+      } else {
+        op = simplified()->CheckedFloat64ToUint64(
             output_type.Maybe(Type::MinusZero())
                 ? use_info.minus_zero_check()
                 : CheckForMinusZeroMode::kDontCheckForMinusZero,
@@ -1381,13 +1475,6 @@ Node* RepresentationChanger::GetWord64RepresentationFor(
       op = machine()->ChangeFloat64ToInt64();
     } else if (output_type.Is(cache_->kDoubleRepresentableUint64)) {
       op = machine()->ChangeFloat64ToUint64();
-    } else if (use_info.type_check() == TypeCheckKind::kSigned64 ||
-               use_info.type_check() == TypeCheckKind::kArrayIndex) {
-      op = simplified()->CheckedFloat64ToInt64(
-          output_type.Maybe(Type::MinusZero())
-              ? use_info.minus_zero_check()
-              : CheckForMinusZeroMode::kDontCheckForMinusZero,
-          use_info.feedback());
     } else {
       return TypeError(node, output_rep, output_type,
                        MachineRepresentation::kWord64);
@@ -1397,6 +1484,9 @@ Node* RepresentationChanger::GetWord64RepresentationFor(
       if (output_type.IsRange() && output_type.AsRange()->Min() >= 0) {
         node = InsertChangeTaggedSignedToInt32(node);
         op = machine()->ChangeUint32ToUint64();
+      } else if (use_info.type_check() == TypeCheckKind::kUnsigned64) {
+        node = InsertChangeTaggedSignedToInt32(node);
+        op = simplified()->CheckedInt32ToUint64(use_info.feedback());
       } else {
         op = simplified()->ChangeTaggedSignedToInt64();
       }
@@ -1413,46 +1503,75 @@ Node* RepresentationChanger::GetWord64RepresentationFor(
                                              use_node, use_info);
     op = simplified()->TruncateBigIntToWord64();
   } else if (CanBeTaggedPointer(output_rep)) {
-    if (output_type.Is(cache_->kDoubleRepresentableInt64) ||
-        (output_type.Is(cache_->kDoubleRepresentableInt64OrMinusZero) &&
-         use_info.truncation().IdentifiesZeroAndMinusZero())) {
-      op = simplified()->ChangeTaggedToInt64();
+    if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
+      if (output_type.Is(cache_->kAdditiveSafeIntegerFeedback)) {
+        op = simplified()->ChangeTaggedToInt64();
+      } else {
+        op = simplified()->CheckedTaggedToAdditiveSafeInteger(
+            output_type.Maybe(Type::MinusZero())
+                ? use_info.minus_zero_check()
+                : CheckForMinusZeroMode::kDontCheckForMinusZero,
+            use_info.feedback());
+      }
     } else if (use_info.type_check() == TypeCheckKind::kSigned64) {
-      op = simplified()->CheckedTaggedToInt64(
+      if (output_type.Is(cache_->kDoubleRepresentableInt64) ||
+          (output_type.Is(cache_->kDoubleRepresentableInt64OrMinusZero) &&
+           use_info.truncation().IdentifiesZeroAndMinusZero())) {
+        op = simplified()->ChangeTaggedToInt64();
+      } else {
+        op = simplified()->CheckedTaggedToInt64(
+            output_type.Maybe(Type::MinusZero())
+                ? use_info.minus_zero_check()
+                : CheckForMinusZeroMode::kDontCheckForMinusZero,
+            use_info.feedback());
+      }
+    } else if (use_info.type_check() == TypeCheckKind::kUnsigned64) {
+      op = simplified()->CheckedTaggedToUint64(
           output_type.Maybe(Type::MinusZero())
               ? use_info.minus_zero_check()
               : CheckForMinusZeroMode::kDontCheckForMinusZero,
           use_info.feedback());
     } else if (use_info.type_check() == TypeCheckKind::kArrayIndex) {
       op = simplified()->CheckedTaggedToArrayIndex(use_info.feedback());
-    } else if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
-      op = simplified()->CheckedTaggedToAdditiveSafeInteger(
-          output_type.Maybe(Type::MinusZero())
-              ? use_info.minus_zero_check()
-              : CheckForMinusZeroMode::kDontCheckForMinusZero,
-          use_info.feedback());
+    } else if (output_type.Is(cache_->kDoubleRepresentableInt64) ||
+               (output_type.Is(cache_->kDoubleRepresentableInt64OrMinusZero) &&
+                use_info.truncation().IdentifiesZeroAndMinusZero())) {
+      op = simplified()->ChangeTaggedToInt64();
     } else {
       return TypeError(node, output_rep, output_type,
                        MachineRepresentation::kWord64);
     }
   } else if (output_rep == MachineRepresentation::kWord64) {
-    DCHECK(TypeCheckIsBigInt(use_info.type_check()));
-    if (output_type.Is(Type::UnsignedBigInt64()) &&
-        use_info.type_check() == TypeCheckKind::kBigInt64) {
-      op = simplified()->CheckedUint64ToInt64(use_info.feedback());
-    } else if ((output_type.Is(Type::BigInt()) &&
-                use_info.type_check() == TypeCheckKind::kBigInt) ||
-               (output_type.Is(Type::SignedBigInt64()) &&
-                use_info.type_check() == TypeCheckKind::kBigInt64)) {
-      return node;
+    if (use_info.type_check() == TypeCheckKind::kAdditiveSafeInteger) {
+      if (output_type.Is(cache_->kAdditiveSafeIntegerFeedback)) {
+        return node;
+      } else {
+        op = simplified()->CheckedInt64ToAdditiveSafeInteger(
+            use_info.feedback());
+      }
+    } else if (use_info.type_check() == TypeCheckKind::kUnsigned64) {
+      op = simplified()->CheckedInt64ToUint64(use_info.feedback());
+    } else if (TypeCheckIsBigInt(use_info.type_check())) {
+      if (output_type.Is(Type::UnsignedBigInt64()) &&
+          use_info.type_check() == TypeCheckKind::kBigInt64) {
+        op = simplified()->CheckedUint64ToInt64(use_info.feedback());
+      } else if ((output_type.Is(Type::BigInt()) &&
+                  use_info.type_check() == TypeCheckKind::kBigInt) ||
+                 (output_type.Is(Type::SignedBigInt64()) &&
+                  use_info.type_check() == TypeCheckKind::kBigInt64)) {
+        return node;
+      } else {
+        DCHECK(output_type != Type::BigInt() ||
+               use_info.type_check() != TypeCheckKind::kBigInt64);
+        Node* unreachable = InsertUnconditionalDeopt(
+            use_node, DeoptimizeReason::kNotABigInt, use_info.feedback());
+        return jsgraph()->graph()->NewNode(
+            jsgraph()->common()->DeadValue(MachineRepresentation::kWord64),
+            unreachable);
+      }
     } else {
-      DCHECK(output_type != Type::BigInt() ||
-             use_info.type_check() != TypeCheckKind::kBigInt64);
-      Node* unreachable = InsertUnconditionalDeopt(
-          use_node, DeoptimizeReason::kNotABigInt, use_info.feedback());
-      return jsgraph()->graph()->NewNode(
-          jsgraph()->common()->DeadValue(MachineRepresentation::kWord64),
-          unreachable);
+      return TypeError(node, output_rep, output_type,
+                       MachineRepresentation::kWord64);
     }
   } else if (output_rep == MachineRepresentation::kSandboxedPointer) {
     if (output_type.Is(Type::SandboxedPointer())) {

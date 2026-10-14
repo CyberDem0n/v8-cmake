@@ -7,17 +7,18 @@
 #include <memory>
 
 #include "src/base/bounded-page-allocator.h"
+#include "src/base/once.h"
 #include "src/base/platform/memory.h"
 #include "src/base/platform/mutex.h"
 #include "src/common/ptr-compr-inl.h"
 #include "src/compiler-dispatcher/optimizing-compile-dispatcher.h"
 #include "src/execution/isolate.h"
 #include "src/heap/code-range.h"
-#include "src/heap/page-pool.h"
+#include "src/heap/memory-pool.h"
 #include "src/heap/read-only-heap.h"
 #include "src/heap/read-only-spaces.h"
-#include "src/heap/trusted-range.h"
-#include "src/sandbox/code-pointer-table-inl.h"
+#include "src/heap/safepoint.h"
+#include "src/init/v8.h"
 #include "src/sandbox/sandbox.h"
 #include "src/utils/memcopy.h"
 #include "src/utils/utils.h"
@@ -40,9 +41,21 @@ class IsolateGroupAccessScope final {
   explicit IsolateGroupAccessScope(IsolateGroup* group)
       : previous_(IsolateGroup::current()) {
     IsolateGroup::set_current(group);
+#ifdef V8_ENABLE_SANDBOX
+    Sandbox::set_current(group->sandbox());
+#endif
   }
 
-  ~IsolateGroupAccessScope() { IsolateGroup::set_current(previous_); }
+  ~IsolateGroupAccessScope() {
+    IsolateGroup::set_current(previous_);
+#ifdef V8_ENABLE_SANDBOX
+    if (previous_) {
+      Sandbox::set_current(previous_->sandbox());
+    } else {
+      Sandbox::set_current(nullptr);
+    }
+#endif
+  }
 
  private:
   IsolateGroup* previous_;
@@ -55,6 +68,22 @@ class IsolateGroupAccessScope final {
   ~IsolateGroupAccessScope() {}
 };
 #endif  // V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+
+#ifdef V8_ENABLE_SANDBOX
+void IsolateGroup::BasePageTableEntry::SetMetadata(BasePage* metadata,
+                                                   Isolate* isolate) {
+  metadata_ = metadata;
+  // Read-only and shared pages can be accessed from any isolate, mark the entry
+  // with the sentinel.
+  if (metadata &&
+      (metadata->IsReadOnlyPage() || metadata->is_writable_shared())) {
+    isolate_ =
+        reinterpret_cast<Isolate*>(kReadOnlyOrSharedEntryIsolateSentinel);
+    return;
+  }
+  isolate_ = isolate;
+}
+#endif  // V8_ENABLE_SANDBOX
 
 IsolateGroup* IsolateGroup::default_isolate_group_ = nullptr;
 
@@ -95,14 +124,12 @@ IsolateGroup::~IsolateGroup() {
   DCHECK(isolates_.empty());
   DCHECK_NULL(main_isolate_);
 
-  page_pool_->TearDown();
-
-#ifdef V8_ENABLE_LEAPTIERING
-  js_dispatch_table_.TearDown();
-#endif  // V8_ENABLE_LEAPTIERING
+  if (memory_pool_) {
+    memory_pool_->TearDown();
+  }
 
 #ifdef V8_ENABLE_SANDBOX
-  code_pointer_table_.TearDown();
+  trusted_range_.Free();
 #endif  // V8_ENABLE_SANDBOX
 
   // Reset before `reservation_` for pointer compression but disabled external
@@ -116,6 +143,9 @@ IsolateGroup::~IsolateGroup() {
 
 #ifdef V8_ENABLE_SANDBOX
   sandbox_->TearDown();
+  if (!process_wide_) {
+    delete sandbox_;
+  }
 #endif  // V8_ENABLE_SANDBOX
 }
 
@@ -139,18 +169,40 @@ void IsolateGroup::Initialize(bool process_wide, Sandbox* sandbox) {
   }
   page_allocator_ = reservation_.page_allocator();
   pointer_compression_cage_ = &reservation_;
-  trusted_pointer_compression_cage_ =
-      TrustedRange::EnsureProcessWideTrustedRange(kMaximalTrustedRangeSize);
+
+#if CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+  void* cage_base = reinterpret_cast<void*>(reservation_.base());
+  const void* read_only_reservation_start = page_allocator_->AllocatePages(
+      cage_base, kContiguousReadOnlyReservationSize,
+      MemoryChunk::GetAlignmentForAllocation(),
+      PageAllocator::Permission::kNoAccess);
+  CHECK_EQ(read_only_reservation_start, cage_base);
+  read_only_page_allocator_ = std::make_unique<v8::base::BoundedPageAllocator>(
+      page_allocator_, reinterpret_cast<Address>(read_only_reservation_start),
+      kContiguousReadOnlyReservationSize, kRegularPageSize,
+      base::PageInitializationMode::kAllocatedPagesCanBeUninitialized,
+      base::PageFreeingMode::kMakeInaccessible);
+#endif  // CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+
+  if (!trusted_range_.InitReservation(kMaximalTrustedRangeSize)) {
+    V8::FatalProcessOutOfMemory(
+        nullptr, "Failed to reserve virtual memory for TrustedRange");
+  }
+  trusted_pointer_compression_cage_ = &trusted_range_;
   sandbox_ = sandbox;
 
-  code_pointer_table()->Initialize();
   optimizing_compile_task_executor_ =
       std::make_unique<OptimizingCompileTaskExecutor>();
-  page_pool_ = std::make_unique<PagePool>();
 
-#ifdef V8_ENABLE_LEAPTIERING
-  js_dispatch_table()->Initialize();
-#endif  // V8_ENABLE_LEAPTIERING
+  if (v8_flags.memory_pool) {
+    memory_pool_ = std::make_unique<MemoryPool>(MemoryPool::Config{
+        .single_threaded = v8_flags.single_threaded,
+        .share_memory_on_teardown =
+            v8_flags.memory_pool_share_memory_on_teardown,
+        .trace_gc_nvp = v8_flags.trace_gc_nvp,
+        .max_large_page_pool_size = v8_flags.max_large_page_pool_size,
+        .timeout_in_sec = v8_flags.memory_pool_timeout});
+  }
 }
 #elif defined(V8_COMPRESS_POINTERS)
 void IsolateGroup::Initialize(bool process_wide) {
@@ -164,14 +216,31 @@ void IsolateGroup::Initialize(bool process_wide) {
         "pointer compression cage");
   }
   page_allocator_ = reservation_.page_allocator();
+
+#if CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+  void* cage_base = reinterpret_cast<void*>(reservation_.base());
+  const void* read_only_reservation_start = page_allocator_->AllocatePages(
+      cage_base, kContiguousReadOnlyReservationSize,
+      MemoryChunk::GetAlignmentForAllocation(),
+      PageAllocator::Permission::kNoAccess);
+  CHECK_EQ(read_only_reservation_start, cage_base);
+  read_only_page_allocator_ = std::make_unique<v8::base::BoundedPageAllocator>(
+      page_allocator_, reinterpret_cast<Address>(read_only_reservation_start),
+      kContiguousReadOnlyReservationSize, kRegularPageSize,
+      base::PageInitializationMode::kAllocatedPagesCanBeUninitialized,
+      base::PageFreeingMode::kMakeInaccessible);
+#endif  // CONTIGUOUS_COMPRESSED_READ_ONLY_SPACE_BOOL
+
   pointer_compression_cage_ = &reservation_;
   trusted_pointer_compression_cage_ = &reservation_;
   optimizing_compile_task_executor_ =
       std::make_unique<OptimizingCompileTaskExecutor>();
-  page_pool_ = std::make_unique<PagePool>();
-#ifdef V8_ENABLE_LEAPTIERING
-  js_dispatch_table()->Initialize();
-#endif  // V8_ENABLE_LEAPTIERING
+  memory_pool_ = std::make_unique<MemoryPool>(MemoryPool::Config{
+      .single_threaded = v8_flags.single_threaded,
+      .share_memory_on_teardown = v8_flags.memory_pool_share_memory_on_teardown,
+      .trace_gc_nvp = v8_flags.trace_gc_nvp,
+      .max_large_page_pool_size = v8_flags.max_large_page_pool_size,
+      .timeout_in_sec = v8_flags.memory_pool_timeout});
 }
 #else   // !V8_COMPRESS_POINTERS
 void IsolateGroup::Initialize(bool process_wide) {
@@ -179,10 +248,12 @@ void IsolateGroup::Initialize(bool process_wide) {
   page_allocator_ = GetPlatformPageAllocator();
   optimizing_compile_task_executor_ =
       std::make_unique<OptimizingCompileTaskExecutor>();
-  page_pool_ = std::make_unique<PagePool>();
-#ifdef V8_ENABLE_LEAPTIERING
-  js_dispatch_table()->Initialize();
-#endif  // V8_ENABLE_LEAPTIERING
+  memory_pool_ = std::make_unique<MemoryPool>(MemoryPool::Config{
+      .single_threaded = v8_flags.single_threaded,
+      .share_memory_on_teardown = v8_flags.memory_pool_share_memory_on_teardown,
+      .trace_gc_nvp = v8_flags.trace_gc_nvp,
+      .max_large_page_pool_size = v8_flags.max_large_page_pool_size,
+      .timeout_in_sec = v8_flags.memory_pool_timeout});
 }
 #endif  // V8_ENABLE_SANDBOX
 
@@ -203,6 +274,9 @@ void IsolateGroup::InitializeOncePerProcess() {
 #ifdef V8_COMPRESS_POINTERS
   V8HeapCompressionScheme::InitBase(group->GetPtrComprCageBase());
 #endif  // V8_COMPRESS_POINTERS
+#ifdef V8_ENABLE_SANDBOX
+  TrustedSpaceCompressionScheme::InitBase(group->GetTrustedPtrComprCageBase());
+#endif
 #ifdef V8_EXTERNAL_CODE_SPACE
   // Speculatively set the code cage base to the same value in case jitless
   // mode will be used. Once the process-wide CodeRange instance is created
@@ -258,13 +332,11 @@ ReadOnlyArtifacts* IsolateGroup::InitializeReadOnlyArtifacts() {
   return read_only_artifacts_.get();
 }
 
-PageAllocator* IsolateGroup::GetBackingStorePageAllocator() {
 #ifdef V8_ENABLE_SANDBOX
-  return sandbox()->page_allocator();
-#else
-  return GetPlatformPageAllocator();
-#endif
+std::weak_ptr<PageAllocator> IsolateGroup::GetBackingStorePageAllocator() {
+  return sandbox()->page_allocator_weak();
 }
+#endif  // V8_ENABLE_SANDBOX
 
 void IsolateGroup::SetupReadOnlyHeap(Isolate* isolate,
                                      SnapshotData* read_only_snapshot_data,
@@ -288,6 +360,9 @@ void IsolateGroup::AddIsolate(Isolate* isolate) {
   optimizing_compile_task_executor_->EnsureStarted();
 
   if (v8_flags.shared_heap) {
+    if (!global_safepoint_) {
+      global_safepoint_ = std::make_unique<GlobalSafepoint>(this);
+    }
     if (has_shared_space_isolate()) {
       isolate->owns_shareable_data_ = false;
     } else {
@@ -330,6 +405,11 @@ void IsolateGroup::RemoveIsolate(Isolate* isolate) {
   }
 }
 
+size_t IsolateGroup::GetIsolateCount() {
+  base::MutexGuard guard(&mutex_);
+  return isolates_.size();
+}
+
 // static
 IsolateGroup* IsolateGroup::New() {
   if (!CanCreateNewGroups()) {
@@ -340,7 +420,8 @@ IsolateGroup* IsolateGroup::New() {
 
   IsolateGroup* group = new IsolateGroup;
 #ifdef V8_ENABLE_SANDBOX
-  Sandbox* sandbox = Sandbox::New(GetPlatformVirtualAddressSpace());
+  Sandbox* sandbox =
+      Sandbox::New(V8::GetCurrentPlatform(), GetPlatformVirtualAddressSpace());
   group->Initialize(false, sandbox);
 #else
   group->Initialize(false);
@@ -368,121 +449,9 @@ void IsolateGroup::ReleaseDefault() {
 }
 
 #ifdef V8_ENABLE_SANDBOX
-void SandboxedArrayBufferAllocator::LazyInitialize(Sandbox* sandbox) {
-  base::MutexGuard guard(&mutex_);
-  if (is_initialized()) {
-    return;
-  }
-  CHECK(sandbox->is_initialized());
-  sandbox_ = sandbox;
-  constexpr size_t max_backing_memory_size = 8ULL * GB;
-  constexpr size_t min_backing_memory_size = 1ULL * GB;
-  size_t backing_memory_size = max_backing_memory_size;
-  Address backing_memory_base = 0;
-  while (!backing_memory_base &&
-         backing_memory_size >= min_backing_memory_size) {
-    backing_memory_base = sandbox_->address_space()->AllocatePages(
-        VirtualAddressSpace::kNoHint, backing_memory_size, kChunkSize,
-        PagePermissions::kNoAccess);
-    if (!backing_memory_base) {
-      backing_memory_size /= 2;
-    }
-  }
-  if (!backing_memory_base) {
-    V8::FatalProcessOutOfMemory(
-        nullptr, "Could not reserve backing memory for ArrayBufferAllocators");
-  }
-  DCHECK(IsAligned(backing_memory_base, kChunkSize));
 
-  region_alloc_ = std::make_unique<base::RegionAllocator>(
-      backing_memory_base, backing_memory_size, kAllocationGranularity);
-  end_of_accessible_region_ = region_alloc_->begin();
-
-  // Install an on-merge callback to discard or decommit unused pages.
-  region_alloc_->set_on_merge_callback([this](Address start, size_t size) {
-    mutex_.AssertHeld();
-    Address end = start + size;
-    if (end == region_alloc_->end() &&
-        start <= end_of_accessible_region_ - kChunkSize) {
-      // Can shrink the accessible region.
-      Address new_end_of_accessible_region = RoundUp(start, kChunkSize);
-      size_t size_to_decommit =
-          end_of_accessible_region_ - new_end_of_accessible_region;
-      if (!sandbox_->address_space()->DecommitPages(
-              new_end_of_accessible_region, size_to_decommit)) {
-        V8::FatalProcessOutOfMemory(nullptr, "SandboxedArrayBufferAllocator()");
-      }
-      end_of_accessible_region_ = new_end_of_accessible_region;
-    } else if (size >= 2 * kChunkSize) {
-      // Can discard pages. The pages stay accessible, so the size of the
-      // accessible region doesn't change.
-      Address chunk_start = RoundUp(start, kChunkSize);
-      Address chunk_end = RoundDown(start + size, kChunkSize);
-      if (!sandbox_->address_space()->DiscardSystemPages(
-              chunk_start, chunk_end - chunk_start)) {
-        V8::FatalProcessOutOfMemory(nullptr, "SandboxedArrayBufferAllocator()");
-      }
-    }
-  });
-}
-
-SandboxedArrayBufferAllocator::~SandboxedArrayBufferAllocator() {
-  // The sandbox may already have been torn down, in which case there's no
-  // need to free any memory.
-  if (is_initialized() && sandbox_->is_initialized()) {
-    sandbox_->address_space()->FreePages(region_alloc_->begin(),
-                                         region_alloc_->size());
-  }
-}
-
-void* SandboxedArrayBufferAllocator::Allocate(size_t length) {
-  base::MutexGuard guard(&mutex_);
-
-  length = RoundUp(length, kAllocationGranularity);
-  Address region = region_alloc_->AllocateRegion(length);
-  if (region == base::RegionAllocator::kAllocationFailure) return nullptr;
-
-  // Check if the memory is inside the accessible region. If not, grow it.
-  Address end = region + length;
-  size_t length_to_memset = length;
-  if (end > end_of_accessible_region_) {
-    Address new_end_of_accessible_region = RoundUp(end, kChunkSize);
-    size_t size = new_end_of_accessible_region - end_of_accessible_region_;
-    if (!sandbox_->address_space()->SetPagePermissions(
-            end_of_accessible_region_, size, PagePermissions::kReadWrite)) {
-      if (!region_alloc_->FreeRegion(region)) {
-        V8::FatalProcessOutOfMemory(
-            nullptr, "SandboxedArrayBufferAllocator::Allocate()");
-      }
-      return nullptr;
-    }
-
-    // The pages that were inaccessible are guaranteed to be zeroed, so only
-    // memset until the previous end of the accessible region.
-    length_to_memset = end_of_accessible_region_ - region;
-    end_of_accessible_region_ = new_end_of_accessible_region;
-  }
-
-  void* mem = reinterpret_cast<void*>(region);
-  memset(mem, 0, length_to_memset);
-  return mem;
-}
-
-void SandboxedArrayBufferAllocator::Free(void* data) {
-  base::MutexGuard guard(&mutex_);
-  region_alloc_->FreeRegion(reinterpret_cast<Address>(data));
-}
-
-PageAllocator* SandboxedArrayBufferAllocator::page_allocator() {
-  return sandbox_->page_allocator();
-}
-
-SandboxedArrayBufferAllocator*
-IsolateGroup::GetSandboxedArrayBufferAllocator() {
-  // TODO(342905186): Consider initializing it during IsolateGroup
-  // initialization instead of doing it lazily.
-  backend_allocator_.LazyInitialize(sandbox());
-  return &backend_allocator_;
+v8::Allocator* IsolateGroup::GetInSandboxAllocator() {
+  return sandbox_->in_sandbox_allocator();
 }
 
 #endif  // V8_ENABLE_SANDBOX

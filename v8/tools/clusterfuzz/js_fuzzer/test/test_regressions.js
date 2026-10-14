@@ -142,13 +142,18 @@ describe('Regression tests', () => {
 
   it('resolves flag contradictions', () => {
     sandbox.stub(exceptions, 'CONTRADICTORY_FLAGS').value(
-        [['--flag1', '--flag2']])
+        [['--flag1', '--flag2']]);
     const {file, flags} = createFuzzTest(
         'test_data/regress/empty_db',
         this.settings,
         ['v8/regress/contradictions/input1.js',
          'v8/regress/contradictions/input2.js']);
-    assert.deepEqual(['--flag1'], flags);
+
+    const isFlag1 = flags.length === 1 && flags[0] === '--flag1';
+    const isFlag2 = flags.length === 1 && flags[0] === '--flag2';
+
+    assert.ok(isFlag1 || isFlag2,
+      `Expected flags to be either ['--flag1'] or ['--flag2'], but got [${flags}]`);
   });
 
   it('skips mjs flags', () => {
@@ -194,6 +199,20 @@ describe('Regression tests', () => {
         this.settings,
         'test_data/regress/super/super_member_db',
         'regress/super/member_expected.js');
+  });
+
+  it('does not cross-insert wrong await', () => {
+    // Enforce mutations at every possible location.
+    this.settings['MUTATE_CROSSOVER_INSERT'] = 1.0;
+
+    const fakeDb = new db.MutateDb('test_data/regress/await/db');
+    const mutator = new crossOver.CrossOverMutator(this.settings, fakeDb);
+
+    const source = helpers.loadTestData('regress/await/input.js');
+    mutator.mutate(source);
+
+    const mutated = sourceHelpers.generateCode(source);
+    helpers.assertExpectedResult('regress/await/expected.js', mutated);
   });
 
   it('does not cross-insert duplicate variables', () => {

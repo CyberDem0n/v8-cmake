@@ -5,9 +5,12 @@
 #ifndef V8_HEAP_HEAP_ALLOCATOR_H_
 #define V8_HEAP_HEAP_ALLOCATOR_H_
 
+#include <atomic>
 #include <optional>
+#include <type_traits>
 
 #include "include/v8config.h"
+#include "src/base/functional/function-ref.h"
 #include "src/base/macros.h"
 #include "src/common/globals.h"
 #include "src/heap/allocation-result.h"
@@ -18,7 +21,6 @@ namespace internal {
 
 class AllocationObserver;
 class CodeLargeObjectSpace;
-class Heap;
 class LocalHeap;
 class LinearAllocationArea;
 class MainAllocator;
@@ -29,16 +31,18 @@ class PagedSpace;
 class ReadOnlySpace;
 class SharedTrustedLargeObjectSpace;
 class Space;
+class YoungPendingAllocations;
 
 // Allocator for the main thread. All exposed functions internally call the
 // right bottleneck.
 class V8_EXPORT_PRIVATE HeapAllocator final {
  public:
+  using CustomAllocationFunction = base::FunctionRef<bool()>;
+
   explicit HeapAllocator(LocalHeap*);
 
   // Set up all LABs for this LocalHeap.
-  void Setup(LinearAllocationArea* new_allocation_info = nullptr,
-             LinearAllocationArea* old_allocation_info = nullptr);
+  void Setup();
 
   void SetReadOnlySpace(ReadOnlySpace*);
 
@@ -77,6 +81,13 @@ class V8_EXPORT_PRIVATE HeapAllocator final {
 
   V8_INLINE bool CanAllocateInReadOnlySpace() const;
 
+  // Returns the maximum size a regular (non-large) object can have for the
+  // given allocation type. This takes into account allocating in the code
+  // space, for which the size of the allocatable space per V8 page may depend
+  // on the OS page size at runtime. You may use kMaxRegularHeapObjectSize as a
+  // constant instead if you know the allocation isn't in the code spaces.
+  V8_INLINE int MaxRegularHeapObjectSize(AllocationType allocation) const;
+
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
   void UpdateAllocationTimeout();
   // See `allocation_timeout_`.
@@ -103,12 +114,10 @@ class V8_EXPORT_PRIVATE HeapAllocator final {
   // Mark/Unmark all LABs except for new and shared space. Use for black
   // allocation with sticky mark bits.
   void MarkLinearAllocationAreasBlack();
-  void UnmarkLinearAllocationsArea();
 
   // Mark/Unmark linear allocation areas in shared heap black. Used for black
   // allocation with sticky mark bits.
   void MarkSharedLinearAllocationAreasBlack();
-  void UnmarkSharedLinearAllocationAreas();
 
   // Free linear allocation areas and reset free-lists.
   void FreeLinearAllocationAreasAndResetFreeLists();
@@ -139,9 +148,26 @@ class V8_EXPORT_PRIVATE HeapAllocator final {
     return &shared_space_allocator_.value();
   }
 
-  template <typename Function>
-  V8_WARN_UNUSED_RESULT V8_INLINE auto CustomAllocateWithRetryOrFail(
-      Function&& Allocate, AllocationType allocation);
+  bool RetryCustomAllocate(CustomAllocationFunction allocate,
+                           AllocationType allocation,
+                           GarbageCollectionReason gc_reason);
+  void RetryCustomAllocateOrFail(CustomAllocationFunction allocate,
+                                 AllocationType allocation,
+                                 GarbageCollectionReason gc_reason);
+
+#if V8_VERIFY_WRITE_BARRIERS
+  bool IsMostRecentYoungAllocation(Address object_address);
+  void ResetMostRecentYoungAllocation();
+#endif  // V8_VERIFY_WRITE_BARRIERS
+
+  void set_last_young_allocation(Address value) {
+    *last_young_allocation_pointer_ = value;
+  }
+
+  Address last_young_allocation() { return *last_young_allocation_pointer_; }
+
+  V8_INLINE Address pending_large_object() const;
+  void ResetPendingLargeObject();
 
  private:
   V8_INLINE PagedSpace* code_space() const;
@@ -160,39 +186,43 @@ class V8_EXPORT_PRIVATE HeapAllocator final {
       int size_in_bytes, AllocationType allocation, AllocationOrigin origin,
       AllocationAlignment alignment, AllocationHint hint);
 
-  template <typename AllocateFunction, typename RetryFunction>
-  V8_WARN_UNUSED_RESULT inline auto AllocateRawWithRetryOrFailSlowPath(
-      AllocateFunction&& Allocate, RetryFunction&& RetryAllocate,
-      AllocationType allocation);
+  void UpdatePendingLargeObject(Tagged<HeapObject> object,
+                                AllocationType allocation);
 
-  V8_WARN_UNUSED_RESULT AllocationResult AllocateRawWithRetryOrFailSlowPath(
-      int size, AllocationType allocation, AllocationOrigin origin,
-      AllocationAlignment alignment, AllocationHint hint);
+  bool RetryCustomAllocateLight(CustomAllocationFunction allocate,
+                                AllocationType allocation,
+                                GarbageCollectionReason gc_reason);
 
-  template <typename AllocateFunction, typename RetryFunction>
-  V8_WARN_UNUSED_RESULT inline auto AllocateRawWithLightRetrySlowPath(
-      AllocateFunction&& Allocate, RetryFunction&& RetryAllocate,
-      AllocationType allocation);
+  V8_WARN_UNUSED_RESULT Tagged<HeapObject> AllocateRawSlowPath(
+      AllocationRetryMode retry_mode, int size, AllocationType allocation,
+      AllocationOrigin origin, AllocationAlignment alignment,
+      AllocationHint hint);
 
-  V8_WARN_UNUSED_RESULT AllocationResult AllocateRawWithLightRetrySlowPath(
-      int size, AllocationType allocation, AllocationOrigin origin,
-      AllocationAlignment alignment, AllocationHint hint);
-
-  void CollectGarbage(AllocationType allocation);
+  void CollectGarbage(AllocationType allocation,
+                      PerformHeapLimitCheck perform_heap_limit_check,
+                      GarbageCollectionReason gc_reason);
   void CollectAllAvailableGarbage(AllocationType allocation);
 
-  V8_WARN_UNUSED_RESULT AllocationResult RetryAllocateRaw(
-      int size_in_bytes, AllocationType allocation, AllocationOrigin origin,
-      AllocationAlignment alignment, AllocationHint hint);
+  // Performs a GC and retries the allocation in a loop. The caller of this
+  // method needs to perform the heap limit check.
+  bool CollectGarbageAndRetryAllocation(CustomAllocationFunction,
+                                        AllocationType allocation,
+                                        GarbageCollectionReason gc_reason);
 
   bool ReachedAllocationTimeout();
+
+  Heap* heap_for_allocation(AllocationType allocation);
 
 #ifdef DEBUG
   void IncrementObjectCounters();
 #endif  // DEBUG
 
+  std::atomic<Address> pending_large_object_{kNullAddress};
+
   LocalHeap* local_heap_;
   Heap* const heap_;
+  YoungPendingAllocations* young_pending_allocations_ = nullptr;
+  int max_regular_code_object_size_ = 0;
   Space* spaces_[LAST_SPACE + 1];
   ReadOnlySpace* read_only_space_;
 
@@ -206,6 +236,9 @@ class V8_EXPORT_PRIVATE HeapAllocator final {
   std::optional<MainAllocator> shared_trusted_space_allocator_;
   OldLargeObjectSpace* shared_lo_space_;
   SharedTrustedLargeObjectSpace* shared_trusted_lo_space_;
+
+  std::optional<Address> last_young_allocation_;
+  Address* last_young_allocation_pointer_ = nullptr;
 
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
   // Specifies how many allocations should be performed until returning

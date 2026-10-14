@@ -4,31 +4,20 @@
 
 #include "src/maglev/maglev-compiler.h"
 
-#include <algorithm>
-#include <iomanip>
+#include <fstream>
+#include <optional>
 #include <ostream>
-#include <type_traits>
-#include <unordered_map>
 
-#include "src/base/iterator.h"
 #include "src/base/logging.h"
-#include "src/base/threaded-list.h"
 #include "src/codegen/interface-descriptors-inl.h"
-#include "src/codegen/machine-type.h"
-#include "src/codegen/register-configuration.h"
-#include "src/codegen/register.h"
-#include "src/codegen/reglist.h"
 #include "src/common/globals.h"
-#include "src/compiler/backend/instruction.h"
-#include "src/compiler/bytecode-liveness-map.h"
+#include "src/common/synchronization-point-support.h"
 #include "src/compiler/compilation-dependencies.h"
 #include "src/compiler/heap-refs.h"
 #include "src/compiler/js-heap-broker.h"
-#include "src/deoptimizer/frame-translation-builder.h"
+#include "src/diagnostics/code-tracer.h"
 #include "src/execution/frames.h"
 #include "src/flags/flags.h"
-#include "src/ic/handler-configuration.h"
-#include "src/maglev/maglev-basic-block.h"
 #include "src/maglev/maglev-code-generator.h"
 #include "src/maglev/maglev-compilation-info.h"
 #include "src/maglev/maglev-compilation-unit.h"
@@ -36,61 +25,130 @@
 #include "src/maglev/maglev-graph-labeller.h"
 #include "src/maglev/maglev-graph-printer.h"
 #include "src/maglev/maglev-graph-processor.h"
+#include "src/maglev/maglev-graph-serializer.h"
 #include "src/maglev/maglev-graph-verifier.h"
 #include "src/maglev/maglev-graph.h"
 #include "src/maglev/maglev-inlining.h"
 #include "src/maglev/maglev-interpreter-frame-state.h"
 #include "src/maglev/maglev-ir-inl.h"
 #include "src/maglev/maglev-ir.h"
+#include "src/maglev/maglev-phase.h"
 #include "src/maglev/maglev-phi-representation-selector.h"
 #include "src/maglev/maglev-post-hoc-optimizations-processors.h"
 #include "src/maglev/maglev-pre-regalloc-codegen-processors.h"
-#include "src/maglev/maglev-regalloc-data.h"
 #include "src/maglev/maglev-regalloc.h"
+#include "src/maglev/maglev-truncation.h"
 #include "src/objects/code-inl.h"
 #include "src/objects/js-function.h"
-#include "src/utils/identity-map.h"
-#include "src/zone/zone.h"
+
+#ifdef ALWAYS_MAGLEV_GRAPH_LABELLER
+#define ALWAYS_MAGLEV_GRAPH_LABELLER_BOOL true
+#else
+#define ALWAYS_MAGLEV_GRAPH_LABELLER_BOOL false
+#endif
 
 namespace v8 {
 namespace internal {
 namespace maglev {
 
+namespace {
+
+constexpr uint32_t kMaxStackSlots = 4 * KB / kSystemPointerSize;
+
+void PrintGraph(Graph* graph, bool condition, MaglevPhase phase) {
+  MaglevCompilationInfo* info = graph->compilation_info();
+  if (V8_UNLIKELY(condition && info->is_tracing_enabled())) {
+    compiler::UnparkedScopeIfNeeded unparked_scope(
+        graph->broker()->local_isolate());
+    std::cout << "\n----- " << PhaseName(phase) << " -----" << std::endl;
+    PrintGraph(std::cout, graph, phase);
+  }
+  if (V8_UNLIKELY(info->trace_json_enabled())) {
+    compiler::UnparkedScopeIfNeeded unparked_scope(
+        graph->broker()->local_isolate());
+    PrintMaglevGraphAsJSON(info, graph, phase);
+  }
+}
+
+void VerifyGraph(Graph* graph, MaglevPhase phase) {
+#ifdef DEBUG
+  GraphProcessor<MaglevGraphVerifier> verifier(graph->compilation_info(),
+                                               phase);
+  verifier.ProcessGraph(graph);
+#endif  // DEBUG
+}
+
+void PrintAndVerify(Graph* graph, bool printing_condition, MaglevPhase phase) {
+  PrintGraph(graph, printing_condition, phase);
+  VerifyGraph(graph, phase);
+}
+}  // namespace
+
 // static
 bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
                              MaglevCompilationInfo* compilation_info) {
+  compilation_info->set_optimization_id(local_isolate->NextOptimizationId());
+  std::optional<MaglevGraphLabellerScope> graph_labeller_scope;
   compiler::CurrentHeapBrokerScope current_broker(compilation_info->broker());
-  Graph* graph =
-      Graph::New(compilation_info->zone(),
-                 compilation_info->toplevel_compilation_unit()->is_osr());
+  Graph* graph = Graph::New(compilation_info);
 
-  bool is_tracing_enabled = false;
+  bool enable_labeller = ALWAYS_MAGLEV_GRAPH_LABELLER_BOOL ||
+                         compilation_info->is_tracing_enabled() ||
+                         compilation_info->trace_json_enabled() ||
+                         compilation_info->collect_source_positions() ||
+                         v8_flags.code_comments;
+#ifdef ENABLE_GDB_JIT_INTERFACE
+  enable_labeller = enable_labeller || v8_flags.maglev_gdbjit;
+#endif
+
+  if (V8_UNLIKELY(enable_labeller)) {
+    compilation_info->set_graph_labeller(new MaglevGraphLabeller());
+    graph_labeller_scope.emplace(compilation_info->graph_labeller());
+  }
+
+  if (compilation_info->is_tracing_enabled() ||
+      compilation_info->trace_json_enabled()) {
+    CodeTracer::StreamScope tracing_scope(
+        local_isolate->GetMainThreadIsolateUnsafe()->GetCodeTracer());
+    tracing_scope.stream()
+        << "---------------------------------------------------\n"
+        << "Begin compiling method " << compilation_info->function_name()
+        << " using Maglev" << std::endl;
+  }
+
+  if (compilation_info->trace_json_enabled()) {
+    compiler::UnparkedScopeIfNeeded unparked_scope(local_isolate);
+
+    Isolate* isolate = local_isolate->GetMainThreadIsolateUnsafe();
+    Handle<SharedFunctionInfo> shared_info =
+        compilation_info->toplevel_compilation_unit()
+            ->shared_function_info()
+            .object();
+    DirectHandle<Script> script =
+        direct_handle(Cast<Script>(shared_info->script()), local_isolate);
+
+    // TODO(dmercadier): this is opening JSON structures, but if we bail out
+    // during compilation, we might never close them. We should use a RAII
+    // structure with a desctructor to make sure that the JSON structures are
+    // always closed at the end. (Turbolizer can handle some invalid JSON, but
+    // it would be better not to rely on that)
+    MaglevJsonFile json_of(compilation_info, std::ios_base::trunc);
+    json_of << "{\"function\" : ";
+    JsonPrintFunctionSource(json_of, -1, compilation_info->function_name(),
+                            script, isolate, shared_info);
+    json_of << ",\n\"phases\":[\n";
+  }
+
   {
-    UnparkedScopeIfOnBackground unparked_scope(local_isolate->heap());
+    compiler::UnparkedScopeIfNeeded unparked_scope(local_isolate);
 
-    // Build graph.
-    if (v8_flags.print_maglev_code || v8_flags.code_comments ||
-        v8_flags.print_maglev_graph || v8_flags.print_maglev_graphs ||
-        v8_flags.trace_maglev_graph_building ||
-        v8_flags.trace_maglev_escape_analysis ||
-        v8_flags.trace_maglev_phi_untagging || v8_flags.trace_maglev_regalloc ||
-        v8_flags.trace_maglev_object_tracking) {
-      is_tracing_enabled = compilation_info->toplevel_compilation_unit()
-                               ->shared_function_info()
-                               .object()
-                               ->PassesFilter(v8_flags.maglev_print_filter);
-      compilation_info->set_graph_labeller(new MaglevGraphLabeller());
-    }
-
-    if (is_tracing_enabled &&
-        (v8_flags.print_maglev_code || v8_flags.print_maglev_graph ||
-         v8_flags.print_maglev_graphs || v8_flags.trace_maglev_graph_building ||
-         v8_flags.trace_maglev_phi_untagging ||
-         v8_flags.trace_maglev_regalloc)) {
+    if (V8_UNLIKELY(v8_flags.maglev_print_bytecode &&
+                    compilation_info->is_tracing_enabled())) {
       MaglevCompilationUnit* top_level_unit =
           compilation_info->toplevel_compilation_unit();
       std::cout << "Compiling " << Brief(*compilation_info->toplevel_function())
-                << " with Maglev\n";
+                << " with Maglev";
+      std::cout << "\n----- Bytecode array -----" << std::endl;
       BytecodeArray::Disassemble(top_level_unit->bytecode().object(),
                                  std::cout);
       if (v8_flags.maglev_print_feedback) {
@@ -98,122 +156,93 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
       }
     }
 
-    MaglevGraphBuilder graph_builder(
-        local_isolate, compilation_info->toplevel_compilation_unit(), graph);
-
     {
-      TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                   "V8.Maglev.GraphBuilding");
-      graph_builder.Build();
-
-      if (is_tracing_enabled && v8_flags.print_maglev_graphs) {
-        std::cout << "\nAfter graph building" << std::endl;
-        PrintGraph(std::cout, compilation_info, graph);
-      }
+      TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                  "V8.Maglev.GraphBuilding");
+      SYNCHRONIZATION_POINT("MaglevGraphBuilding");
+      MaglevGraphBuilder graph_builder(
+          local_isolate, compilation_info->toplevel_compilation_unit(), graph);
+      if (!graph_builder.Build()) return false;
+      PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+                     MaglevPhase::kMaglevGraphBuilding);
     }
-
-#ifdef DEBUG
-    {
-      GraphProcessor<MaglevGraphVerifier, /* visit_identity_nodes */ true>
-          verifier(compilation_info);
-      verifier.ProcessGraph(graph);
-    }
-#endif
 
     if (v8_flags.maglev_non_eager_inlining) {
-      TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                   "V8.Maglev.Inlining");
-
-      MaglevInliner inliner(compilation_info, graph);
-      inliner.Run(is_tracing_enabled);
-
-      // TODO(victorgomes): We need to remove all identity nodes before
-      // PhiRepresentationSelector. Since Identity has different semantics
-      // there. Check if we can remove the identity nodes during
-      // PhiRepresentationSelector instead.
-      GraphProcessor<SweepIdentityNodes, /* visit_identity_nodes */ true> sweep;
-      sweep.ProcessGraph(graph);
+      TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                  "V8.Maglev.Inlining");
+      SYNCHRONIZATION_POINT("MaglevInlining");
+      MaglevInliner inliner(graph);
+      if (!inliner.Run()) return false;
+      PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+                     MaglevPhase::kInlining);
     }
 
-#ifdef DEBUG
-    {
-      GraphProcessor<MaglevGraphVerifier, /* visit_identity_nodes */ true>
-          verifier(compilation_info);
-      verifier.ProcessGraph(graph);
+    if (v8_flags.maglev_truncation && graph->may_have_truncation()) {
+      TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                  "V8.Maglev.Truncation");
+      SYNCHRONIZATION_POINT("MaglevTruncation");
+      GraphBackwardProcessor<PropagateTruncationProcessor> propagate(graph);
+      propagate.ProcessGraph(graph);
+      PrintGraph(graph, v8_flags.print_maglev_graphs,
+                 MaglevPhase::kTruncationPropagation);
+      GraphProcessor<TruncationProcessor> truncate(graph);
+      truncate.ProcessGraph(graph);
+      PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+                     MaglevPhase::kTruncation);
     }
-#endif
 
     if (v8_flags.maglev_licm) {
-      TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                   "V8.Maglev.LoopOptimizations");
-
+      TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                  "V8.Maglev.LoopOptimizations");
+      SYNCHRONIZATION_POINT("MaglevLoopOptimizations");
       GraphProcessor<LoopOptimizationProcessor> loop_optimizations(
-          &graph_builder);
+          compilation_info);
       loop_optimizations.ProcessGraph(graph);
-
-      if (is_tracing_enabled && v8_flags.print_maglev_graphs) {
-        std::cout << "\nAfter loop optimizations" << std::endl;
-        PrintGraph(std::cout, compilation_info, graph);
-      }
+      PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+                     MaglevPhase::kLoopOptimization);
     }
-
-#ifdef DEBUG
-    {
-      GraphProcessor<MaglevGraphVerifier, /* visit_identity_nodes */ true>
-          verifier(compilation_info);
-      verifier.ProcessGraph(graph);
-    }
-#endif
 
     if (v8_flags.maglev_untagged_phis) {
-      TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                   "V8.Maglev.PhiUntagging");
-
-      GraphProcessor<MaglevPhiRepresentationSelector> representation_selector(
-          &graph_builder);
-      representation_selector.ProcessGraph(graph);
-
-      if (is_tracing_enabled && v8_flags.print_maglev_graphs) {
-        std::cout << "\nAfter Phi untagging" << std::endl;
-        PrintGraph(std::cout, compilation_info, graph);
+      TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                  "V8.Maglev.PhiUntagging");
+      SYNCHRONIZATION_POINT("MaglevPhiUntagging");
+      ReachableExceptionHandlerTracker tracker(graph);
+      MaglevPhiRepresentationSelector representation_selector(graph);
+      GraphMultiProcessor<ReachableExceptionHandlerTracker&,
+                          MaglevPhiRepresentationSelector&>
+          processor{tracker, representation_selector};
+      processor.ProcessGraph(graph);
+      if (graph->may_have_unreachable_blocks()) {
+        graph->RemoveUnreachableBlocks();
       }
+      PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+                     MaglevPhase::kPhiUntagging);
     }
   }
-
-#ifdef DEBUG
-  {
-    GraphProcessor<MaglevGraphVerifier, /* visit_identity_nodes */ true>
-        verifier(compilation_info);
-    verifier.ProcessGraph(graph);
-  }
-#endif
 
   {
     // Post-hoc optimisation:
+    //   - Remove unreachable blocks
     //   - Dead node marking
     //   - Cleaning up identity nodes
-    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                 "V8.Maglev.DeadCodeMarking");
-    GraphMultiProcessor<AnyUseMarkingProcessor> processor;
+    TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                "V8.Maglev.DeadCodeMarking");
+    SYNCHRONIZATION_POINT("MaglevDeadCodeMarking");
+    if (graph->may_have_unreachable_blocks()) {
+      graph->RemoveUnreachableBlocks();
+    }
+    graph->UnwrapDeoptFrames();
+    GraphMultiProcessor<ReturnedValueRepresentationSelector,
+                        AnyUseMarkingProcessor,
+                        RegallocNodeInfoAllocationProcessor>
+        processor;
     processor.ProcessGraph(graph);
+    PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+                   MaglevPhase::kAnyUseMarking);
   }
-
-  if (is_tracing_enabled && v8_flags.print_maglev_graphs) {
-    UnparkedScopeIfOnBackground unparked_scope(local_isolate->heap());
-    std::cout << "After use marking" << std::endl;
-    PrintGraph(std::cout, compilation_info, graph);
-  }
-
-#ifdef DEBUG
-  {
-    GraphProcessor<MaglevGraphVerifier, /* visit_identity_nodes */ true>
-        verifier(compilation_info);
-    verifier.ProcessGraph(graph);
-  }
-#endif
 
   {
-    RegallocInfo regalloc_info;
+    RegallocBlockInfo regalloc_info;
     {
       // Preprocessing for register allocation and code gen:
       //   - Remove dead nodes
@@ -221,44 +250,51 @@ bool MaglevCompiler::Compile(LocalIsolate* local_isolate,
       //   - Find the maximum number of stack arguments passed to calls
       //   - Collect use information, for SSA liveness and next-use distance.
       //   - Mark
-      TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                   "V8.Maglev.NodeProcessing");
-      UnparkedScopeIfOnBackground unparked_scope(local_isolate->heap());
+      TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                  "V8.Maglev.NodeProcessing");
+      SYNCHRONIZATION_POINT("MaglevNodeProcessing");
+      compiler::UnparkedScopeIfNeeded unparked_scope(local_isolate);
       GraphMultiProcessor<DeadNodeSweepingProcessor,
                           ValueLocationConstraintProcessor,
                           MaxCallDepthProcessor, LiveRangeAndNextUseProcessor,
                           DecompressedUseMarkingProcessor>
-          processor(DeadNodeSweepingProcessor{compilation_info},
-                    LiveRangeAndNextUseProcessor{compilation_info, graph,
+          processor(LiveRangeAndNextUseProcessor{compilation_info, graph,
                                                  &regalloc_info});
       processor.ProcessGraph(graph);
-    }
-
-    if (is_tracing_enabled && v8_flags.print_maglev_graphs) {
-      UnparkedScopeIfOnBackground unparked_scope(local_isolate->heap());
-      std::cout << "After register allocation pre-processing" << std::endl;
-      PrintGraph(std::cout, compilation_info, graph);
+      PrintAndVerify(graph, v8_flags.print_maglev_graphs,
+                     MaglevPhase::kDeadNodeSweeping);
     }
 
     {
-      TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                   "V8.Maglev.RegisterAllocation");
+      TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                  "V8.Maglev.RegisterAllocation");
+      SYNCHRONIZATION_POINT("MaglevRegisterAllocation");
       StraightForwardRegisterAllocator allocator(compilation_info, graph,
                                                  &regalloc_info);
-    }
-
-    if (is_tracing_enabled &&
-        (v8_flags.print_maglev_graph || v8_flags.print_maglev_graphs)) {
-      UnparkedScopeIfOnBackground unparked_scope(local_isolate->heap());
-      std::cout << "After register allocation" << std::endl;
-      PrintGraph(std::cout, compilation_info, graph);
+      PrintGraph(graph, v8_flags.print_maglev_graph, MaglevPhase::kRegAlloc);
+#ifdef ENABLE_GDB_JIT_INTERFACE
+      if (v8_flags.gdbjit_full && v8_flags.maglev_gdbjit) {
+        compiler::UnparkedScopeIfNeeded unparked_scope(local_isolate);
+        PrintGraphToFile(graph, MaglevPhase::kRegAlloc);
+      }
+#endif
     }
   }
 
+  // The prologue grows the frame with a single stack pointer decrement, before
+  // FunctionEntryStackCheck runs. A frame no larger than the smallest OS page
+  // cannot step over a guard page, so bail out rather than emit an unchecked
+  // stack pointer jump of arbitrary size.
+  if (graph->tagged_stack_slots() + graph->untagged_stack_slots() >
+      kMaxStackSlots) {
+    return false;
+  }
+
   {
-    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                 "V8.Maglev.CodeAssembly");
-    UnparkedScopeIfOnBackground unparked_scope(local_isolate->heap());
+    TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                "V8.Maglev.CodeAssembly");
+    SYNCHRONIZATION_POINT("MaglevCodeAssembly");
+    compiler::UnparkedScopeIfNeeded unparked_scope(local_isolate);
     std::unique_ptr<MaglevCodeGenerator> code_generator =
         std::make_unique<MaglevCodeGenerator>(local_isolate, compilation_info,
                                               graph);
@@ -284,8 +320,13 @@ std::pair<MaybeHandle<Code>, BailoutReason> MaglevCompiler::GenerateCode(
 
   Handle<Code> code;
   {
-    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                 "V8.Maglev.CodeGeneration");
+    std::optional<MaglevGraphLabellerScope> current_thread_graph_labeller;
+    if (compilation_info->has_graph_labeller()) {
+      current_thread_graph_labeller.emplace(compilation_info->graph_labeller());
+    }
+    TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                "V8.Maglev.CodeGeneration");
+    SYNCHRONIZATION_POINT("MaglevCodeGeneration");
     if (compilation_info->is_detached() ||
         !code_generator->Generate(isolate).ToHandle(&code)) {
       compilation_info->toplevel_compilation_unit()
@@ -296,10 +337,26 @@ std::pair<MaybeHandle<Code>, BailoutReason> MaglevCompiler::GenerateCode(
     }
   }
 
+  if (compilation_info->trace_json_enabled()) {
+    FinalizeMaglevLogging(isolate, compilation_info, code_generator->graph(),
+                          code);
+  }
+  if (compilation_info->is_tracing_enabled() ||
+      compilation_info->trace_json_enabled()) {
+    CodeTracer::StreamScope tracing_scope(isolate->GetCodeTracer());
+    tracing_scope.stream()
+        << "---------------------------------------------------\n"
+        << "Finished compiling method " << compilation_info->function_name()
+        << " using Maglev" << std::endl;
+  }
+
   {
-    TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-                 "V8.Maglev.CommittingDependencies");
+    TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+                "V8.Maglev.CommittingDependencies");
+    SYNCHRONIZATION_POINT("MaglevCommittingDependencies");
     if (!compilation_info->broker()->dependencies()->Commit(code)) {
+      compilation_info->toplevel_function()->SetTieringInProgress(isolate,
+                                                                  false);
       // Don't `set_maglev_compilation_failed` s.t. we may reattempt
       // compilation.
       // TODO(v8:7700): Make this more robust, i.e.: don't recompile endlessly.

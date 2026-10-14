@@ -88,8 +88,9 @@ class DeclarationContext {
   // to the instance specific virtual methods.
   static v8::Intercepted HandleGet(
       Local<Name> key, const v8::PropertyCallbackInfo<v8::Value>& info);
-  static v8::Intercepted HandleSet(Local<Name> key, Local<Value> value,
-                                   const v8::PropertyCallbackInfo<void>& info);
+  static v8::Intercepted HandleSet(
+      Local<Name> key, Local<Value> value,
+      const v8::PropertyCallbackInfo<Boolean>& info);
   static v8::Intercepted HandleQuery(
       Local<Name> key, const v8::PropertyCallbackInfo<v8::Integer>& info);
 
@@ -120,11 +121,15 @@ DeclarationContext::DeclarationContext()
   // Do nothing.
 }
 
+// This tag value has been picked arbitrarily between 0 and
+// V8_EXTERNAL_POINTER_TAG_COUNT.
+constexpr v8::ExternalPointerTypeTag kDeclarationContextTag = 27;
+
 void DeclarationContext::InitializeIfNeeded() {
   if (is_initialized_) return;
   HandleScope scope(isolate_);
   Local<FunctionTemplate> function = FunctionTemplate::New(isolate_);
-  Local<Value> data = External::New(isolate_, this);
+  Local<Value> data = External::New(isolate_, this, kDeclarationContextTag);
   GetHolder(function)->SetHandler(v8::NamedPropertyHandlerConfiguration(
       &HandleGet, &HandleSet, &HandleQuery, nullptr, nullptr, data));
   Local<Context> context = Context::New(
@@ -191,7 +196,7 @@ v8::Intercepted DeclarationContext::HandleGet(
 
 v8::Intercepted DeclarationContext::HandleSet(
     Local<Name> key, Local<Value> value,
-    const v8::PropertyCallbackInfo<void>& info) {
+    const v8::PropertyCallbackInfo<Boolean>& info) {
   DeclarationContext* context = GetInstance(info.Data());
   context->set_count_++;
   Maybe<bool> maybe_result = context->Set(key, value);
@@ -218,7 +223,7 @@ v8::Intercepted DeclarationContext::HandleQuery(
 }
 
 DeclarationContext* DeclarationContext::GetInstance(Local<Value> data) {
-  void* value = Local<External>::Cast(data)->Value();
+  void* value = Local<External>::Cast(data)->Value(kDeclarationContextTag);
   return static_cast<DeclarationContext*>(value);
 }
 
@@ -1065,7 +1070,6 @@ TEST_F(DeclsTest, Regress3941_Reads) {
 }
 
 TEST_F(DeclsTest, TestUsing) {
-  i::v8_flags.js_explicit_resource_management = true;
   HandleScope scope(isolate());
 
   {
@@ -1104,7 +1108,6 @@ TEST_F(DeclsTest, TestUsing) {
 }
 
 TEST_F(DeclsTest, TestAwaitUsing) {
-  i::v8_flags.js_explicit_resource_management = true;
   HandleScope scope(isolate());
 
   {

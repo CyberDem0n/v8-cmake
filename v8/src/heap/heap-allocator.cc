@@ -4,14 +4,20 @@
 
 #include "src/heap/heap-allocator.h"
 
+#include "src/base/functional/function-ref.h"
 #include "src/base/logging.h"
+#include "src/base/strong-alias.h"
 #include "src/common/globals.h"
 #include "src/execution/isolate.h"
+#include "src/heap/allocation-result.h"
+#include "src/heap/base-page.h"
 #include "src/heap/heap-allocator-inl.h"
 #include "src/heap/heap-inl.h"
-#include "src/heap/large-page-metadata.h"
+#include "src/heap/large-page.h"
 #include "src/heap/large-spaces.h"
-#include "src/heap/page-metadata.h"
+#include "src/heap/memory-chunk-layout.h"
+#include "src/heap/normal-page.h"
+#include "src/heap/pending-allocations.h"
 #include "src/logging/counters.h"
 #include "src/objects/heap-object.h"
 #include "src/utils/utils.h"
@@ -24,40 +30,56 @@ class Heap;
 HeapAllocator::HeapAllocator(LocalHeap* local_heap)
     : local_heap_(local_heap), heap_(local_heap->heap()) {}
 
-void HeapAllocator::Setup(LinearAllocationArea* new_allocation_info,
-                          LinearAllocationArea* old_allocation_info) {
+void HeapAllocator::Setup() {
+  max_regular_code_object_size_ = MemoryChunkLayout::MaxRegularCodeObjectSize();
+
   for (int i = FIRST_SPACE; i <= LAST_SPACE; ++i) {
     spaces_[i] = heap_->space(i);
   }
 
   if ((heap_->new_space() || v8_flags.sticky_mark_bits) &&
       local_heap_->is_main_thread()) {
+    LinearAllocationArea* const new_allocation_info =
+        &heap_->isolate()->isolate_data()->new_allocation_info();
+    young_pending_allocations_ = heap_->young_pending_allocations();
     new_space_allocator_.emplace(
         local_heap_,
         v8_flags.sticky_mark_bits
             ? static_cast<SpaceWithLinearArea*>(heap_->sticky_space())
             : static_cast<SpaceWithLinearArea*>(heap_->new_space()),
-        MainAllocator::IsNewGeneration::kYes, new_allocation_info);
+        MainAllocator::kNewGeneration, new_allocation_info);
   }
 
+  if (local_heap_->is_main_thread()) {
+    last_young_allocation_pointer_ = reinterpret_cast<Address*>(
+        heap_->isolate()->isolate_data()->last_young_allocation_address());
+  } else {
+    last_young_allocation_.emplace(kNullAddress);
+    last_young_allocation_pointer_ = &last_young_allocation_.value();
+  }
+
+  LinearAllocationArea* const old_allocation_info =
+      local_heap_->is_main_thread()
+          ? &heap_->isolate()->isolate_data()->old_allocation_info()
+          : nullptr;
   old_space_allocator_.emplace(local_heap_, heap_->old_space(),
-                               MainAllocator::IsNewGeneration::kNo,
+                               MainAllocator::kOldGeneration,
                                old_allocation_info);
 
   trusted_space_allocator_.emplace(local_heap_, heap_->trusted_space(),
-                                   MainAllocator::IsNewGeneration::kNo);
+                                   MainAllocator::kOldGeneration);
   code_space_allocator_.emplace(local_heap_, heap_->code_space(),
-                                MainAllocator::IsNewGeneration::kNo);
+                                MainAllocator::kOldGeneration);
 
   if (heap_->isolate()->has_shared_space()) {
     shared_space_allocator_.emplace(local_heap_,
                                     heap_->shared_allocation_space(),
-                                    MainAllocator::IsNewGeneration::kNo);
+                                    MainAllocator::kOldGeneration);
     shared_lo_space_ = heap_->shared_lo_allocation_space();
 
     shared_trusted_space_allocator_.emplace(
         local_heap_, heap_->shared_trusted_allocation_space(),
-        MainAllocator::IsNewGeneration::kNo);
+        MainAllocator::kOldGeneration);
     shared_trusted_lo_space_ = heap_->shared_trusted_lo_allocation_space();
   }
 }
@@ -69,25 +91,59 @@ void HeapAllocator::SetReadOnlySpace(ReadOnlySpace* read_only_space) {
 AllocationResult HeapAllocator::AllocateRawLargeInternal(
     int size_in_bytes, AllocationType allocation, AllocationOrigin origin,
     AllocationAlignment alignment, AllocationHint hint) {
-  DCHECK_GT(size_in_bytes, heap_->MaxRegularHeapObjectSize(allocation));
+  DCHECK_GT(size_in_bytes, MaxRegularHeapObjectSize(allocation));
+  AllocationResult allocation_result;
   switch (allocation) {
     case AllocationType::kYoung:
-      return new_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      allocation_result =
+          new_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      break;
     case AllocationType::kOld:
-      return lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      allocation_result =
+          lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      break;
     case AllocationType::kCode:
-      return code_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      allocation_result =
+          code_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      break;
     case AllocationType::kSharedOld:
-      return shared_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      allocation_result =
+          shared_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      break;
     case AllocationType::kTrusted:
-      return trusted_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      allocation_result =
+          trusted_lo_space()->AllocateRaw(local_heap_, size_in_bytes, hint);
+      break;
     case AllocationType::kSharedTrusted:
-      return shared_trusted_lo_space()->AllocateRaw(local_heap_, size_in_bytes,
-                                                    hint);
+      allocation_result = shared_trusted_lo_space()->AllocateRaw(
+          local_heap_, size_in_bytes, hint);
+      break;
     case AllocationType::kMap:
     case AllocationType::kReadOnly:
     case AllocationType::kSharedMap:
       UNREACHABLE();
+  }
+  if (!allocation_result.IsFailure()) {
+    int allocated_size = ALIGN_TO_ALLOCATION_ALIGNMENT(size_in_bytes);
+    heap_->AddTotalAllocatedBytes(allocated_size);
+    UpdatePendingLargeObject(allocation_result.ToObject(), allocation);
+  }
+  return allocation_result;
+}
+
+void HeapAllocator::UpdatePendingLargeObject(Tagged<HeapObject> object,
+                                             AllocationType allocation) {
+  Address addr = object.address();
+  pending_large_object_.store(addr, std::memory_order_release);
+  if (allocation == AllocationType::kYoung && young_pending_allocations_) {
+    young_pending_allocations_->UpdateLargeObject(addr);
+  }
+}
+
+void HeapAllocator::ResetPendingLargeObject() {
+  pending_large_object_.store(kNullAddress, std::memory_order_release);
+  if (young_pending_allocations_) {
+    young_pending_allocations_->RemoveLargeObject();
   }
 }
 
@@ -101,85 +157,97 @@ constexpr AllocationSpace AllocationTypeToGCSpace(AllocationType type) {
     case AllocationType::kCode:
     case AllocationType::kMap:
     case AllocationType::kTrusted:
+    case AllocationType::kSharedMap:
+    case AllocationType::kSharedOld:
       // OLD_SPACE indicates full GC.
       return OLD_SPACE;
     case AllocationType::kReadOnly:
-    case AllocationType::kSharedMap:
-    case AllocationType::kSharedOld:
     case AllocationType::kSharedTrusted:
       UNREACHABLE();
   }
+  UNREACHABLE();
 }
 
 }  // namespace
 
-AllocationResult HeapAllocator::AllocateRawWithLightRetrySlowPath(
-    int size, AllocationType allocation, AllocationOrigin origin,
-    AllocationAlignment alignment, AllocationHint hint) {
-  auto Allocate = [&](AllocationType allocation) {
-    return AllocateRaw(size, allocation, origin, alignment, hint);
-  };
-  auto RetryAllocate = [&](AllocationType allocation) {
-    return RetryAllocateRaw(size, allocation, origin, alignment, hint);
-  };
-
-  return AllocateRawWithLightRetrySlowPath(Allocate, RetryAllocate, allocation);
-}
-
-void HeapAllocator::CollectGarbage(AllocationType allocation) {
+void HeapAllocator::CollectGarbage(
+    AllocationType allocation, PerformHeapLimitCheck perform_heap_limit_check,
+    GarbageCollectionReason gc_reason) {
   if (IsSharedAllocationType(allocation)) {
-    heap_->CollectGarbageShared(local_heap_,
-                                GarbageCollectionReason::kAllocationFailure);
+    auto* isolate = heap_->isolate();
+    if (isolate->shared_space_isolate() == isolate &&
+        local_heap_->is_main_thread()) {
+      AllocationSpace space_to_gc = AllocationTypeToGCSpace(allocation);
+      heap_->CollectGarbage(space_to_gc, gc_reason, kNoGCCallbackFlags,
+                            perform_heap_limit_check);
+    } else {
+      isolate->shared_space_isolate()
+          ->heap()
+          ->TriggerAndWaitForGCFromBackgroundThread(local_heap_,
+                                                    RequestedGCKind::kMajor);
+    }
   } else if (local_heap_->is_main_thread()) {
     // On the main thread we can directly start the GC.
     AllocationSpace space_to_gc = AllocationTypeToGCSpace(allocation);
-    heap_->CollectGarbage(space_to_gc,
-                          GarbageCollectionReason::kAllocationFailure);
+    heap_->CollectGarbage(space_to_gc, gc_reason, kNoGCCallbackFlags,
+                          perform_heap_limit_check);
   } else {
     // Request GC from main thread.
-    heap_->CollectGarbageFromAnyThread(local_heap_);
+    heap_->TriggerAndWaitForGCFromBackgroundThread(local_heap_,
+                                                   RequestedGCKind::kMajor);
   }
-}
-
-AllocationResult HeapAllocator::AllocateRawWithRetryOrFailSlowPath(
-    int size, AllocationType allocation, AllocationOrigin origin,
-    AllocationAlignment alignment, AllocationHint hint) {
-  auto Allocate = [&](AllocationType allocation) {
-    return AllocateRaw(size, allocation, origin, alignment, hint);
-  };
-  auto RetryAllocate = [&](AllocationType allocation) {
-    return RetryAllocateRaw(size, allocation, origin, alignment, hint);
-  };
-  return AllocateRawWithRetryOrFailSlowPath(Allocate, RetryAllocate,
-                                            allocation);
 }
 
 void HeapAllocator::CollectAllAvailableGarbage(AllocationType allocation) {
   if (IsSharedAllocationType(allocation)) {
-    heap_->CollectGarbageShared(heap_->main_thread_local_heap(),
-                                GarbageCollectionReason::kLastResort);
+    auto* isolate = heap_->isolate();
+    if (isolate->shared_space_isolate() == isolate &&
+        local_heap_->is_main_thread()) {
+      heap_->CollectAllAvailableGarbage(GarbageCollectionReason::kLastResort);
+    } else {
+      isolate->shared_space_isolate()
+          ->heap()
+          ->TriggerAndWaitForGCFromBackgroundThread(
+              local_heap_, RequestedGCKind::kLastResort);
+    }
   } else if (local_heap_->is_main_thread()) {
-    // On the main thread we can directly start the GC.
     heap_->CollectAllAvailableGarbage(GarbageCollectionReason::kLastResort);
   } else {
     // Request GC from main thread.
-    heap_->CollectGarbageFromAnyThread(local_heap_);
+    heap_->TriggerAndWaitForGCFromBackgroundThread(
+        local_heap_, RequestedGCKind::kLastResort);
   }
 }
 
-AllocationResult HeapAllocator::RetryAllocateRaw(int size_in_bytes,
-                                                 AllocationType allocation,
-                                                 AllocationOrigin origin,
-                                                 AllocationAlignment alignment,
-                                                 AllocationHint hint) {
-  // Initially flags on the LocalHeap are always disabled. They are only
-  // active while this method is running.
-  DCHECK(!local_heap_->IsRetryOfFailedAllocation());
-  local_heap_->SetRetryOfFailedAllocation(true);
-  AllocationResult result =
-      AllocateRaw(size_in_bytes, allocation, origin, alignment, hint);
-  local_heap_->SetRetryOfFailedAllocation(false);
-  return result;
+Tagged<HeapObject> HeapAllocator::AllocateRawSlowPath(
+    AllocationRetryMode retry_mode, int size, AllocationType allocation,
+    AllocationOrigin origin, AllocationAlignment alignment,
+    AllocationHint hint) {
+  AllocationResult result;
+  auto allocate = [&result, size, allocation, origin, alignment, hint, this]() {
+    // Initially flags on the LocalHeap are always disabled. They are only
+    // active while this method is running.
+    DCHECK(!local_heap_->IsRetryOfFailedAllocation());
+    local_heap_->SetRetryOfFailedAllocation(true);
+    result = AllocateRaw(size, allocation, origin, alignment, hint);
+    local_heap_->SetRetryOfFailedAllocation(false);
+    return !result.IsFailure();
+  };
+
+  if (retry_mode == AllocationRetryMode::kLightRetry) {
+    RetryCustomAllocateLight(allocate, allocation,
+                             GarbageCollectionReason::kAllocationFailure);
+  } else {
+    DCHECK_EQ(retry_mode, AllocationRetryMode::kRetryOrFail);
+    RetryCustomAllocateOrFail(allocate, allocation,
+                              GarbageCollectionReason::kAllocationFailure);
+  }
+
+  Tagged<HeapObject> object;
+  if (result.To(&object)) {
+    return object;
+  }
+  return Tagged<HeapObject>();
 }
 
 bool HeapAllocator::TryResizeLargeObject(Tagged<HeapObject> object,
@@ -189,16 +257,18 @@ bool HeapAllocator::TryResizeLargeObject(Tagged<HeapObject> object,
     return false;
   }
 
-  PageMetadata* page = PageMetadata::FromHeapObject(object);
-  Space* space = page->owner();
-  if (space->identity() != NEW_LO_SPACE && space->identity() != LO_SPACE) {
+  LargePage* page;
+  if (!TryCast<LargePage>(BasePage::FromHeapObject(heap_->isolate(), object),
+                          &page)) {
     return false;
   }
-  DCHECK(page->IsLargePage());
+  DCHECK(page->owner()->identity() == NEW_LO_SPACE ||
+         page->owner()->identity() == LO_SPACE);
+  DCHECK(page->is_large());
   DCHECK_EQ(page->area_size(), old_object_size);
   CHECK_GT(new_object_size, old_object_size);
-  if (!heap_->memory_allocator()->ResizeLargePage(
-          LargePageMetadata::cast(page), old_object_size, new_object_size)) {
+  if (!heap_->memory_allocator()->ResizeLargePage(page, old_object_size,
+                                                  new_object_size)) {
     if (V8_UNLIKELY(v8_flags.trace_resize_large_object)) {
       heap_->isolate()->PrintWithTimestamp(
           "resizing large object failed: allocation could not be extended\n");
@@ -255,12 +325,6 @@ void HeapAllocator::MarkLinearAllocationAreasBlack() {
   code_space_allocator_->MarkLinearAllocationAreaBlack();
 }
 
-void HeapAllocator::UnmarkLinearAllocationsArea() {
-  DCHECK(!v8_flags.black_allocated_pages);
-  old_space_allocator_->UnmarkLinearAllocationArea();
-  trusted_space_allocator_->UnmarkLinearAllocationArea();
-  code_space_allocator_->UnmarkLinearAllocationArea();
-}
 
 void HeapAllocator::MarkSharedLinearAllocationAreasBlack() {
   DCHECK(!v8_flags.black_allocated_pages);
@@ -272,15 +336,6 @@ void HeapAllocator::MarkSharedLinearAllocationAreasBlack() {
   }
 }
 
-void HeapAllocator::UnmarkSharedLinearAllocationAreas() {
-  DCHECK(!v8_flags.black_allocated_pages);
-  if (shared_space_allocator_) {
-    shared_space_allocator_->UnmarkLinearAllocationArea();
-  }
-  if (shared_trusted_space_allocator_) {
-    shared_trusted_space_allocator_->UnmarkLinearAllocationArea();
-  }
-}
 
 void HeapAllocator::FreeLinearAllocationAreasAndResetFreeLists() {
   DCHECK(v8_flags.black_allocated_pages);
@@ -314,6 +369,7 @@ void HeapAllocator::FreeLinearAllocationAreas() {
   if (shared_trusted_space_allocator_) {
     shared_trusted_space_allocator_->FreeLinearAllocationArea();
   }
+  ResetPendingLargeObject();
 }
 
 void HeapAllocator::PublishPendingAllocations() {
@@ -325,10 +381,7 @@ void HeapAllocator::PublishPendingAllocations() {
   trusted_space_allocator_->MoveOriginalTopForward();
   code_space_allocator_->MoveOriginalTopForward();
 
-  lo_space()->ResetPendingObject();
-  if (new_lo_space()) new_lo_space()->ResetPendingObject();
-  code_lo_space()->ResetPendingObject();
-  trusted_lo_space()->ResetPendingObject();
+  ResetPendingLargeObject();
 }
 
 void HeapAllocator::AddAllocationObserver(
@@ -415,8 +468,9 @@ void HeapAllocator::SetAllocationTimeout(int allocation_timeout) {
 
 void HeapAllocator::UpdateAllocationTimeout() {
   if (v8_flags.random_gc_interval > 0) {
-    const int new_timeout = heap_->isolate()->fuzzer_rng()->NextInt(
-        v8_flags.random_gc_interval + 1);
+    const int new_timeout =
+        heap_->isolate()->fuzzer_rng()->NextInt(v8_flags.random_gc_interval) +
+        1;
     // Reset the allocation timeout, but make sure to allow at least a few
     // allocations after a collection. The reason for this is that we have a lot
     // of allocation sequences and we assume that a garbage collection will
@@ -444,6 +498,126 @@ bool HeapAllocator::ReachedAllocationTimeout() {
 }
 
 #endif  // V8_ENABLE_ALLOCATION_TIMEOUT
+
+Heap* HeapAllocator::heap_for_allocation(AllocationType allocation) {
+  if (IsSharedAllocationType(allocation)) {
+    return heap_->isolate()->shared_space_isolate()->heap();
+  } else {
+    return heap_;
+  }
+}
+
+bool HeapAllocator::RetryCustomAllocate(CustomAllocationFunction allocate,
+                                        AllocationType allocation,
+                                        GarbageCollectionReason gc_reason) {
+  if (CollectGarbageAndRetryAllocation(allocate, allocation, gc_reason)) {
+    return true;
+  }
+
+  // In the case of young allocations, the GCs above were minor GCs. Try "light"
+  // full GCs before performing the last-resort GCs.
+  if (allocation == AllocationType::kYoung) {
+    if (CollectGarbageAndRetryAllocation(allocate, AllocationType::kOld,
+                                         gc_reason)) {
+      return true;
+    }
+  }
+
+  // Perform last resort GC. This call will clear more caches and perform more
+  // GCs. It will also enforce the heap limit if still violated.
+  CollectAllAvailableGarbage(allocation);
+
+  return allocate();
+}
+
+void HeapAllocator::RetryCustomAllocateOrFail(
+    CustomAllocationFunction allocate, AllocationType allocation,
+    GarbageCollectionReason gc_reason) {
+  if (RetryCustomAllocate(allocate, allocation, gc_reason)) return;
+  V8::FatalProcessOutOfMemory(heap_->isolate(), "CALL_AND_RETRY_LAST",
+                              V8::kHeapOOM);
+}
+
+bool HeapAllocator::RetryCustomAllocateLight(
+    CustomAllocationFunction allocate, AllocationType allocation,
+    GarbageCollectionReason gc_reason) {
+  DCHECK_NE(AllocationType::kYoung, allocation);
+
+  if (auto result =
+          CollectGarbageAndRetryAllocation(allocate, allocation, gc_reason)) {
+    return result;
+  }
+
+  heap_for_allocation(allocation)->CheckHeapLimitReached();
+
+  return {};
+}
+
+bool HeapAllocator::CollectGarbageAndRetryAllocation(
+    CustomAllocationFunction allocate, AllocationType allocation,
+    GarbageCollectionReason gc_reason) {
+  const auto perform_heap_limit_check = v8_flags.late_heap_limit_check
+                                            ? PerformHeapLimitCheck{false}
+                                            : PerformHeapLimitCheck{true};
+
+  for (int i = 0; i < 2; i++) {
+    if (allocation != AllocationType::kYoung &&
+        heap_for_allocation(allocation)
+            ->HasConsecutiveIneffectiveMarkCompact()) {
+      return false;
+    }
+
+    // Skip the heap limit check in the GC if enabled. The heap limit needs to
+    // be enforced by the caller.
+    CollectGarbage(allocation, perform_heap_limit_check, gc_reason);
+
+    // As long as we are at or above the heap limit, we definitely need another
+    // GC.
+    if (heap_for_allocation(allocation)->ReachedHeapLimit()) {
+      continue;
+    }
+
+    if (allocate()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+#if V8_VERIFY_WRITE_BARRIERS
+
+bool HeapAllocator::IsMostRecentYoungAllocation(Address object_address) {
+  const Address last = last_young_allocation();
+
+  if (last == kNullAddress) {
+    return false;
+  }
+
+  DCHECK(new_space_allocator_.has_value());
+
+  if (new_space_allocator_->start() <= last &&
+      last < new_space_allocator_->top()) {
+    // The last young allocation was allocated from LAB. Because of allocation
+    // folding we have to allow values between [last_young_allocation; LAB top[.
+    return last <= object_address &&
+           object_address < new_space_allocator_->top();
+  } else {
+    // Otherwise the last young allocation has to be a large object.
+    BasePage* chunk = BasePage::FromAddress(heap_->isolate(), last);
+    CHECK(chunk->is_large());
+    CHECK_EQ(chunk->owner_identity(), NEW_LO_SPACE);
+    // No allocation folding with large objects, so object_address has to match
+    // the last young allocation exactly.
+    return last == object_address;
+  }
+}
+
+void HeapAllocator::ResetMostRecentYoungAllocation() {
+  set_last_young_allocation(kNullAddress);
+}
+
+#endif  // V8_VERIFY_WRITE_BARRIERS
 
 }  // namespace internal
 }  // namespace v8

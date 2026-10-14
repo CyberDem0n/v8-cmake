@@ -43,6 +43,7 @@ ObjectVisitorWithCageBases::ObjectVisitorWithCageBases(Heap* heap)
     : ObjectVisitorWithCageBases(Isolate::FromHeap(heap)) {}
 
 template <typename Visitor>
+  requires(is_subtype_v<Visitor, RootVisitor>)
 inline void ClientRootVisitor<Visitor>::VisitRunningCode(
     FullObjectSlot code_slot, FullObjectSlot maybe_istream_slot) {
 #if DEBUG
@@ -55,6 +56,7 @@ inline void ClientRootVisitor<Visitor>::VisitRunningCode(
 
 // static
 template <typename Visitor>
+  requires(is_subtype_v<Visitor, RootVisitor>)
 bool ClientRootVisitor<Visitor>::IsSharedHeapObject(Tagged<Object> object) {
   return IsHeapObject(object) &&
          HeapLayout::InWritableSharedSpace(Cast<HeapObject>(object));
@@ -63,7 +65,7 @@ bool ClientRootVisitor<Visitor>::IsSharedHeapObject(Tagged<Object> object) {
 template <typename Visitor>
 inline void ClientObjectVisitor<Visitor>::VisitMapPointer(
     Tagged<HeapObject> host) {
-  if (!IsSharedHeapObject(host->map(cage_base()))) return;
+  if (!IsSharedHeapObject(host->map())) return;
   actual_visitor_->VisitMapPointer(host);
 }
 
@@ -92,7 +94,7 @@ inline void ClientObjectVisitor<Visitor>::VisitCodeTarget(
 template <typename Visitor>
 inline void ClientObjectVisitor<Visitor>::VisitEmbeddedPointer(
     Tagged<InstructionStream> host, RelocInfo* rinfo) {
-  if (!IsSharedHeapObject(rinfo->target_object(cage_base()))) return;
+  if (!IsSharedHeapObject(rinfo->target_object())) return;
   actual_visitor_->VisitEmbeddedPointer(host, rinfo);
 }
 

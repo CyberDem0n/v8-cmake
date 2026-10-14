@@ -273,10 +273,10 @@ class TestCodeEventHandler : public v8::CodeEventHandler {
     std::string name = std::string(code_event->GetComment());
     if (name.empty()) {
       v8::Local<v8::String> functionName = code_event->GetFunctionName();
-      size_t buffer_size = functionName->Utf8LengthV2(isolate_) + 1;
+      size_t buffer_size = functionName->Utf8Length(isolate_) + 1;
       std::string buffer(buffer_size, 0);
-      functionName->WriteUtf8V2(isolate_, &buffer[0], buffer_size,
-                                String::WriteFlags::kNullTerminate);
+      functionName->WriteUtf8(isolate_, &buffer[0], buffer_size,
+                              String::WriteFlags::kNullTerminate);
       // Sanitize name, removing unwanted \0 resulted from WriteUtf8
       name = std::string(buffer.c_str());
     }
@@ -383,7 +383,7 @@ static void Prop1Getter(v8::Local<v8::Name> property,
 
 static void Prop1Setter(v8::Local<v8::Name> property,
                         v8::Local<v8::Value> value,
-                        const v8::PropertyCallbackInfo<void>& info) {}
+                        const v8::PropertyCallbackInfo<v8::Boolean>& info) {}
 
 static void Prop2Getter(v8::Local<v8::Name> property,
                         const v8::PropertyCallbackInfo<v8::Value>& info) {}
@@ -536,7 +536,7 @@ TEST_F(LogAllTest, LogAll) {
     CHECK(logger.ContainsLine({"code-creation,Script", ":1:1"}));
     CHECK(logger.ContainsLine({"code-creation,JS,", "testAddFn"}));
 
-    if (i::v8_flags.turbofan && !i::v8_flags.always_turbofan) {
+    if (i::v8_flags.turbofan) {
       CHECK(logger.ContainsLine({"code-deopt,", "not a Smi"}));
       CHECK(logger.ContainsLine({"timer-event-start", "V8.DeoptimizeCode"}));
       CHECK(logger.ContainsLine({"timer-event-end", "V8.DeoptimizeCode"}));
@@ -582,7 +582,6 @@ class LogInterpretedFramesNativeStackWithSerializationTest
     i::v8_flags.logfile = i::LogFile::kLogToTemporaryFile;
     i::v8_flags.logfile_per_isolate = false;
     i::v8_flags.interpreted_frames_native_stack = true;
-    i::v8_flags.always_turbofan = false;
     TestWithPlatform::SetUpTestSuite();
   }
 
@@ -1136,9 +1135,6 @@ class LogFunctionEventsTest : public LogTest {
 };
 
 TEST_F(LogFunctionEventsTest, LogFunctionEvents) {
-  // --always-turbofan will break the fine-grained log order.
-  if (i::v8_flags.always_turbofan) return;
-
   {
     ScopedLoggerInitializer logger(isolate());
 
@@ -1224,14 +1220,16 @@ TEST_F(LogTest, BuiltinsNotLoggedAsLazyCompile) {
     v8::base::SNPrintF(buffer, ",0x%" V8PRIxPTR ",%d,BooleanConstructor",
                        builtin->instruction_start(),
                        builtin->instruction_size());
+    static_assert(static_cast<int>(i::CodeKind::BUILTIN) == 3,
+                  "Update ',3,' below to proper value");
     CHECK(logger.ContainsLine(
-        {"code-creation,Builtin,2,", std::string(buffer.begin())}));
+        {"code-creation,Builtin,3,", std::string(buffer.begin())}));
 
     v8::base::SNPrintF(buffer, ",0x%" V8PRIxPTR ",%d,",
                        builtin->instruction_start(),
                        builtin->instruction_size());
     CHECK(!logger.ContainsLine(
-        {"code-creation,JS,2,", std::string(buffer.begin())}));
+        {"code-creation,JS,3,", std::string(buffer.begin())}));
   }
 }
 }  // namespace v8

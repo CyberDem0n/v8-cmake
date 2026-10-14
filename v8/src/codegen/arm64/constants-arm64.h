@@ -40,10 +40,15 @@ constexpr int kMaxLoadLiteralRange = 1 * MB;
 
 constexpr int kNumberOfRegisters = 32;
 constexpr int kNumberOfVRegisters = 32;
+constexpr int kNumberOfZRegisters = kNumberOfVRegisters;
 // Callee saved registers are x19-x28.
 constexpr int kNumberOfCalleeSavedRegisters = 10;
 // Callee saved FP registers are d8-d15.
-constexpr int kNumberOfCalleeSavedVRegisters = 8;
+constexpr int kNumberOfCalleeSavedDRegisters = 8;
+// AAPCS64 only requires the callee to preserve the *lower* 64 bits of v8-v15
+// (which are essentially the d8-d15 registers), thus none of the 128-bit
+// V registers are callee-saved.
+constexpr int kNumberOfCalleeSavedVRegisters = 0;
 constexpr int kWRegSizeInBits = 32;
 constexpr int kWRegSizeInBitsLog2 = 5;
 constexpr int kWRegSize = kWRegSizeInBits >> 3;
@@ -532,6 +537,13 @@ constexpr NEONScalarFormatField NEON_H = 0x00400000;
 constexpr NEONScalarFormatField NEON_S = 0x00800000;
 constexpr NEONScalarFormatField NEON_D = 0x00C00000;
 
+using SVESizeField = uint32_t;
+constexpr SVESizeField SVESizeFieldMask = 0x00C00000;
+constexpr SVESizeField SVE_B = 0x00000000;
+constexpr SVESizeField SVE_H = 0x00400000;
+constexpr SVESizeField SVE_S = 0x00800000;
+constexpr SVESizeField SVE_D = 0x00C00000;
+
 // PC relative addressing.
 using PCRelAddressingOp = uint32_t;
 constexpr PCRelAddressingOp PCRelAddressingFixed = 0x10000000;
@@ -604,6 +616,20 @@ constexpr AddSubWithCarryOp SBC = SBC_w;
 constexpr AddSubWithCarryOp SBCS_w = AddSubWithCarryFixed | SUBS;
 constexpr AddSubWithCarryOp SBCS_x =
     AddSubWithCarryFixed | SUBS | SixtyFourBits;
+
+// Min/max immediate.
+using MinMaxImmediateOp = uint32_t;
+constexpr MinMaxImmediateOp MinMaxImmediateFixed = 0x11C00000;
+constexpr MinMaxImmediateOp MinMaxImmediateFMask = 0x7FF00000;
+constexpr MinMaxImmediateOp MinMaxImmediateMask = 0xFFFC0000;
+constexpr MinMaxImmediateOp SMAX_w_imm = MinMaxImmediateFixed;
+constexpr MinMaxImmediateOp SMAX_x_imm = SMAX_w_imm | SixtyFourBits;
+constexpr MinMaxImmediateOp UMAX_w_imm = MinMaxImmediateFixed | 0x00040000;
+constexpr MinMaxImmediateOp UMAX_x_imm = UMAX_w_imm | SixtyFourBits;
+constexpr MinMaxImmediateOp SMIN_w_imm = MinMaxImmediateFixed | 0x00080000;
+constexpr MinMaxImmediateOp SMIN_x_imm = SMIN_w_imm | SixtyFourBits;
+constexpr MinMaxImmediateOp UMIN_w_imm = MinMaxImmediateFixed | 0x000C0000;
+constexpr MinMaxImmediateOp UMIN_x_imm = UMIN_w_imm | SixtyFourBits;
 
 // Logical (immediate and shifted register).
 using LogicalOp = uint32_t;
@@ -764,6 +790,23 @@ constexpr ConditionalBranchOp B_cond = ConditionalBranchFixed | 0x00000000;
 constexpr ConditionalBranchOp ConditionalBranchConsistentFixed = 0x54000010;
 constexpr ConditionalBranchOp BC_cond =
     ConditionalBranchConsistentFixed | 0x00000000;
+
+// MOPS
+using MemCpyOp = uint32_t;
+constexpr MemCpyOp CpyFixed = 0x1D000400;
+constexpr MemCpyOp CpyFMask = 0xFF20FC00;
+constexpr MemCpyOp CpyMask = CpyFMask | 0x00E00000;
+constexpr MemCpyOp CPYP = CpyFixed | 0x00000000;
+constexpr MemCpyOp CPYM = CpyFixed | 0x00400000;
+constexpr MemCpyOp CPYE = CpyFixed | 0x00800000;
+
+using MemSetOp = uint32_t;
+constexpr MemSetOp SetFixed = 0x19C00400;
+constexpr MemSetOp SetFMask = 0xFFE03C00;
+constexpr MemSetOp SetMask = SetFMask | 0x0000C000;
+constexpr MemSetOp SETP = SetFixed | 0x00000000;
+constexpr MemSetOp SETM = SetFixed | 0x00004000;
+constexpr MemSetOp SETE = SetFixed | 0x00008000;
 
 // System.
 // System instruction encoding is complicated because some instructions use op
@@ -1259,6 +1302,18 @@ constexpr DataProcessing2SourceOp CRC32CW =
     DataProcessing2SourceFixed | 0x00005800;
 constexpr DataProcessing2SourceOp CRC32CX =
     DataProcessing2SourceFixed | SixtyFourBits | 0x00005C00;
+constexpr DataProcessing2SourceOp SMAX_w =
+    DataProcessing2SourceFixed | 0x0006000;
+constexpr DataProcessing2SourceOp SMAX_x = SMAX_w | SixtyFourBits;
+constexpr DataProcessing2SourceOp UMAX_w =
+    DataProcessing2SourceFixed | 0x0006400;
+constexpr DataProcessing2SourceOp UMAX_x = UMAX_w | SixtyFourBits;
+constexpr DataProcessing2SourceOp SMIN_w =
+    DataProcessing2SourceFixed | 0x0006800;
+constexpr DataProcessing2SourceOp SMIN_x = SMIN_w | SixtyFourBits;
+constexpr DataProcessing2SourceOp UMIN_w =
+    DataProcessing2SourceFixed | 0x0006C00;
+constexpr DataProcessing2SourceOp UMIN_x = UMIN_w | SixtyFourBits;
 
 // Data processing 3 source.
 using DataProcessing3SourceOp = uint32_t;
@@ -2428,6 +2483,7 @@ constexpr NEONSHA3Op NEONSHA3FMask = 0xce000000;
 constexpr NEONSHA3Op NEONSHA3Mask = 0xcee00000;
 constexpr NEONSHA3Op NEON_BCAX = NEONSHA3Fixed | 0x00200000;
 constexpr NEONSHA3Op NEON_EOR3 = NEONSHA3Fixed;
+constexpr NEONSHA3Op NEON_XAR = NEONSHA3Fixed | 0x00800000;
 
 // NEON perm.
 using NEONPermOp = uint32_t;
@@ -2601,6 +2657,13 @@ constexpr NEONScalar3DiffOp NEON_SQDMLSL_scalar =
     NEON_Q | NEONScalar | NEON_SQDMLSL;
 constexpr NEONScalar3DiffOp NEON_SQDMULL_scalar =
     NEON_Q | NEONScalar | NEON_SQDMULL;
+
+// SVE bit permute instructions
+using SVEBitPermOp = uint32_t;
+constexpr SVEBitPermOp SVEBitPermFixed = 0x4500B000;
+constexpr SVEBitPermOp SVEBitPermFMask = 0xFF20F000;
+constexpr SVEBitPermOp SVEBitPermMask = 0xFF20FC00;
+constexpr SVEBitPermOp BEXT = SVEBitPermFixed;
 
 // Unimplemented and unallocated instructions. These are defined to make fixed
 // bit assertion easier.

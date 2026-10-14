@@ -34,9 +34,9 @@ using StackVisitorCallback = void (*)(StackVisitor*);
 // of relevant GC stack regions where interesting pointers can be found.
 class V8_EXPORT_PRIVATE Stack final {
  public:
-  // Sets the start of the stack to the current stack start.
-  void SetStackStart() {
-    current_segment_.start = v8::base::Stack::GetStackStart();
+  // Sets the start of the stack to the provided stack start.
+  void SetStackStart(const void* stack_start) {
+    current_segment_.start = stack_start;
 #ifdef V8_USE_ADDRESS_SANITIZER
     current_segment_.asan_fake_stack = __asan_get_current_fake_stack();
 #endif  // V8_USE_ADDRESS_SANITIZER
@@ -45,15 +45,12 @@ class V8_EXPORT_PRIVATE Stack final {
 #endif  // V8_USE_SAFE_STACK
   }
 
+  const void* stack_start() const { return current_segment_.start; }
+
   // Returns true if |slot| is part of the stack and false otherwise.
   // It is a static method, ignoring the set stack start and marker, but it
   // considers the ASAN stack and SafeStack.
   static bool IsOnStack(const void* slot);
-
-  void IteratePointers(StackVisitor* visitor) const {
-    IteratePointersUntilMarker(visitor);
-    IterateBackgroundStacks(visitor);
-  }
 
   // Word-aligned iteration of the stack, starting at the `stack_marker_`
   // and going to the stack start. Slot values are passed on to `visitor`.
@@ -99,10 +96,10 @@ class V8_EXPORT_PRIVATE Stack final {
 
   using IterateStackCallback = void (*)(Stack*, void*, const void*);
 
-  // This method combines SetMarkerAndCallback with IteratePointers.
-  // Callee-saved registers are pushed to the stack and then a word-aligned
-  // iteration of the stack is performed. Slot values are passed on to
-  // `visitor`. To be used for testing.
+  // This method combines SetMarkerAndCallback with pointer iteration, including
+  // background stacks. Callee-saved registers are pushed to the stack and then
+  // a word-aligned iteration of the stack is performed. Slot values are passed
+  // on to `visitor`. To be used for testing.
   void IteratePointersForTesting(StackVisitor* visitor);
 
   bool IsMarkerSet() const { return current_segment_.top != nullptr; }
@@ -213,10 +210,11 @@ class V8_EXPORT_PRIVATE Stack final {
     (*callback)();
     {
       v8::base::MutexGuard guard(&stack->lock_);
-      if (previous_segment.top)
+      if (previous_segment.top) {
         background_stacks[thread] = previous_segment;
-      else
+      } else {
         background_stacks.erase(thread);
+      }
     }
   }
 

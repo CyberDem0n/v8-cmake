@@ -2,8 +2,14 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <map>
+#ifndef V8_UNITTESTS_COMPILER_TURBOSHAFT_REDUCER_TEST_H_
+#define V8_UNITTESTS_COMPILER_TURBOSHAFT_REDUCER_TEST_H_
 
+#include <map>
+#include <memory>
+
+#include "src/codegen/interface-descriptors.h"
+#include "src/codegen/turboshaft-builtins-assembler-inl.h"
 #include "src/compiler/backend/instruction.h"
 #include "src/compiler/turbofan-graph-visualizer.h"
 #include "src/compiler/turboshaft/assembler.h"
@@ -15,7 +21,7 @@ namespace v8::internal::compiler::turboshaft {
 
 class TestInstance {
  public:
-  using Assembler = TSAssembler<VariableReducer>;
+  using assembler_t = Assembler<VariableReducer>;
 
   struct CapturedOperation {
     TestInstance* instance;
@@ -23,6 +29,10 @@ class TestInstance {
     std::set<OpIndex> generated_output;
 
     bool IsEmpty() const { return generated_output.empty(); }
+
+    bool Is(OpIndex index) const {
+      return generated_output.size() == 1 && generated_output.contains(index);
+    }
 
     template <typename Op>
     bool Contains() const {
@@ -57,32 +67,59 @@ class TestInstance {
   template <typename Builder>
   static TestInstance CreateFromGraph(PipelineData* data, int parameter_count,
                                       const Builder& builder, Isolate* isolate,
-                                      Zone* zone) {
-    auto graph = std::make_unique<Graph>(zone);
-    TestInstance instance(data, std::move(graph), isolate, zone);
+                                      Zone* zone, Handle<Context> context) {
+    TestInstance instance(data, isolate, zone, context);
     // Generate a function prolog
     Block* start_block = instance.Asm().NewBlock();
     instance.Asm().Bind(start_block);
-    instance.Asm().Parameter(3, RegisterRepresentation::Tagged(), "%context");
-    instance.Asm().Parameter(0, RegisterRepresentation::Tagged(), "%this");
     for (int i = 0; i < parameter_count; ++i) {
       instance.parameters_.push_back(
-          instance.Asm().Parameter(1 + i, RegisterRepresentation::Tagged()));
+          instance.Asm().Parameter(i, RegisterRepresentation::Tagged()));
     }
     builder(instance);
+    // Need to clear the Assembler before returning so that we don't end up with
+    // multiple Assemblers alive later.
+    instance.ClearAssembler();
     return instance;
   }
 
-  Assembler& Asm() { return assembler_; }
+  template <typename Builder>
+  static TestInstance CreateFromGraph(
+      PipelineData* data,
+      base::Vector<const RegisterRepresentation> parameter_reps,
+      const Builder& builder, Isolate* isolate, Zone* zone,
+      Handle<Context> context) {
+    TestInstance instance(data, isolate, zone, context);
+    // Generate a function prolog
+    Block* start_block = instance.Asm().NewBlock();
+    instance.Asm().Bind(start_block);
+    for (size_t i = 0; i < parameter_reps.size(); ++i) {
+      instance.parameters_.push_back(
+          instance.Asm().Parameter(static_cast<int>(i), parameter_reps[i]));
+    }
+    builder(instance);
+    // Need to clear the Assembler before returning so that we don't end up with
+    // multiple Assemblers alive later.
+    instance.ClearAssembler();
+    return instance;
+  }
+
+  assembler_t& Asm() {
+    DCHECK(assembler_);
+    return *assembler_;
+  }
   Graph& graph() { return *graph_; }
   Factory& factory() { return *isolate_->factory(); }
   Zone* zone() { return zone_; }
+  V<Context> context() { return Asm().HeapConstantNoHole(context_); }
 
-  Assembler& operator()() { return Asm(); }
+  assembler_t& operator()() { return Asm(); }
+
+  void ClearAssembler() { assembler_.reset(); }
 
   template <template <typename> typename... Reducers>
   void Run(bool trace_reductions = v8_flags.turboshaft_trace_reduction) {
-    TSAssembler<GraphVisitor, Reducers...> phase(
+    Assembler<GraphVisitor, Reducers...> phase(
         data_, graph(), graph().GetOrCreateCompanion(), zone_);
 #ifdef DEBUG
     if (trace_reductions) {
@@ -103,9 +140,14 @@ class TestInstance {
     }
   }
 
-  V<Object> GetParameter(int index) {
+  int GetParameterCount() const { return static_cast<int>(parameters_.size()); }
+
+  template <typename T = Object>
+  V<T> GetParameter(int index) {
     DCHECK_LE(0, index);
     DCHECK_LT(index, parameters_.size());
+    DCHECK(v_traits<T>::allows_representation(
+        graph_->Get(parameters_[index]).Cast<ParameterOp>().rep));
     return parameters_[index];
   }
   OpIndex BuildFrameState() {
@@ -125,7 +167,7 @@ class TestInstance {
                                             OutputFrameStateCombine::Ignore(),
                                             function_info);
 
-    return Asm().FrameState(
+    return Asm().template FrameState<AnyFrameState>(
         builder.Inputs(), builder.inlined(),
         builder.AllocateFrameStateData(*frame_state_info, zone_));
   }
@@ -189,44 +231,135 @@ class TestInstance {
     }
     PrintTurboshaftGraphForTurbolizer(*stream_, graph(), phase_name, nullptr,
                                       zone_);
+    // Flush the output stream to get a proper file even when the test crashes
+    // afterwards.
+    stream_->flush();
   }
 
+  Handle<Code> CompileWithBuiltinPipeline(CallDescriptor* call_descriptor);
+  Handle<Code> CompileAsJSBuiltin();
+
  private:
-  TestInstance(PipelineData* data, std::unique_ptr<Graph> graph,
-               Isolate* isolate, Zone* zone)
+  TestInstance(PipelineData* data, Isolate* isolate, Zone* zone,
+               Handle<Context> context)
       : data_(data),
-        assembler_(data, *graph, *graph, zone),
-        graph_(std::move(graph)),
+        assembler_(std::make_unique<assembler_t>(data, data_->graph(),
+                                                 data_->graph(), zone)),
+        graph_(&data_->graph()),
         isolate_(isolate),
-        zone_(zone) {}
+        zone_(zone),
+        context_(context) {}
 
   PipelineData* data_;
-  Assembler assembler_;
-  std::unique_ptr<Graph> graph_;
+  std::unique_ptr<assembler_t> assembler_;
+  Graph* graph_;
   std::unique_ptr<std::ofstream> stream_;
   Isolate* isolate_;
   Zone* zone_;
+  Handle<Context> context_;
   base::SmallMap<std::map<std::string, CapturedOperation>> captured_operations_;
   base::SmallVector<OpIndex, 4> parameters_;
 };
 
 class ReducerTest : public TestWithNativeContextAndZone {
  public:
+  using assembler_t = TestInstance::assembler_t;
+
   template <typename Builder>
   TestInstance CreateFromGraph(int parameter_count, const Builder& builder) {
+    Initialize(false);
+    Handle<Context> context = indirect_handle(native_context());
     return TestInstance::CreateFromGraph(pipeline_data_.get(), parameter_count,
-                                         builder, isolate(), zone());
+                                         builder, isolate(), zone(), context);
   }
 
-  void SetUp() override {
-    pipeline_data_.reset(new turboshaft::PipelineData(
-        &zone_stats_, TurboshaftPipelineKind::kJS, this->isolate(), nullptr,
-        AssemblerOptions::Default(this->isolate())));
+  template <typename Builder>
+  TestInstance CreateFromGraph(int parameter_count, const Builder& builder,
+                               bool is_wasm) {
+    Initialize(is_wasm);
+    Handle<Context> context = indirect_handle(native_context());
+    return TestInstance::CreateFromGraph(pipeline_data_.get(), parameter_count,
+                                         builder, isolate(), zone(), context);
   }
-  void TearDown() override { pipeline_data_.reset(); }
+
+  template <typename Builder>
+  TestInstance CreateFromGraph(
+      base::Vector<const RegisterRepresentation> parameter_reps,
+      const Builder& builder) {
+    Initialize(false);
+    Handle<Context> context = indirect_handle(native_context());
+    return TestInstance::CreateFromGraph(pipeline_data_.get(), parameter_reps,
+                                         builder, isolate(), zone(), context);
+  }
+
+  template <typename Builder>
+  TestInstance CreateFromGraph(
+      base::Vector<const RegisterRepresentation> parameter_reps,
+      const Builder& builder, bool is_wasm) {
+    Initialize(is_wasm);
+    Handle<Context> context = indirect_handle(native_context());
+    return TestInstance::CreateFromGraph(pipeline_data_.get(), parameter_reps,
+                                         builder, isolate(), zone(), context);
+  }
+
+#if V8_ENABLE_WEBASSEMBLY
+  template <typename Builder>
+  TestInstance CreateFromGraph(
+      base::Vector<const RegisterRepresentation> parameter_reps,
+      const Builder& builder, const wasm::WasmModule* module,
+      const wasm::FunctionSig* sig) {
+    Initialize(true);
+    pipeline_data_->SetIsWasmFunction(module, sig);
+    Handle<Context> context = indirect_handle(native_context());
+    return TestInstance::CreateFromGraph(pipeline_data_.get(), parameter_reps,
+                                         builder, isolate(), zone(), context);
+  }
+
+  template <typename Builder>
+  TestInstance CreateFromGraph(int parameter_count, const Builder& builder,
+                               const wasm::WasmModule* module,
+                               const wasm::FunctionSig* sig) {
+    Initialize(true);
+    pipeline_data_->SetIsWasmFunction(module, sig);
+    Handle<Context> context = indirect_handle(native_context());
+    return TestInstance::CreateFromGraph(pipeline_data_.get(), parameter_count,
+                                         builder, isolate(), zone(), context);
+  }
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+ private:
+  void Initialize(bool is_wasm) {
+    const testing::TestInfo* test_info =
+        testing::UnitTest::GetInstance()->current_test_info();
+    std::stringstream file_name;
+    const char* debug_name = test_info->name();
+    size_t debug_name_len = std::strlen(debug_name);
+
+    CodeKind code_kind =
+        is_wasm ? CodeKind::WASM_FUNCTION : CodeKind::FOR_TESTING_JS;
+    TurboshaftPipelineKind pipeline_kind =
+        is_wasm ? TurboshaftPipelineKind::kWasm : TurboshaftPipelineKind::kJS;
+    info_.reset(new OptimizedCompilationInfo(
+        base::Vector<const char>(debug_name, debug_name_len), this->zone(),
+        code_kind));
+    AssemblerOptions options = AssemblerOptions::Default(this->isolate());
+    options.is_wasm = is_wasm;
+    pipeline_data_.reset(new turboshaft::PipelineData(
+        &zone_stats_, pipeline_kind, this->isolate(), info_.get(), options));
+    pipeline_data_->InitializeGraphComponent(nullptr,
+                                             Graph::Origin::kPureTurboshaft);
+  }
+
+  void TearDown() override {
+    pipeline_data_.reset();
+    info_.reset();
+  }
 
   ZoneStats zone_stats_{this->zone()->allocator()};
+  std::unique_ptr<OptimizedCompilationInfo> info_;
   std::unique_ptr<turboshaft::PipelineData> pipeline_data_;
 };
 
 }  // namespace v8::internal::compiler::turboshaft
+
+#endif  // V8_UNITTESTS_COMPILER_TURBOSHAFT_REDUCER_TEST_H_

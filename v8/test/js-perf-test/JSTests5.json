@@ -246,6 +246,17 @@
       ]
     },
     {
+      "name": "IteratorsWithOptimization",
+      "path": ["Iterators"],
+      "main": "run.js",
+      "resources": ["forof.js"],
+      "flags": ["--for_of_optimization", "--maglev", "--no-turbofan"],
+      "results_regexp": "^%s\\-Iterators\\(Score\\): (.+)$",
+      "tests": [
+        {"name": "ForOf"}
+        ]
+    },
+    {
       "name": "StringIterators",
       "path": ["StringIterators"],
       "main": "run.js",
@@ -641,6 +652,14 @@
             {"name": "JSLoop"},
             {"name": "PureJSLoop"}
           ]
+        },
+        {
+          "name": "AdditiveSafeIntFeedback",
+          "main": "run.js",
+          "flags": [],
+          "resources": ["additiveSafeIntFeedback.js"],
+          "test_flags": ["additiveSafeIntFeedback"],
+          "results_regexp": "^AdditiveSafeIntFeedback\\-TurboFan\\(Score\\): (.+)$"
         }
       ]
     },

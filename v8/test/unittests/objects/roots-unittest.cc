@@ -3,8 +3,8 @@
 // found in the LICENSE file.
 
 #include "src/common/globals.h"
+#include "src/heap/base-page.h"
 #include "src/heap/heap-inl.h"
-#include "src/heap/memory-chunk-metadata.h"
 #include "src/objects/cell.h"
 #include "src/objects/feedback-cell.h"
 #include "src/objects/script.h"
@@ -59,10 +59,12 @@ bool CanBeInReadOnlySpace(Factory* factory, Handle<Object> object) {
   V(shared_wasm_memories)                 \
   V(materialized_objects)                 \
   V(public_symbol_table)                  \
+  V(regexp_split_cache)                   \
   V(serialized_global_proxy_sizes)        \
   V(serialized_objects)                   \
   IF_WASM(V, js_to_wasm_wrappers)         \
   IF_WASM(V, wasm_canonical_rtts)         \
+  IF_WASM(V, wasm_shared_canonical_rtts)  \
   V(weak_refs_keep_during_job)
 
 #define TEST_CAN_BE_READ_ONLY(name) \
@@ -82,7 +84,7 @@ bool CanBeInReadOnlySpace(Factory* factory, Handle<Object> object) {
 
 // Some mutable roots may initially point to undefined until they are properly
 // initialized.
-bool IsUninitialized(DirectHandle<Object> object) {
+bool IsUninitializedHole(DirectHandle<Object> object) {
   return !IsTrustedObject(*object) && IsUndefined(*object);
 }
 }  // namespace
@@ -94,7 +96,7 @@ bool IsUninitialized(DirectHandle<Object> object) {
   Handle<Object> name = factory->name();                             \
   CHECK_EQ(*name, heap->name());                                     \
   if (IsHeapObject(*name) && !CanBeInReadOnlySpace(factory, name) && \
-      !IsUninitialized(name)) {                                      \
+      !IsUninitializedHole(name)) {                                  \
     CHECK_NE(RO_SPACE, GetSpaceFromObject(Cast<HeapObject>(*name))); \
   }
 
@@ -112,6 +114,9 @@ TEST_F(RootsTest, TestHeapNumberList) {
   ReadOnlyRoots roots(isolate());
   for (auto pos = RootIndex::kFirstReadOnlyRoot;
        pos <= RootIndex::kLastReadOnlyRoot; ++pos) {
+#if V8_ENABLE_WEBASSEMBLY
+    if (pos == RootIndex::kWasmNull) continue;
+#endif  // V8_ENABLE_WEBASSEMBLY
     auto obj = roots.object_at(pos);
     bool in_nr_range = pos >= RootIndex::kFirstHeapNumberRoot &&
                        pos <= RootIndex::kLastHeapNumberRoot;

@@ -99,7 +99,7 @@ class ReferenceSummarizerMarkingVisitor
                            0 /*code_flushing_increase*/),
         marking_state_(marking_state) {}
 
-  template <typename TSlot>
+  template <typename TSlot, RecordYoungSlot kRecordYoung = RecordYoungSlot::kNo>
   void RecordSlot(Tagged<HeapObject> object, TSlot slot,
                   Tagged<HeapObject> target) {}
 
@@ -143,7 +143,7 @@ ReferenceSummary ReferenceSummary::SummarizeReferencesFrom(
   ReferenceSummarizerMarkingState marking_state(obj);
 
   ReferenceSummarizerMarkingVisitor visitor(heap, &marking_state);
-  visitor.Visit(obj->map(heap->isolate()), obj);
+  visitor.Visit(obj->map(), obj);
 
   return marking_state.DestructivelyRetrieveReferences();
 }

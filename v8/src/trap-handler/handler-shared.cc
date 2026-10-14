@@ -24,18 +24,16 @@ namespace v8 {
 namespace internal {
 namespace trap_handler {
 
-// We declare this as int rather than bool as a workaround for a glibc bug, in
-// which the dynamic loader cannot handle executables whose TLS area is only
-// 1 byte in size; see https://sourceware.org/bugzilla/show_bug.cgi?id=14898.
-thread_local int g_thread_in_wasm_code;
-
-static_assert(sizeof(g_thread_in_wasm_code) > 1,
-              "sizeof(thread_local_var) must be > 1, see "
-              "https://sourceware.org/bugzilla/show_bug.cgi?id=14898");
+#if defined(V8_OS_AIX)
+__thread bool TrapHandlerGuard::is_active_ = 0;
+#else
+thread_local bool TrapHandlerGuard::is_active_ = 0;
+#endif
 
 size_t gNumCodeObjects = 0;
 CodeProtectionInfoListEntry* gCodeObjects = nullptr;
 SandboxRecord* gSandboxRecordsHead = nullptr;
+CoveredMemoryRecord* gCoveredMemoryRecordsHead = nullptr;
 std::atomic_size_t gRecoveredTrapCount = {0};
 std::atomic<uintptr_t> gLandingPad = {0};
 
@@ -43,34 +41,58 @@ std::atomic<uintptr_t> gLandingPad = {0};
     __cpp_lib_atomic_value_initialization < 201911L
 std::atomic_flag MetadataLock::spinlock_ = ATOMIC_FLAG_INIT;
 std::atomic_flag SandboxRecordsLock::spinlock_ = ATOMIC_FLAG_INIT;
+std::atomic_flag CoveredMemoryRecordsLock::spinlock_ = ATOMIC_FLAG_INIT;
 #else
 std::atomic_flag MetadataLock::spinlock_;
 std::atomic_flag SandboxRecordsLock::spinlock_;
+std::atomic_flag CoveredMemoryRecordsLock::spinlock_;
 #endif
 
 MetadataLock::MetadataLock() {
-  if (g_thread_in_wasm_code) {
-    abort();
-  }
+  // This lock is taken from inside the trap handler. As such, we must only
+  // take this lock if the trap handler guard is active on this thread. This
+  // way, we avoid a deadlock in case we cause a fault while holding the lock.
+  TH_CHECK(TrapHandlerGuard::IsActiveOnCurrentThread());
 
   while (spinlock_.test_and_set(std::memory_order_acquire)) {
   }
 }
 
 MetadataLock::~MetadataLock() {
-  if (g_thread_in_wasm_code) {
-    abort();
-  }
+  TH_CHECK(TrapHandlerGuard::IsActiveOnCurrentThread());
 
   spinlock_.clear(std::memory_order_release);
 }
 
 SandboxRecordsLock::SandboxRecordsLock() {
+  // This lock is taken from inside the trap handler. As such, we must only
+  // take this lock if the trap handler guard is active on this thread. This
+  // way, we avoid a deadlock in case we cause a fault while holding the lock.
+  TH_CHECK(TrapHandlerGuard::IsActiveOnCurrentThread());
+
   while (spinlock_.test_and_set(std::memory_order_acquire)) {
   }
 }
 
 SandboxRecordsLock::~SandboxRecordsLock() {
+  TH_CHECK(TrapHandlerGuard::IsActiveOnCurrentThread());
+
+  spinlock_.clear(std::memory_order_release);
+}
+
+CoveredMemoryRecordsLock::CoveredMemoryRecordsLock() {
+  // This lock is taken from inside the trap handler. As such, we must only
+  // take this lock if the trap handler guard is active on this thread. This
+  // way, we avoid a deadlock in case we cause a fault while holding the lock.
+  TH_CHECK(TrapHandlerGuard::IsActiveOnCurrentThread());
+
+  while (spinlock_.test_and_set(std::memory_order_acquire)) {
+  }
+}
+
+CoveredMemoryRecordsLock::~CoveredMemoryRecordsLock() {
+  TH_CHECK(TrapHandlerGuard::IsActiveOnCurrentThread());
+
   spinlock_.clear(std::memory_order_release);
 }
 

@@ -93,7 +93,6 @@ class BytecodeGraphTester {
   BytecodeGraphTester(Isolate* isolate, const char* script,
                       const char* filter = kFunctionName)
       : isolate_(isolate), script_(script) {
-    i::v8_flags.always_turbofan = false;
     i::v8_flags.allow_natives_syntax = true;
   }
   virtual ~BytecodeGraphTester() = default;
@@ -224,9 +223,9 @@ class RunBytecodeGraphBuilderTest : public TestWithNativeContext {
 
     for (size_t i = 0; i < arraysize(snippets); i++) {
       if ((i % 2) != shard) continue;
-      base::ScopedVector<char> script(3072);
-      SNPrintF(script, "function %s(p1) { %s };\n%s({});", kFunctionName,
-               snippets[i].code_snippet, kFunctionName);
+      auto script = base::OwnedVector<char>::NewForOverwrite(3072);
+      SNPrintF(script.as_vector(), "function %s(p1) { %s };\n%s({});",
+               kFunctionName, snippets[i].code_snippet, kFunctionName);
 
       BytecodeGraphTester tester(i_isolate(), script.begin());
       auto callable = tester.GetCallable<Handle<Object>>();
@@ -271,9 +270,9 @@ class RunBytecodeGraphBuilderTest : public TestWithNativeContext {
 
     for (size_t i = 0; i < arraysize(snippets); i++) {
       if ((i % 2) != shard) continue;
-      base::ScopedVector<char> script(2048);
-      SNPrintF(script, "function %s(p1, p2) { %s };\n%s({});", kFunctionName,
-               snippets[i].code_snippet, kFunctionName);
+      auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+      SNPrintF(script.as_vector(), "function %s(p1, p2) { %s };\n%s({});",
+               kFunctionName, snippets[i].code_snippet, kFunctionName);
 
       BytecodeGraphTester tester(isolate, script.begin());
       auto callable = tester.GetCallable<Handle<Object>>();
@@ -393,8 +392,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderReturnStatements) {
       {"return NaN;", {factory->nan_value()}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -417,8 +416,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderPrimitiveExpressions) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -470,9 +469,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderTwoParameterTests) {
        {MakeString("abcdef"), MakeString("abc"), MakeString("def")}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1, p2) { %s }\n%s(0, 0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1, p2) { %s }\n%s(0, 0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>, Handle<Object>>();
@@ -503,9 +502,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderNamedLoad) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1) { %s };\n%s(0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s };\n%s(0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -548,9 +547,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderKeyedLoad) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1, p2) { %s };\n%s(0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1, p2) { %s };\n%s(0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>, Handle<Object>>();
@@ -581,9 +580,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderPropertyCall) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1) { %s };\n%s({func() {}});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s };\n%s({func() {}});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -721,8 +720,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderToName) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s({});", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s({});", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -746,9 +745,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLogicalNot) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s }\n%s({});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s }\n%s({});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -773,9 +772,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderTypeOf) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s }\n%s({});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s }\n%s({});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -815,9 +814,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderCompareTypeOf) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s }\n%s({});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s }\n%s({});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -861,9 +860,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderCountOperation) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s }\n%s({});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s }\n%s({});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -892,9 +891,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderDelete) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s }\n%s({});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s }\n%s({});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -943,8 +942,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderDeleteGlobal) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s %s({});", snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s %s({});", snippets[i].code_snippet,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -978,9 +978,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderDeleteLookupSlot) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s %s %s", function_prologue, snippets[i].code_snippet,
-             function_epilogue);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s %s %s", function_prologue,
+             snippets[i].code_snippet, function_epilogue);
 
     BytecodeGraphTester tester(isolate, script.begin(), "t");
     auto callable = tester.GetCallable<>();
@@ -1017,9 +1017,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLookupSlot) {
        {factory->NewNumber(23.456)}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s %s %s", function_prologue, snippets[i].code_snippet,
-             function_epilogue);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s %s %s", function_prologue,
+             snippets[i].code_snippet, function_epilogue);
 
     BytecodeGraphTester tester(isolate, script.begin(), "t");
     auto callable = tester.GetCallable<>();
@@ -1042,10 +1042,11 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLookupContextSlot) {
       {"'use strict'; eval('var x = 1'); return x;", {factory->NewNumber(0)}}};
 
   for (size_t i = 0; i < arraysize(inner_eval_snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s %s %s } ; %s() ;", kFunctionName,
-             inner_eval_prologue, inner_eval_snippets[i].code_snippet,
-             inner_eval_epilogue, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s %s %s } ; %s() ;",
+             kFunctionName, inner_eval_prologue,
+             inner_eval_snippets[i].code_snippet, inner_eval_epilogue,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1065,10 +1066,11 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLookupContextSlot) {
       {"'use strict'; var x = 0; eval('var x = 1');", {factory->NewNumber(0)}}};
 
   for (size_t i = 0; i < arraysize(outer_eval_snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s %s %s } ; %s() ;", kFunctionName,
-             outer_eval_prologue, outer_eval_snippets[i].code_snippet,
-             outer_eval_epilogue, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s %s %s } ; %s() ;",
+             kFunctionName, outer_eval_prologue,
+             outer_eval_snippets[i].code_snippet, outer_eval_epilogue,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1092,10 +1094,11 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLookupGlobalSlot) {
       {"'use strict'; eval('var x = 1'); return x;", {factory->NewNumber(0)}}};
 
   for (size_t i = 0; i < arraysize(inner_eval_snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s %s %s } ; %s() ;", kFunctionName,
-             inner_eval_prologue, inner_eval_snippets[i].code_snippet,
-             inner_eval_epilogue, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s %s %s } ; %s() ;",
+             kFunctionName, inner_eval_prologue,
+             inner_eval_snippets[i].code_snippet, inner_eval_epilogue,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1115,10 +1118,11 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLookupGlobalSlot) {
       {"'use strict'; x = 0; eval('var x = 1');", {factory->NewNumber(0)}}};
 
   for (size_t i = 0; i < arraysize(outer_eval_snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s %s %s } ; %s() ;", kFunctionName,
-             outer_eval_prologue, outer_eval_snippets[i].code_snippet,
-             outer_eval_epilogue, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s %s %s } ; %s() ;",
+             kFunctionName, outer_eval_prologue,
+             outer_eval_snippets[i].code_snippet, outer_eval_epilogue,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1157,9 +1161,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLookupSlotWide) {
        {factory->NewNumber(23.456)}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(3072);
-    SNPrintF(script, "%s %s %s", function_prologue, snippets[i].code_snippet,
-             function_epilogue);
+    auto script = base::OwnedVector<char>::NewForOverwrite(3072);
+    SNPrintF(script.as_vector(), "%s %s %s", function_prologue,
+             snippets[i].code_snippet, function_epilogue);
 
     BytecodeGraphTester tester(isolate, script.begin(), "t");
     auto callable = tester.GetCallable<>();
@@ -1184,8 +1188,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderCallLookupSlot) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1230,8 +1234,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderEval) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1255,9 +1259,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderEvalParams) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s }\n%s(0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s }\n%s(0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
     DirectHandle<Object> return_value =
@@ -1352,9 +1356,10 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderCompare) {
       factory->NewNumberFromInt(SMI_MIN)};
 
   for (size_t i = 0; i < arraysize(kCompareOperators); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1, p2) { %s }\n%s({}, {});", kFunctionName,
-             get_code_snippet(kCompareOperators[i]), kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1, p2) { %s }\n%s({}, {});",
+             kFunctionName, get_code_snippet(kCompareOperators[i]),
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>, Handle<Object>>();
@@ -1397,9 +1402,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderTestIn) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1, p2) { %s }\n%s({}, {});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1, p2) { %s }\n%s({}, {});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>, Handle<Object>>();
@@ -1426,9 +1431,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderTestInstanceOf) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s(p1) { %s }\n%s({});", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s }\n%s({});",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -1454,8 +1459,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderTryCatch) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -1490,8 +1495,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderTryFinally1) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -1512,8 +1517,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderTryFinally2) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -1539,8 +1544,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderThrow) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -1597,8 +1602,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderContext) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s", snippets[i].code_snippet);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s", snippets[i].code_snippet);
 
     BytecodeGraphTester tester(isolate, script.begin(), "f");
     auto callable = tester.GetCallable<>("f");
@@ -1659,8 +1664,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderLoadContextNoCell) {
        {factory->NewNumberFromInt(24), factory->NewNumberFromInt(4)}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s", snippets[i].code_snippet);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s", snippets[i].code_snippet);
 
     BytecodeGraphTester tester(isolate, script.begin(), "*");
     auto callable = tester.GetCallable<Handle<Object>>("f");
@@ -1689,8 +1694,9 @@ TEST_F(RunBytecodeGraphBuilderTest,
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s\n%s();", snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s\n%s();", snippets[i].code_snippet,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1729,8 +1735,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderCreateArguments) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s\n%s();", snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s\n%s();", snippets[i].code_snippet,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable =
@@ -1770,8 +1777,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderCreateRestArguments) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s\n%s();", snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s\n%s();", snippets[i].code_snippet,
+             kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable =
@@ -1801,8 +1809,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderRegExpLiterals) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(4096);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(4096);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -1836,8 +1844,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderArrayLiterals) {
        {MakeString("1t")}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(4096);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(4096);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -1894,8 +1902,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderObjectLiterals) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(4096);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(4096);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -1999,9 +2007,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderIf) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1) { %s };\n%s(0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s };\n%s(0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -2027,9 +2035,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderConditionalOperator) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1) { %s };\n%s(0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s };\n%s(0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -2072,9 +2080,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderSwitch) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1) { %s };\n%s(0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s };\n%s(0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -2119,9 +2127,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderSwitchMerge) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1) { %s };\n%s(0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1) { %s };\n%s(0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>>();
@@ -2176,9 +2184,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderNestedSwitch) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(2048);
-    SNPrintF(script, "function %s(p1, p2) { %s };\n%s(0, 0);", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(2048);
+    SNPrintF(script.as_vector(), "function %s(p1, p2) { %s };\n%s(0, 0);",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<Handle<Object>, Handle<Object>>();
@@ -2216,8 +2224,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderBreakableBlocks) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2262,8 +2270,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderWhile) {
        {factory->NewNumberFromInt(16)}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2308,8 +2316,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderDo) {
        {factory->NewNumber(3)}}};
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2399,8 +2407,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderFor) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2468,8 +2476,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderForIn) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2557,8 +2565,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderForOf) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2594,8 +2602,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderWithStatement) {
   };
 
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2639,8 +2647,8 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderConstDeclaration) {
 
   // Tests for sloppy mode.
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2651,9 +2659,9 @@ TEST_F(RunBytecodeGraphBuilderTest, BytecodeGraphBuilderConstDeclaration) {
 
   // Tests for strict mode.
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() {'use strict'; %s }\n%s();", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() {'use strict'; %s }\n%s();",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -2680,8 +2688,8 @@ TEST_F(RunBytecodeGraphBuilderTest,
 
   // Tests for sloppy mode.
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2692,9 +2700,9 @@ TEST_F(RunBytecodeGraphBuilderTest,
 
   // Tests for strict mode.
   for (size_t i = 0; i < arraysize(snippets); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() {'use strict'; %s }\n%s();", kFunctionName,
-             snippets[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() {'use strict'; %s }\n%s();",
+             kFunctionName, snippets[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     auto callable = tester.GetCallable<>();
@@ -2739,9 +2747,9 @@ TEST_F(RunBytecodeGraphBuilderTest,
        {handle(Smi::FromInt(-1), isolate)}}};
 
   for (size_t i = 0; i < arraysize(const_decl); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "%s %s %s", prologue, const_decl[i].code_snippet,
-             epilogue);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "%s %s %s", prologue,
+             const_decl[i].code_snippet, epilogue);
 
     BytecodeGraphTester tester(isolate, script.begin(), "*");
     auto callable = tester.GetCallable<>();
@@ -2771,8 +2779,8 @@ TEST_F(RunBytecodeGraphBuilderTest,
 
   // Tests for sloppy mode.
   for (size_t i = 0; i < arraysize(illegal_const_decl); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() { %s }\n%s();", kFunctionName,
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() { %s }\n%s();", kFunctionName,
              illegal_const_decl[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
@@ -2785,9 +2793,9 @@ TEST_F(RunBytecodeGraphBuilderTest,
 
   // Tests for strict mode.
   for (size_t i = 0; i < arraysize(illegal_const_decl); i++) {
-    base::ScopedVector<char> script(1024);
-    SNPrintF(script, "function %s() {'use strict'; %s }\n%s();", kFunctionName,
-             illegal_const_decl[i].code_snippet, kFunctionName);
+    auto script = base::OwnedVector<char>::NewForOverwrite(1024);
+    SNPrintF(script.as_vector(), "function %s() {'use strict'; %s }\n%s();",
+             kFunctionName, illegal_const_decl[i].code_snippet, kFunctionName);
 
     BytecodeGraphTester tester(isolate, script.begin());
     v8::Local<v8::String> message = tester.CheckThrowsReturnMessage()->Get();

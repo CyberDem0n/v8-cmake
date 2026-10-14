@@ -136,7 +136,7 @@ CallDescriptor* CreateRandomCallDescriptor(Zone* zone, size_t return_count,
 
 std::shared_ptr<wasm::NativeModule> AllocateNativeModule(i::Isolate* isolate,
                                                          size_t code_size) {
-  auto module = std::make_shared<wasm::WasmModule>(wasm::kWasmOrigin);
+  auto module = std::make_shared<wasm::WasmModule>();
   module->num_declared_functions = 1;
 
   // We have to add the code object to a NativeModule, because the
@@ -147,6 +147,11 @@ std::shared_ptr<wasm::NativeModule> AllocateNativeModule(i::Isolate* isolate,
       wasm::CompileTimeImports{}, std::move(module), code_size);
   native_module->SetWireBytes({});
   return native_module;
+}
+
+V8_SYMBOL_USED extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv) {
+  v8_fuzzer::FuzzerSupport::InitializeFuzzerSupport(argc, argv);
+  return 0;
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {

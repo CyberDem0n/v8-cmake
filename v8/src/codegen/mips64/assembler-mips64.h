@@ -54,6 +54,10 @@ namespace internal {
 
 class SafepointTableBuilder;
 
+namespace regexp {
+class RegExpMacroAssemblerMIPS;
+}
+
 // -----------------------------------------------------------------------------
 // Machine instruction Operands.
 constexpr int kSmiShift = kSmiTagSize + kSmiShiftSize;
@@ -173,6 +177,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
 
   // Unused on this architecture.
   void MaybeEmitOutOfLineConstantPool() {}
+  void ClearInternalState() {}
 
   // Mips uses BlockTrampolinePool to prevent generating trampoline inside a
   // continuous instruction block. For Call instruction, it prevents generating
@@ -348,6 +353,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void DataAlign(int m);
   // Aligns code to something that's optimal for a jump target for the platform.
   void CodeTargetAlign();
+  void SwitchTargetAlign() { CodeTargetAlign(); }
+  void BranchTargetAlign() {}
   void LoopHeaderAlign() { CodeTargetAlign(); }
 
   // Different nop operations are used by the code generator to detect certain
@@ -1658,9 +1665,6 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void set_pc_for_safepoint() { pc_for_safepoint_ = pc_; }
 
  private:
-  // Avoid overflows for displacements etc.
-  static const int kMaximalBufferSize = 512 * MB;
-
   // Buffer size and constant pool distance are checked together at regular
   // intervals of kBufferCheckInterval emitted bytes.
   static constexpr int kBufferCheckInterval = 1 * KB / 2;
@@ -1918,11 +1922,11 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   RegList scratch_register_list_;
 
  private:
-  void AllocateAndInstallRequestedHeapNumbers(LocalIsolate* isolate);
+  void PatchInHeapNumberRequest(Address pc, Handle<HeapNumber> object) override;
 
   int WriteCodeComments();
 
-  friend class RegExpMacroAssemblerMIPS;
+  friend class regexp::RegExpMacroAssemblerMIPS;
   friend class RelocInfo;
   friend class BlockTrampolinePoolScope;
   friend class EnsureSpace;

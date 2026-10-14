@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 // Flags: --allow-natives-syntax --turbofan
-// Flags: --no-always-turbofan --no-always-sparkplug --expose-gc
+// Flags: --no-always-sparkplug --expose-gc
 
 d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
 
@@ -20,7 +20,7 @@ function testOptimized(run, fctToOptimize) {
 
 let wasm = (function createWasmModule() {
   let builder = new WasmModuleBuilder();
-  let array = builder.addArray(kWasmI32, true);
+  let array = builder.addArray(kWasmI32);
 
   builder.addFunction('createArray', makeSig([kWasmI32], [kWasmExternRef]))
     .addBody([

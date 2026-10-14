@@ -6,9 +6,11 @@
 #define V8_COMPILER_TURBOSHAFT_FAST_API_CALL_LOWERING_REDUCER_H_
 
 #include "include/v8-fast-api-calls.h"
+#include "src/base/logging.h"
 #include "src/compiler/fast-api-calls.h"
 #include "src/compiler/globals.h"
 #include "src/compiler/turboshaft/assembler.h"
+#include "src/compiler/turboshaft/builtin-call-descriptors.h"
 #include "src/compiler/turboshaft/copying-phase.h"
 #include "src/compiler/turboshaft/index.h"
 #include "src/compiler/turboshaft/operations.h"
@@ -25,8 +27,8 @@ class FastApiCallLoweringReducer : public Next {
   TURBOSHAFT_REDUCER_BOILERPLATE(FastApiCallLowering)
 
   OpIndex REDUCE(FastApiCall)(
-      V<FrameState> frame_state, V<Object> data_argument, V<Context> context,
-      base::Vector<const OpIndex> arguments,
+      V<LazyFrameState> frame_state, V<Object> data_argument,
+      V<Context> context, base::Vector<const OpIndex> arguments,
       const FastApiCallParameters* parameters,
       base::Vector<const RegisterRepresentation> out_reps) {
     __ data() -> set_graph_has_lowered_fast_api_calls();
@@ -46,8 +48,8 @@ class FastApiCallLoweringReducer : public Next {
 
     base::SmallVector<OpIndex, 16> args;
     for (int i = 0; i < c_arg_count; ++i) {
-        CTypeInfo type = c_signature->ArgumentInfo(i);
-        args.push_back(AdaptFastCallArgument(arguments[i], type, handle_error));
+      CTypeInfo type = c_signature->ArgumentInfo(i);
+      args.push_back(AdaptFastCallArgument(arguments[i], type, handle_error));
     }
 
     // While adapting the arguments, we might have noticed an inconsistency that
@@ -62,12 +64,7 @@ class FastApiCallLoweringReducer : public Next {
 
       for (int i = 0; i < c_arg_count; ++i) {
         CTypeInfo type = c_signature->ArgumentInfo(i);
-        START_ALLOW_USE_DEPRECATED()
-        MachineType machine_type =
-            type.GetSequenceType() == CTypeInfo::SequenceType::kScalar
-                ? MachineType::TypeForCType(type)
-                : MachineType::AnyTagged();
-        END_ALLOW_USE_DEPRECATED()
+        MachineType machine_type = MachineType::TypeForCType(type);
         builder.AddParam(machine_type);
       }
 
@@ -98,33 +95,49 @@ class FastApiCallLoweringReducer : public Next {
       }
 
       // Build the actual call.
+      // For Wasm Fast API Call wrappers, we don't have a frame state, and
+      // avoid the need for it by calling the WasmPropagateException builtin
+      // below.
       const TSCallDescriptor* call_descriptor = TSCallDescriptor::Create(
-          Linkage::GetSimplifiedCDescriptor(__ graph_zone(), builder.Get(),
-                                            CallDescriptor::kNeedsFrameState),
-          CanThrow::kYes, LazyDeoptOnThrow::kNo, __ graph_zone());
+          Linkage::GetSimplifiedCDescriptor(
+              __ graph_zone(), builder.Get(),
+              frame_state.valid() ? CallDescriptor::kNeedsFrameState
+                                  : CallDescriptor::kNoFlags),
+          CanThrow{true}, LazyDeoptOnThrow{false}, __ graph_zone());
       OpIndex c_call_result = WrapFastCall(call_descriptor, callee, frame_state,
                                            context, base::VectorOf(args));
 
       Label<> trigger_exception(this);
 
       V<Object> exception =
-          __ Load(__ ExternalConstant(ExternalReference::Create(
-                      IsolateAddressId::kExceptionAddress, isolate_)),
+          __ Load(__ IsolateField(IsolateFieldId::kException),
                   LoadOp::Kind::RawAligned(), MemoryRepresentation::UintPtr());
-      GOTO_IF_NOT(LIKELY(__ TaggedEqual(
-                      exception,
-                      __ HeapConstant(isolate_->factory()->the_hole_value()))),
-                  trigger_exception);
+      GOTO_IF_NOT(
+          LIKELY(__ TaggedEqual(
+              exception, __ template LoadRoot<RootIndex::kTheHoleValue>())),
+          trigger_exception);
 
       V<Any> fast_call_result = ConvertReturnValue(c_signature, c_call_result);
       __ SetVariable(result, fast_call_result);
 
       GOTO(done, FastApiCallOp::kSuccessValue);
       BIND(trigger_exception);
-      __ template CallRuntime<
-          typename RuntimeCallDescriptor::PropagateException>(
-          isolate_, frame_state, __ NoContextConstant(), LazyDeoptOnThrow::kNo,
-          {});
+      if (frame_state.valid()) {
+        __ template CallRuntime<typename runtime::PropagateException>(
+            frame_state, context, {}, LazyDeoptOnThrow{false});
+      } else {
+#if V8_ENABLE_WEBASSEMBLY
+        using Desc = deprecated::BuiltinCallDescriptor::WasmPropagateException;
+        OpIndex propagate_exception_builtin =
+            __ SmiConstant(Smi::FromInt(static_cast<int>(Desc::kFunction)));
+        __ Call(
+            propagate_exception_builtin, OpIndex::Invalid(), {},
+            Desc::Create(StubCallMode::kCallBuiltinPointer, __ graph_zone()),
+            Desc::kEffects);
+#else
+        UNREACHABLE();
+#endif  // V8_ENABLE_WEBASSEMBLY
+      }
 
       __ Unreachable();
     }
@@ -137,7 +150,7 @@ class FastApiCallLoweringReducer : public Next {
     }
 
     BIND(done, state);
-    return __ Tuple(state, __ GetVariable(result));
+    return __ MakeTuple(state, __ GetVariable(result));
   }
 
  private:
@@ -151,124 +164,125 @@ class FastApiCallLoweringReducer : public Next {
 
   OpIndex AdaptFastCallArgument(OpIndex argument, CTypeInfo arg_type,
                                 Label<>& handle_error) {
-    START_ALLOW_USE_DEPRECATED()
-    switch (arg_type.GetSequenceType()) {
-      case CTypeInfo::SequenceType::kScalar: {
-        uint8_t flags = static_cast<uint8_t>(arg_type.GetFlags());
-        if (flags & static_cast<uint8_t>(CTypeInfo::Flags::kEnforceRangeBit)) {
-          switch (arg_type.GetType()) {
-            case CTypeInfo::Type::kInt32: {
-              auto result = __ TryTruncateFloat64ToInt32(argument);
-              return Checked(result, handle_error);
-            }
-            case CTypeInfo::Type::kUint32: {
-              auto result = __ TryTruncateFloat64ToUint32(argument);
-              return Checked(result, handle_error);
-            }
-            case CTypeInfo::Type::kInt64: {
-              auto result = __ TryTruncateFloat64ToInt64(argument);
-              return Checked(result, handle_error);
-            }
-            case CTypeInfo::Type::kUint64: {
-              auto result = __ TryTruncateFloat64ToUint64(argument);
-              return Checked(result, handle_error);
-            }
-            default: {
-              GOTO(handle_error);
-              return argument;
-            }
-          }
-        } else if (flags & static_cast<uint8_t>(CTypeInfo::Flags::kClampBit)) {
-          return ClampFastCallArgument(argument, arg_type.GetType());
-        } else {
-          switch (arg_type.GetType()) {
-            case CTypeInfo::Type::kV8Value: {
-              return __ AdaptLocalArgument(argument);
-            }
-            case CTypeInfo::Type::kFloat32: {
-              return __ TruncateFloat64ToFloat32(argument);
-            }
-            case CTypeInfo::Type::kPointer: {
-              // Check that the value is a HeapObject.
-              GOTO_IF(__ ObjectIsSmi(argument), handle_error);
-              Label<WordPtr> done(this);
-
-              // Check if the value is null.
-              GOTO_IF(UNLIKELY(__ TaggedEqual(
-                          argument, __ HeapConstant(factory_->null_value()))),
-                      done, 0);
-
-              // Check that the value is a JSExternalObject.
-              GOTO_IF_NOT(
-                  __ TaggedEqual(__ LoadMapField(argument),
-                                 __ HeapConstant(factory_->external_map())),
-                  handle_error);
-
-              GOTO(done, __ template LoadField<WordPtr>(
-                             V<HeapObject>::Cast(argument),
-                             AccessBuilder::ForJSExternalObjectValue()));
-
-              BIND(done, result);
-              return result;
-            }
-            case CTypeInfo::Type::kSeqOneByteString: {
-              // Check that the value is a HeapObject.
-              GOTO_IF(__ ObjectIsSmi(argument), handle_error);
-              V<HeapObject> argument_obj = V<HeapObject>::Cast(argument);
-
-              V<Map> map = __ LoadMapField(argument_obj);
-              V<Word32> instance_type = __ LoadInstanceTypeField(map);
-
-              V<Word32> encoding = __ Word32BitwiseAnd(
-                  instance_type, kStringRepresentationAndEncodingMask);
-              GOTO_IF_NOT(__ Word32Equal(encoding, kSeqOneByteStringTag),
-                          handle_error);
-
-              V<WordPtr> length_in_bytes = __ template LoadField<WordPtr>(
-                  argument_obj, AccessBuilder::ForStringLength());
-              V<WordPtr> data_ptr = __ GetElementStartPointer(
-                  argument_obj, AccessBuilder::ForSeqOneByteStringCharacter());
-
-              constexpr int kAlign = alignof(FastOneByteString);
-              constexpr int kSize = sizeof(FastOneByteString);
-              static_assert(kSize == sizeof(uintptr_t) + sizeof(size_t),
-                            "The size of "
-                            "FastOneByteString isn't equal to the sum of its "
-                            "expected members.");
-              OpIndex stack_slot = __ StackSlot(kSize, kAlign);
-              __ StoreOffHeap(stack_slot, data_ptr,
-                              MemoryRepresentation::UintPtr());
-              __ StoreOffHeap(stack_slot, length_in_bytes,
-                              MemoryRepresentation::Uint32(), sizeof(size_t));
-              static_assert(sizeof(uintptr_t) == sizeof(size_t),
-                            "The string length can't "
-                            "fit the PointerRepresentation used to store it.");
-              return stack_slot;
-            }
-            default: {
-              return argument;
-            }
-          }
+    uint8_t flags = static_cast<uint8_t>(arg_type.GetFlags());
+    if (flags & static_cast<uint8_t>(CTypeInfo::Flags::kEnforceRangeBit)) {
+      switch (arg_type.GetType()) {
+        case CTypeInfo::Type::kInt32: {
+          auto result = __ TryTruncateFloat64ToInt32(argument);
+          return Checked(result, handle_error);
+        }
+        case CTypeInfo::Type::kUint32: {
+          auto result = __ TryTruncateFloat64ToUint32(argument);
+          return Checked(result, handle_error);
+        }
+        case CTypeInfo::Type::kInt64: {
+          auto result = __ TryTruncateFloat64ToInt64(argument);
+          return Checked(result, handle_error);
+        }
+        case CTypeInfo::Type::kUint64: {
+          auto result = __ TryTruncateFloat64ToUint64(argument);
+          return Checked(result, handle_error);
+        }
+        default: {
+          GOTO(handle_error);
+          return argument;
         }
       }
-      case CTypeInfo::SequenceType::kIsSequence: {
-        CHECK_EQ(arg_type.GetType(), CTypeInfo::Type::kVoid);
+    } else if (flags & static_cast<uint8_t>(CTypeInfo::Flags::kClampBit)) {
+      return ClampFastCallArgument(argument, arg_type.GetType());
+    } else {
+      switch (arg_type.GetType()) {
+        case CTypeInfo::Type::kV8Value: {
+          return __ AdaptLocalArgument(argument);
+        }
+        case CTypeInfo::Type::kFloat32: {
+          // When Wasm performs a Fast API Call, it'll provide a float32 value.
+          // Only JavaScript needs a truncation here.
+          if (__ Get(argument).outputs_rep()[0] ==
+              RegisterRepresentation::Float32()) {
+            if (flags &
+                static_cast<uint8_t>(CTypeInfo::Flags::kIsRestrictedBit)) {
+              GOTO_IF_NOT(__ Float32IsFinite(argument), handle_error);
+            }
+            return argument;
+          }
+          V<Float32> result = __ TruncateFloat64ToFloat32(argument);
+          if (flags &
+              static_cast<uint8_t>(CTypeInfo::Flags::kIsRestrictedBit)) {
+            GOTO_IF_NOT(__ Float32IsFinite(result), handle_error);
+          }
+          return result;
+        }
+        case CTypeInfo::Type::kFloat64: {
+          if (flags &
+              static_cast<uint8_t>(CTypeInfo::Flags::kIsRestrictedBit)) {
+            GOTO_IF_NOT(__ Float64IsFinite(argument), handle_error);
+          }
+          return argument;
+        }
+        case CTypeInfo::Type::kPointer: {
+          // Check that the value is a HeapObject.
+          GOTO_IF(__ ObjectIsSmi(argument), handle_error);
+          Label<WordPtr> done(this);
 
-        // Check that the value is a HeapObject.
-        GOTO_IF(__ ObjectIsSmi(argument), handle_error);
+          // Check if the value is null.
+          GOTO_IF(UNLIKELY(__ TaggedEqual(
+                      argument, __ template LoadRoot<RootIndex::kNullValue>())),
+                  done, 0);
 
-        // Check that the value is a JSArray.
-        V<Map> map = __ LoadMapField(argument);
-        V<Word32> instance_type = __ LoadInstanceTypeField(map);
-        GOTO_IF_NOT(__ Word32Equal(instance_type, JS_ARRAY_TYPE), handle_error);
+          // Check that the value is a JSExternalObject.
+          GOTO_IF_NOT(
+              __ TaggedEqual(__ LoadMapField(argument),
+                             __ template LoadRoot<RootIndex::kExternalMap>()),
+              handle_error);
 
-        return __ AdaptLocalArgument(argument);
-      }
-      default: {
-        UNREACHABLE();
+          GOTO(done, __ template LoadField<WordPtr>(
+                         V<HeapObject>::Cast(argument),
+                         AccessBuilder::ForJSExternalObjectValue()));
+
+          BIND(done, result);
+          return result;
+        }
+        case CTypeInfo::Type::kSeqOneByteString: {
+          // Check that the value is a HeapObject.
+          GOTO_IF(__ ObjectIsSmi(argument), handle_error);
+          V<HeapObject> argument_obj = V<HeapObject>::Cast(argument);
+
+          V<Map> map = __ LoadMapField(argument_obj);
+          V<Word32> instance_type = __ LoadInstanceTypeField(map);
+
+          V<Word32> encoding = __ Word32BitwiseAnd(
+              instance_type,
+              kIsNotStringMask | kStringRepresentationAndEncodingMask);
+          GOTO_IF_NOT(__ Word32Equal(encoding, kSeqOneByteStringTag),
+                      handle_error);
+
+          V<WordPtr> length_in_bytes = __ template LoadField<WordPtr>(
+              argument_obj, AccessBuilder::ForStringLength());
+          V<WordPtr> data_ptr = __ GetElementStartPointer(
+              argument_obj, AccessBuilder::ForSeqOneByteStringCharacter());
+
+          constexpr int kAlign = alignof(FastOneByteString);
+          constexpr int kSize = sizeof(FastOneByteString);
+          static_assert(kSize == sizeof(uintptr_t) + sizeof(size_t),
+                        "The size of "
+                        "FastOneByteString isn't equal to the sum of its "
+                        "expected members.");
+          OpIndex stack_slot = __ StackSlot(kSize, kAlign);
+          __ StoreOffHeap(stack_slot, data_ptr,
+                          MemoryRepresentation::UintPtr());
+          __ StoreOffHeap(stack_slot, length_in_bytes,
+                          MemoryRepresentation::Uint32(), sizeof(size_t));
+          static_assert(sizeof(uintptr_t) == sizeof(size_t),
+                        "The string length can't "
+                        "fit the PointerRepresentation used to store it.");
+          return stack_slot;
+        }
+        default: {
+          return argument;
+        }
       }
     }
-    END_ALLOW_USE_DEPRECATED()
   }
 
   OpIndex ClampFastCallArgument(V<Float64> argument,
@@ -324,7 +338,7 @@ class FastApiCallLoweringReducer : public Next {
   V<Any> DefaultReturnValue(const CFunctionInfo* c_signature) {
     switch (c_signature->ReturnInfo().GetType()) {
       case CTypeInfo::Type::kVoid:
-        return __ HeapConstant(factory_->undefined_value());
+        return __ template LoadRoot<RootIndex::kUndefinedValue>();
       case CTypeInfo::Type::kBool:
       case CTypeInfo::Type::kInt32:
       case CTypeInfo::Type::kUint32:
@@ -344,7 +358,7 @@ class FastApiCallLoweringReducer : public Next {
       case CTypeInfo::Type::kFloat64:
         return __ Float64Constant(0);
       case CTypeInfo::Type::kPointer:
-        return __ HeapConstant(factory_->undefined_value());
+        return __ template LoadRoot<RootIndex::kUndefinedValue>();
       case CTypeInfo::Type::kAny:
       case CTypeInfo::Type::kSeqOneByteString:
       case CTypeInfo::Type::kV8Value:
@@ -352,15 +366,16 @@ class FastApiCallLoweringReducer : public Next {
       case CTypeInfo::Type::kUint8:
         UNREACHABLE();
     }
+    UNREACHABLE();
   }
 
   V<Any> ConvertReturnValue(const CFunctionInfo* c_signature, OpIndex result) {
     switch (c_signature->ReturnInfo().GetType()) {
       case CTypeInfo::Type::kVoid:
-        return __ HeapConstant(factory_->undefined_value());
+        return __ template LoadRoot<RootIndex::kUndefinedValue>();
       case CTypeInfo::Type::kBool:
         static_assert(sizeof(bool) == 1, "unsupported bool size");
-        return __ Word32BitwiseAnd(result, __ Word32Constant(0xFF));
+        return __ Word32BitwiseAnd(result, 0xFF);
       case CTypeInfo::Type::kInt32:
       case CTypeInfo::Type::kUint32:
       case CTypeInfo::Type::kFloat32:
@@ -394,6 +409,7 @@ class FastApiCallLoweringReducer : public Next {
       case CTypeInfo::Type::kUint8:
         UNREACHABLE();
     }
+    UNREACHABLE();
   }
 
   V<HeapObject> BuildAllocateJSExternalObject(V<WordPtr> pointer) {
@@ -401,14 +417,14 @@ class FastApiCallLoweringReducer : public Next {
 
     // Check if the pointer is a null pointer.
     GOTO_IF(__ WordPtrEqual(pointer, 0), done,
-            __ HeapConstant(factory_->null_value()));
+            __ template LoadRoot<RootIndex::kNullValue>());
 
     Uninitialized<HeapObject> external = __ Allocate(
-        JSExternalObject::kHeaderSize, AllocationType::kYoung, kTaggedAligned);
+        sizeof(JSExternalObject), AllocationType::kYoung, kTaggedAligned);
     __ InitializeField(external, AccessBuilder::ForMap(),
-                       __ HeapConstant(factory_->external_map()));
+                       __ template LoadRoot<RootIndex::kExternalMap>());
     V<FixedArray> empty_fixed_array =
-        __ HeapConstant(factory_->empty_fixed_array());
+        __ template LoadRoot<RootIndex::kEmptyFixedArray>();
     __ InitializeField(external, AccessBuilder::ForJSObjectPropertiesOrHash(),
                        empty_fixed_array);
     __ InitializeField(external, AccessBuilder::ForJSObjectElements(),
@@ -430,8 +446,8 @@ class FastApiCallLoweringReducer : public Next {
     OpIndex handle = __ Call(
         allocate_and_initialize_young_external_pointer_table_entry,
         {isolate_ptr, pointer},
-        TSCallDescriptor::Create(call_descriptor, CanThrow::kNo,
-                                 LazyDeoptOnThrow::kNo, __ graph_zone()));
+        TSCallDescriptor::Create(call_descriptor, CanThrow{false},
+                                 LazyDeoptOnThrow{false}, __ graph_zone()));
     __ InitializeField(
         external, AccessBuilder::ForJSExternalObjectPointerHandle(), handle);
 #else
@@ -445,16 +461,14 @@ class FastApiCallLoweringReducer : public Next {
   }
 
   OpIndex WrapFastCall(const TSCallDescriptor* descriptor, OpIndex callee,
-                       V<FrameState> frame_state, V<Context> context,
+                       V<LazyFrameState> frame_state, V<Context> context,
                        base::Vector<const OpIndex> arguments) {
     // CPU profiler support.
     OpIndex target_address =
         __ IsolateField(IsolateFieldId::kFastApiCallTarget);
-    __ StoreOffHeap(target_address, __ BitcastHeapObjectToWordPtr(callee),
-                    MemoryRepresentation::UintPtr());
+    __ StoreOffHeap(target_address, callee, MemoryRepresentation::UintPtr());
 
-    OpIndex context_address = __ ExternalConstant(
-        ExternalReference::Create(IsolateAddressId::kContextAddress, isolate_));
+    OpIndex context_address = __ IsolateField(IsolateFieldId::kContext);
 
     __ StoreOffHeap(context_address, __ BitcastHeapObjectToWordPtr(context),
                     MemoryRepresentation::UintPtr());
@@ -475,9 +489,6 @@ class FastApiCallLoweringReducer : public Next {
 
     return result;
   }
-
-  Isolate* isolate_ = __ data() -> isolate();
-  Factory* factory_ = isolate_->factory();
 };
 
 #include "src/compiler/turboshaft/undef-assembler-macros.inc"

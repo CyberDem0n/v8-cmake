@@ -14,8 +14,13 @@
 namespace v8 {
 namespace internal {
 
+class NormalPage;
+void ForceEvacuationCandidate(NormalPage* page);
+class SemiSpaceNewSpace;
+
 class HeapInternalsBase {
  protected:
+  size_t OldGenerationSpaceAvailable(Heap* heap);
   void SimulateIncrementalMarking(Heap* heap, bool force_completion);
   void SimulateFullSpace(
       v8::internal::NewSpace* space,
@@ -23,6 +28,9 @@ class HeapInternalsBase {
   void SimulateFullSpace(v8::internal::PagedSpace* space);
   void FillCurrentPage(v8::internal::NewSpace* space,
                        std::vector<Handle<FixedArray>>* out_handles = nullptr);
+  void FillCurrentPageButNBytes(
+      v8::internal::SemiSpaceNewSpace* space, int extra_bytes,
+      std::vector<Handle<FixedArray>>* out_handles = nullptr);
 };
 
 inline void InvokeMajorGC(i::Isolate* isolate) {
@@ -44,7 +52,8 @@ inline void InvokeAtomicMajorGC(i::Isolate* isolate) {
                                  GarbageCollectionReason::kTesting);
   if (heap->sweeping_in_progress()) {
     heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+        Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+        CompleteSweepingReason::kTesting);
   }
 }
 
@@ -53,7 +62,8 @@ inline void InvokeAtomicMinorGC(i::Isolate* isolate) {
   Heap* heap = isolate->heap();
   if (heap->sweeping_in_progress()) {
     heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+        Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+        CompleteSweepingReason::kTesting);
   }
 }
 
@@ -92,6 +102,10 @@ class WithHeapInternals : public TMixin, HeapInternalsBase {
 
   Heap* heap() const { return this->i_isolate()->heap(); }
 
+  size_t OldGenerationSpaceAvailable() {
+    return HeapInternalsBase::OldGenerationSpaceAvailable(heap());
+  }
+
   void SimulateIncrementalMarking(bool force_completion = true) {
     return HeapInternalsBase::SimulateIncrementalMarking(heap(),
                                                          force_completion);
@@ -104,6 +118,13 @@ class WithHeapInternals : public TMixin, HeapInternalsBase {
   }
   void SimulateFullSpace(v8::internal::PagedSpace* space) {
     return HeapInternalsBase::SimulateFullSpace(space);
+  }
+
+  void FillCurrentPageButNBytes(
+      v8::internal::SemiSpaceNewSpace* space, int extra_bytes,
+      std::vector<Handle<FixedArray>>* out_handles = nullptr) {
+    return HeapInternalsBase::FillCurrentPageButNBytes(space, extra_bytes,
+                                                       out_handles);
   }
 
   void GrowNewSpaceToMaximumCapacity() {
@@ -120,14 +141,29 @@ class WithHeapInternals : public TMixin, HeapInternalsBase {
     InvokeMajorGC();
     InvokeMajorGC();
     heap()->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+        Heap::SweepingForcedFinalizationMode::kV8Only,
+        CompleteSweepingReason::kTesting);
     heap()->FreeMainThreadLinearAllocationAreas();
-    for (PageMetadata* page : *heap()->old_space()) {
+    for (NormalPage* page : *heap()->old_space()) {
       page->MarkNeverAllocateForTesting();
     }
   }
 
+  void ForceEvacuationCandidate(NormalPage* page) {
+    i::ForceEvacuationCandidate(page);
+  }
+
   void EmptyNewSpaceUsingGC() { InvokeMajorGC(); }
+
+  int NumberOfGlobalObjects() {
+    int count = 0;
+    HeapObjectIterator iterator(heap());
+    for (Tagged<HeapObject> obj = iterator.Next(); !obj.is_null();
+         obj = iterator.Next()) {
+      if (IsJSGlobalObject(obj)) count++;
+    }
+    return count;
+  }
 };
 
 template <typename TMixin>
@@ -191,6 +227,18 @@ class V8_NODISCARD ManualGCScope final {
   const bool flag_cppheap_concurrent_marking_;
 };
 
+class V8_NODISCARD ManualEvacuationCandidatesSelectionScope final {
+ public:
+  explicit ManualEvacuationCandidatesSelectionScope(ManualGCScope&) {
+    DCHECK(!v8_flags.manual_evacuation_candidates_selection);
+    v8_flags.manual_evacuation_candidates_selection = true;
+  }
+  ~ManualEvacuationCandidatesSelectionScope() {
+    DCHECK(v8_flags.manual_evacuation_candidates_selection);
+    v8_flags.manual_evacuation_candidates_selection = false;
+  }
+};
+
 // DisableHandleChecksForMockingScope disables the checks for v8::Local and
 // internal::DirectHandle, so that such handles can be allocated off-stack.
 // This is required for mocking functions that take such handles as parameters
@@ -211,6 +259,13 @@ class V8_NODISCARD DisableHandleChecksForMockingScope final {
   DisableHandleChecksForMockingScope() {}
 };
 #endif
+
+void AbandonCurrentlyFreeMemory(PagedSpace* space);
+
+Tagged<HeapObject> AllocateAligned(Heap* heap, MainAllocator* allocator,
+                                   int size, AllocationAlignment alignment);
+
+Address AlignOldSpace(Heap* heap, AllocationAlignment alignment, int offset);
 
 }  // namespace internal
 }  // namespace v8

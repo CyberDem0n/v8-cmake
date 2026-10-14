@@ -27,11 +27,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <cmath>
+
 #include "src/base/platform/platform.h"
 #include "src/base/strings.h"
 #include "src/base/vector.h"
 #include "src/codegen/constants-arch.h"
 #include "src/codegen/macro-assembler.h"
+#include "src/codegen/riscv/extension-riscv-zfa.h"
 #include "src/diagnostics/disasm.h"
 
 namespace v8 {
@@ -98,6 +101,8 @@ class Decoder {
   void PrintRvcImm8Addi4spn(Instruction* instr);
   void PrintRvcImm11CJ(Instruction* instr);
   void PrintRvcImm8B(Instruction* instr);
+  void PrintRvcImm2B(Instruction* instr);
+  void PrintRvcImm1H(Instruction* instr);
   void PrintRvvVm(Instruction* instr);
   void PrintAcquireRelease(Instruction* instr);
   void PrintBranchOffset(Instruction* instr);
@@ -109,6 +114,9 @@ class Decoder {
   void PrintRvvUimm5(Instruction* instr);
   void PrintRoundingMode(Instruction* instr);
   void PrintMemoryOrder(Instruction* instr, bool is_pred);
+  void PrintMopNumber(Instruction* instr);
+  void PrintFLISImm(Instruction* instr);
+  void PrintFLIDImm(Instruction* instr);
 
   // Each of these functions decodes one particular instruction type.
   void DecodeRType(Instruction* instr);
@@ -261,8 +269,8 @@ void Decoder::PrintTarget(Instruction* instr) {
   if (Assembler::IsJalr(instr->InstructionBits())) {
     if (Assembler::IsAuipc((instr - 4)->InstructionBits()) &&
         (instr - 4)->RdValue() == instr->Rs1Value()) {
-      int32_t imm = Assembler::BrachlongOffset((instr - 4)->InstructionBits(),
-                                               instr->InstructionBits());
+      int32_t imm = Assembler::BranchLongOffset((instr - 4)->InstructionBits(),
+                                                instr->InstructionBits());
       const char* target =
           converter_.NameOfAddress(reinterpret_cast<uint8_t*>(instr - 4) + imm);
       out_buffer_pos_ +=
@@ -393,6 +401,18 @@ void Decoder::PrintRvcImm8B(Instruction* instr) {
   out_buffer_pos_ += base::SNPrintF(out_buffer_ + out_buffer_pos_, "%d", imm);
 }
 
+void Decoder::PrintRvcImm2B(Instruction* instr) {
+  // Zcb byte load/store offset: uimm[1] = enc[5], uimm[0] = enc[6].
+  int32_t imm = (instr->Bits(5, 5) << 1) | instr->Bits(6, 6);
+  out_buffer_pos_ += base::SNPrintF(out_buffer_ + out_buffer_pos_, "%d", imm);
+}
+
+void Decoder::PrintRvcImm1H(Instruction* instr) {
+  // Zcb halfword load/store offset: uimm[1] = enc[5], uimm[0] = 0.
+  int32_t imm = instr->Bits(5, 5) << 1;
+  out_buffer_pos_ += base::SNPrintF(out_buffer_ + out_buffer_pos_, "%d", imm);
+}
+
 void Decoder::PrintRvvVm(Instruction* instr) {
   uint8_t imm = instr->RvvVM();
   if (imm == 0) {
@@ -500,6 +520,29 @@ void Decoder::PrintMemoryOrder(Instruction* instr, bool is_pred) {
       base::SNPrintF(out_buffer_ + out_buffer_pos_, "%s", s.c_str());
 }
 
+void Decoder::PrintMopNumber(Instruction* instr) {
+  int mop_number = instr->MopNumber();
+  out_buffer_pos_ +=
+      base::SNPrintF(out_buffer_ + out_buffer_pos_, "%02d", mop_number);
+}
+
+// Print the FLI.S immediate value as a floating-point constant.
+// The rs1 field encodes the imm5 value (0-31), which corresponds to
+// predefined floating-point constants.
+void Decoder::PrintFLISImm(Instruction* instr) {
+  uint8_t imm5 = static_cast<uint8_t>(instr->Rs1Value());
+  float value = GetFLISValue(imm5);
+
+  out_buffer_pos_ +=
+      base::SNPrintF(out_buffer_ + out_buffer_pos_, "%.3e", value);
+}
+void Decoder::PrintFLIDImm(Instruction* instr) {
+  uint8_t imm5 = static_cast<uint8_t>(instr->Rs1Value());
+  double value = GetFLIDValue(imm5);
+  out_buffer_pos_ +=
+      base::SNPrintF(out_buffer_ + out_buffer_pos_, "%.3e", value);
+}
+
 // Printing of instruction name.
 void Decoder::PrintInstructionName(Instruction* instr) {}
 
@@ -554,6 +597,17 @@ int Decoder::FormatFPURegisterOrRoundMode(Instruction* instr,
     DCHECK(STRING_STARTS_WITH(format, "frm"));
     PrintRoundingMode(instr);
     return 3;
+  } else if (format[1] == 'i') {  // 'fis or 'fid: FLI immediate values.
+    if (format[2] == 's') {
+      DCHECK(STRING_STARTS_WITH(format, "fis"));
+      PrintFLISImm(instr);
+      return 3;
+    } else if (format[2] == 'd') {
+      DCHECK(STRING_STARTS_WITH(format, "fid"));
+      PrintFLIDImm(instr);
+      return 3;
+    }
+    UNREACHABLE();
   }
   UNREACHABLE();
 }
@@ -688,8 +742,16 @@ int Decoder::FormatRvcImm(Instruction* instr, const char* format) {
       DCHECK(STRING_STARTS_WITH(format, "Cimm11CJ"));
       PrintRvcImm11CJ(instr);
       return 8;
+    } else if (format[5] == 'H') {
+      DCHECK(STRING_STARTS_WITH(format, "Cimm1H"));
+      PrintRvcImm1H(instr);
+      return 6;
     }
     UNREACHABLE();
+  } else if (format[4] == '2') {
+    DCHECK(STRING_STARTS_WITH(format, "Cimm2B"));
+    PrintRvcImm2B(instr);
+    return 6;
   }
   UNREACHABLE();
 }
@@ -838,6 +900,11 @@ int Decoder::FormatOption(Instruction* instr, const char* format) {
       DCHECK(STRING_STARTS_WITH(format, "target"));
       PrintTarget(instr);
       return 6;
+    }
+    case 'm': {  // 'mop: print MOP instr number
+      DCHECK(STRING_STARTS_WITH(format, "mop"));
+      PrintMopNumber(instr);
+      return 3;
     }
   }
   UNREACHABLE();
@@ -1202,8 +1269,14 @@ void Decoder::DecodeRFPType(Instruction* instr) {
         case 0b000:  // RO_FMIN_S
           Format(instr, "fmin.s    'fd, 'fs1, 'fs2");
           break;
+        case 0b010:  // RO_FMINM_S
+          Format(instr, "fminm.s   'fd, 'fs1, 'fs2");
+          break;
         case 0b001:  // RO_FMAX_S
           Format(instr, "fmax.s    'fd, 'fs1, 'fs2");
+          break;
+        case 0b011:  // RO_FMAXM_S
+          Format(instr, "fmaxm.s   'fd, 'fs1, 'fs2");
           break;
         default:
           UNSUPPORTED_RISCV();
@@ -1258,6 +1331,12 @@ void Decoder::DecodeRFPType(Instruction* instr) {
         case 0b000:  // RO_FLE_S
           Format(instr, "fle.s     'rd, 'fs1, 'fs2");
           break;
+        case 0b100:  // RO_FLEQ_S
+          Format(instr, "fleq.s    'rd, 'fs1, 'fs2");
+          break;
+        case 0b101:  // RO_FLTQ_S
+          Format(instr, "fltq.s    'rd, 'fs1, 'fs2");
+          break;
         default:
           UNSUPPORTED_RISCV();
       }
@@ -1287,7 +1366,13 @@ void Decoder::DecodeRFPType(Instruction* instr) {
     }
     case RO_FMV_W_X: {
       if (instr->Funct3Value() == 0b000) {
-        Format(instr, "fmv.w.x   'fd, 'rs1");
+        if (instr->Rs2Value() == 0) {
+          Format(instr, "fmv.w.x   'fd, 'rs1");
+        } else if (instr->Rs2Value() == 0b00001) {
+          Format(instr, "fli.s     'fd, 'fis");
+        } else {
+          UNSUPPORTED_RISCV();
+        }
       } else {
         UNSUPPORTED_RISCV();
       }
@@ -1344,8 +1429,14 @@ void Decoder::DecodeRFPType(Instruction* instr) {
         case 0b000:  // RO_FMIN_D
           Format(instr, "fmin.d    'fd, 'fs1, 'fs2");
           break;
+        case 0b010:  // RO_FMINM_D
+          Format(instr, "fminm.d   'fd, 'fs1, 'fs2");
+          break;
         case 0b001:  // RO_FMAX_D
           Format(instr, "fmax.d    'fd, 'fs1, 'fs2");
+          break;
+        case 0b011:  // RO_FMAXM_D
+          Format(instr, "fmaxm.d   'fd, 'fs1, 'fs2");
           break;
         default:
           UNSUPPORTED_RISCV();
@@ -1357,6 +1448,10 @@ void Decoder::DecodeRFPType(Instruction* instr) {
         Format(instr, "fcvt.s.d ['frm] 'fd, 'fs1");
       } else if (instr->Rs2Value() == 0b00010) {
         Format(instr, "fcvt.s.h ['frm] 'fd, 'fs1");
+      } else if (instr->Rs2Value() == 0b00100) {
+        Format(instr, "fround.s ['frm] 'fd, 'fs1");
+      } else if (instr->Rs2Value() == 0b00101) {
+        Format(instr, "froundnx.s ['frm] 'fd, 'fs1");
       } else {
         UNSUPPORTED_RISCV();
       }
@@ -1367,6 +1462,10 @@ void Decoder::DecodeRFPType(Instruction* instr) {
         Format(instr, "fcvt.d.s ['frm] 'fd, 'fs1");
       } else if (instr->Rs2Value() == 0b00010) {
         Format(instr, "fcvt.d.h ['frm] 'fd, 'fs1");
+      } else if (instr->Rs2Value() == 0b00100) {
+        Format(instr, "fround.d ['frm] 'fd, 'fs1");
+      } else if (instr->Rs2Value() == 0b00101) {
+        Format(instr, "froundnx.d ['frm] 'fd, 'fs1");
       } else {
         UNSUPPORTED_RISCV();
       }
@@ -1382,6 +1481,12 @@ void Decoder::DecodeRFPType(Instruction* instr) {
           break;
         case 0b000:  // RO_FLE_D
           Format(instr, "fle.d     'rd, 'fs1, 'fs2");
+          break;
+        case 0b100:  // RO_FLEQ_S
+          Format(instr, "fleq.d    'rd, 'fs1, 'fs2");
+          break;
+        case 0b101:  // RO_FLTQ_S
+          Format(instr, "fltq.d    'rd, 'fs1, 'fs2");
           break;
         default:
           UNSUPPORTED_RISCV();
@@ -1415,6 +1520,10 @@ void Decoder::DecodeRFPType(Instruction* instr) {
           Format(instr, "fcvt.wu.d ['frm] 'rd, 'fs1");
           break;
 #ifdef V8_TARGET_ARCH_64_BIT
+        case 0b01000:  // RO_FCVTMOD_W_D
+          DCHECK(instr->RoundMode() == FPURoundingMode::RTZ);
+          Format(instr, "fcvtmod.w.d ['frm] 'rd, 'fs1");
+          break;
         case 0b00010:  // RO_FCVT_L_D
           Format(instr, "fcvt.l.d  ['frm] 'rd, 'fs1");
           break;
@@ -1448,10 +1557,24 @@ void Decoder::DecodeRFPType(Instruction* instr) {
       }
       break;
     }
+    case RO_FCVTMOD_W_D: {
+      if (instr->Rs2Value() == 0b01000) {
+        Format(instr, "fcvtmod.w.d ['frm] 'rd, 'fs1");
+      } else {
+        UNSUPPORTED_RISCV();
+      }
+      break;
+    }
 #ifdef V8_TARGET_ARCH_64_BIT
     case RO_FMV_D_X: {
-      if (instr->Funct3Value() == 0b000 && instr->Rs2Value() == 0b00000) {
-        Format(instr, "fmv.d.x   'fd, 'rs1");
+      if (instr->Funct3Value() == 0b000) {
+        if (instr->Rs2Value() == 0b00000) {
+          Format(instr, "fmv.d.x   'fd, 'rs1");
+        } else if (instr->Rs2Value() == 0b00001) {
+          Format(instr, "fli.d     'fd, 'fid");
+        } else {
+          UNSUPPORTED_RISCV();
+        }
       } else {
         UNSUPPORTED_RISCV();
       }
@@ -1530,14 +1653,6 @@ void Decoder::DecodeRFPType(Instruction* instr) {
 #endif /* V8_TARGET_ARCH_64_BIT */
         default:
           UNSUPPORTED_RISCV();
-      }
-      break;
-    }
-    case RO_FCVT_S_H: {
-      if (instr->Rs2Value() == 0b00010) {
-        Format(instr, "fcvt.s.h ['frm] 'fd, 'fs1");
-      } else {
-        UNSUPPORTED_RISCV();
       }
       break;
     }
@@ -1676,7 +1791,7 @@ void Decoder::DecodeIType(Instruction* instr) {
       else if (instr->RdValue() == ra.code() && instr->Imm12Value() == 0)
         Format(instr, "jalr      'rs1");
       else
-        Format(instr, "jalr      'rd, 'imm12('rs1)");
+        Format(instr, "jalr      'rd, 'imm12('rs1)'target");
       break;
     case RO_LB:
       Format(instr, "lb        'rd, 'imm12('rs1)");
@@ -1877,6 +1992,41 @@ void Decoder::DecodeIType(Instruction* instr) {
       }
       break;
     }
+    case RO_MOP: {
+      if ((instr->InstructionBits() & kMopMask) == RO_MOP_R_N) {
+        switch (instr->MopNumber()) {
+          case SSPOPCHK_MOP_NUM:
+            if (CpuFeatures::IsSupported(ZICFISS)) {
+              if (instr->RdValue() == zero_reg.code()) {  // sspopchk
+                Format(instr, "sspopchk  'rs1");
+                return;
+              } else {  // ssrdp
+                DCHECK_EQ(instr->Rs1Value(), zero_reg.code());
+                Format(instr, "ssrdp     'rd");
+                return;
+              }
+            }
+            break;
+          default:
+            break;
+        }
+        Format(instr, "mop.r.'mop  'rd, 'rs1");
+      } else {
+        DCHECK((instr->InstructionBits() & kMopMask) == RO_MOP_RR_N);
+        switch (instr->MopNumber()) {
+          case SSPUSH_MOP_NUM:  // sspush
+            if (CpuFeatures::IsSupported(ZICFISS)) {
+              Format(instr, "sspush    'rs2");
+              return;
+            }
+            break;
+          default:
+            break;
+        }
+        Format(instr, "mop.rr.'mop 'rd, 'rs1, 'rs2");
+      }
+      break;
+    }
     // TODO(riscv): use Zifencei Standard Extension macro block
     case RO_FENCE_I:
       Format(instr, "fence.i");
@@ -1982,16 +2132,12 @@ void Decoder::DecodeIType(Instruction* instr) {
       Format(instr, "fld       'fd, 'imm12('rs1)");
       break;
     default:
-#ifdef CAN_USE_RVV_INSTRUCTIONS
       if (instr->vl_vs_width() != -1) {
         DecodeRvvVL(instr);
       } else {
         UNSUPPORTED_RISCV();
       }
       break;
-#else
-      UNSUPPORTED_RISCV();
-#endif
   }
 }
 
@@ -2023,16 +2169,12 @@ void Decoder::DecodeSType(Instruction* instr) {
       Format(instr, "fsd       'fs2, 'offS('rs1)");
       break;
     default:
-#ifdef CAN_USE_RVV_INSTRUCTIONS
       if (instr->vl_vs_width() != -1) {
         DecodeRvvVS(instr);
       } else {
         UNSUPPORTED_RISCV();
       }
       break;
-#else
-      UNSUPPORTED_RISCV();
-#endif
   }
 }
 
@@ -2142,6 +2284,9 @@ void Decoder::DecodeCAType(Instruction* instr) {
       Format(instr, "addw       'Crs1s, 'Crs1s, 'Crs2s");
       break;
 #endif
+    case RO_C_MUL:
+      Format(instr, "mul       'Crs1s, 'Crs1s, 'Crs2s");
+      break;
     default:
       UNSUPPORTED_RISCV();
   }
@@ -2245,7 +2390,19 @@ void Decoder::DecodeCLType(Instruction* instr) {
       Format(instr, "flw       'Cfs2s, 'Cimm5D('Crs1s)");
       break;
 #endif
-
+    case RO_C_LBU:  // Zcb loads, all sharing funct3=100.
+      if ((instr->InstructionBits() & (kRvcFunct6Mask | (1 << 6))) ==
+          RO_C_LHU) {
+        Format(instr, "lhu       'Crs2s, 'Cimm1H('Crs1s)");
+      } else if ((instr->InstructionBits() & (kRvcFunct6Mask | (1 << 6))) ==
+                 RO_C_LH) {
+        Format(instr, "lh        'Crs2s, 'Cimm1H('Crs1s)");
+      } else if ((instr->InstructionBits() & kRvcFunct6Mask) == RO_C_LBU) {
+        Format(instr, "lbu       'Crs2s, 'Cimm2B('Crs1s)");
+      } else {
+        UNSUPPORTED_RISCV();
+      }
+      break;
     default:
       UNSUPPORTED_RISCV();
   }
@@ -2268,6 +2425,16 @@ void Decoder::DecodeCSType(Instruction* instr) {
       Format(instr, "fsw       'Cfs2s, 'Cimm5D('Crs1s)");
       break;
 #endif
+    case RO_C_LBU:  // Zcb stores, all sharing funct3=100.
+      if ((instr->InstructionBits() & kRvcFunct6Mask) == RO_C_SB) {
+        Format(instr, "sb        'Crs2s, 'Cimm2B('Crs1s)");
+      } else if ((instr->InstructionBits() & (kRvcFunct6Mask | (1 << 6))) ==
+                 RO_C_SH) {
+        Format(instr, "sh        'Crs2s, 'Cimm1H('Crs1s)");
+      } else {
+        UNSUPPORTED_RISCV();
+      }
+      break;
     default:
       UNSUPPORTED_RISCV();
   }
@@ -2300,6 +2467,33 @@ void Decoder::DecodeCBType(Instruction* instr) {
         break;
       } else if (instr->RvcFunct2BValue() == 0b10) {
         Format(instr, "andi       'Crs1s, 'Crs1s, 'Cimm6");
+        break;
+      } else if (instr->RvcFunct2BValue() == 0b11) {
+        // Zcb unary instructions (CU format), distinguished by nzuimm[5:0].
+        switch (instr->RvcImm6Value() & 0b111111) {
+          case 0b111000:
+            Format(instr, "zext.b    'Crs1s, 'Crs1s");
+            break;
+          case 0b111001:
+            Format(instr, "sext.b    'Crs1s, 'Crs1s");
+            break;
+          case 0b111010:
+            Format(instr, "zext.h    'Crs1s, 'Crs1s");
+            break;
+          case 0b111011:
+            Format(instr, "sext.h    'Crs1s, 'Crs1s");
+            break;
+#ifdef V8_TARGET_ARCH_64_BIT
+          case 0b111100:
+            Format(instr, "zext.w    'Crs1s, 'Crs1s");
+            break;
+#endif
+          case 0b111101:
+            Format(instr, "not       'Crs1s, 'Crs1s");
+            break;
+          default:
+            UNSUPPORTED_RISCV();
+        }
         break;
       } else {
         UNSUPPORTED_RISCV();
@@ -3294,11 +3488,9 @@ int Decoder::InstructionDecode(uint8_t* instr_ptr) {
     case Instruction::kCBType:
       DecodeCBType(instr);
       break;
-#ifdef CAN_USE_RVV_INSTRUCTIONS
     case Instruction::kVType:
       DecodeVType(instr);
       break;
-#endif
     default:
       Format(instr, "UNSUPPORTED");
       break;

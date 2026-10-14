@@ -10,6 +10,7 @@ V8 correctness fuzzer launcher script.
 import argparse
 import hashlib
 import json
+import random
 import re
 import sys
 import traceback
@@ -26,31 +27,15 @@ CONFIGS = dict(
         '--turbo-filter=~',
         '--no-turbofan',
         '--no-sparkplug',
-        '--liftoff',
+        '--liftoff-only',
         '--no-wasm-tier-up',
-        '--no-maglev',
-    ],
-    ignition_asm=[
-        '--turbo-filter=~',
-        '--no-turbofan',
-        '--no-sparkplug',
-        '--validate-asm',
-        '--stress-validate-asm',
-        '--no-maglev',
-    ],
-    ignition_eager=[
-        '--turbo-filter=~',
-        '--no-turbofan',
-        '--no-sparkplug',
-        '--no-lazy',
-        '--no-lazy-inner-functions',
         '--no-maglev',
     ],
     ignition_no_ic=[
         '--turbo-filter=~',
         '--no-turbofan',
         '--no-sparkplug',
-        '--liftoff',
+        '--liftoff-only',
         '--no-wasm-tier-up',
         '--no-use-ic',
         '--no-lazy-feedback-allocation',
@@ -60,14 +45,19 @@ CONFIGS = dict(
     ignition_turbo_no_ic=[
         '--no-use-ic',
     ],
-    ignition_turbo_opt=[
-        '--always-turbofan',
+    prepare_opt=[
+        '--no-flush-bytecode',
+        '--no-lazy',
+        '--no-lazy-feedback-allocation',
         '--no-liftoff',
     ],
-    ignition_turbo_opt_eager=[
-        '--always-turbofan',
+    # TODO(https://crbug.com/431974094): Remove this in 2026. Until then
+    # keep it aligned with the above for bisection stability.
+    ignition_turbo_opt=[
+        '--no-flush-bytecode',
         '--no-lazy',
-        '--no-lazy-inner-functions',
+        '--no-lazy-feedback-allocation',
+        '--no-liftoff',
     ],
     ignition_maglev=[
         '--maglev',
@@ -80,9 +70,19 @@ CONFIGS = dict(
     slow_path=[
         '--force-slow-path',
     ],
-    slow_path_opt=[
-        '--always-turbofan',
+    slow_path_prepare_opt=[
         '--force-slow-path',
+        '--no-flush-bytecode',
+        '--no-lazy',
+        '--no-lazy-feedback-allocation',
+    ],
+    # TODO(https://crbug.com/431974094): Remove this in 2026. Until then
+    # keep it aligned with the above for bisection stability.
+    slow_path_opt=[
+        '--force-slow-path',
+        '--no-flush-bytecode',
+        '--no-lazy',
+        '--no-lazy-feedback-allocation',
     ],
 )
 
@@ -189,6 +189,9 @@ DISALLOWED_FLAGS = [
     '--expose-statistics',
     '--log',
     '--rcs',
+
+    # https://crbug.com/430624025
+    '--flush-denormals',
 ]
 
 # The same as above, but prefixes that either match multiple flags or flags
@@ -204,7 +207,6 @@ DISALLOWED_FLAG_PREFIXES = [
 # No need to list other contradictions, they are omitted by the
 # --fuzzing flag).
 CONTRADICTORY_FLAGS = [
-  ('--always-turbofan', '--jitless'),
   ('--assert-types', '--stress-concurrent-inlining'),
   ('--assert-types', '--stress-concurrent-inlining-attach-code'),
   ('--jitless', '--stress-concurrent-inlining'),
@@ -332,14 +334,21 @@ class ExecutionConfig(object):
     return '--simulate-errors' in self.flags
 
 
+def random_seed():
+  """Returns a random, non-zero seed."""
+  seed = 0
+  while not seed:
+    seed = random.SystemRandom().randint(-2147483648, 2147483647)
+  return seed
+
+
 def parse_args(args):
   first_config_arguments = ExecutionArgumentsConfig('first')
   second_config_arguments = ExecutionArgumentsConfig('second')
 
   parser = argparse.ArgumentParser()
   parser.add_argument(
-    '--random-seed', type=int, required=True,
-    help='random seed passed to both runs')
+      '--random-seed', type=int, help='random seed passed to both runs')
   parser.add_argument(
       '--skip-suppressions', default=False, action='store_true',
       help='skip suppressions to reproduce known issues')
@@ -354,8 +363,11 @@ def parse_args(args):
   parser.add_argument('testcase', help='path to test case')
   options = parser.parse_args(args)
 
+  if options.random_seed is None:
+    options.random_seed = random_seed()
+
   # Ensure we have a test case.
-  options.testcase = Path(options.testcase)
+  options.testcase = Path(options.testcase).resolve()
   assert options.testcase.is_file(), (
       f"Test case {options.testcase} doesn't exist")
 

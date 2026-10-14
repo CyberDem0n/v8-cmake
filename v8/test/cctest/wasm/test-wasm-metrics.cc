@@ -9,19 +9,19 @@
 #include "include/v8-platform.h"
 #include "src/api/api-inl.h"
 #include "src/base/platform/time.h"
+#include "src/objects/managed.h"
 #include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-module-builder.h"
+#include "src/wasm/wasm-objects-inl.h"
 #include "test/cctest/cctest.h"
 #include "test/common/wasm/flag-utils.h"
 #include "test/common/wasm/test-signatures.h"
 #include "test/common/wasm/wasm-macro-gen.h"
 #include "test/common/wasm/wasm-module-runner.h"
 
-namespace v8 {
-namespace internal {
-namespace wasm {
+namespace v8::internal::wasm {
 
-namespace {
+namespace test {
 
 class MockPlatform final : public TestPlatform {
  public:
@@ -155,10 +155,10 @@ enum class CompilationStatus {
   kFailed,
 };
 
-class TestInstantiateResolver : public InstantiationResultResolver {
+class InstantiateResolver : public InstantiationResultResolver {
  public:
-  TestInstantiateResolver(Isolate* isolate, CompilationStatus* status,
-                          std::string* error_message)
+  InstantiateResolver(Isolate* isolate, CompilationStatus* status,
+                      std::string* error_message)
       : isolate_(isolate), status_(status), error_message_(error_message) {}
 
   void OnInstantiationSucceeded(
@@ -179,11 +179,10 @@ class TestInstantiateResolver : public InstantiationResultResolver {
   std::string* const error_message_;
 };
 
-class TestCompileResolver : public CompilationResultResolver {
+class CompileResolver : public CompilationResultResolver {
  public:
-  TestCompileResolver(CompilationStatus* status, std::string* error_message,
-                      Isolate* isolate,
-                      std::shared_ptr<NativeModule>* native_module)
+  CompileResolver(CompilationStatus* status, std::string* error_message,
+                  Isolate* isolate, CppGCManaged<NativeModule>::Ptr* native_module)
       : status_(status),
         error_message_(error_message),
         isolate_(isolate),
@@ -192,12 +191,12 @@ class TestCompileResolver : public CompilationResultResolver {
   void OnCompilationSucceeded(
       i::DirectHandle<i::WasmModuleObject> module) override {
     if (!module.is_null()) {
-      *native_module_ = module->shared_native_module();
-      GetWasmEngine()->AsyncInstantiate(
-          isolate_,
-          std::make_unique<TestInstantiateResolver>(isolate_, status_,
-                                                    error_message_),
-          module, MaybeDirectHandle<JSReceiver>());
+      *native_module_ = module->native_module();
+      GetWasmEngine()->AsyncInstantiate(isolate_,
+                                        std::make_unique<InstantiateResolver>(
+                                            isolate_, status_, error_message_),
+                                        module,
+                                        MaybeDirectHandle<JSReceiver>());
     }
   }
 
@@ -212,34 +211,34 @@ class TestCompileResolver : public CompilationResultResolver {
   CompilationStatus* const status_;
   std::string* const error_message_;
   Isolate* isolate_;
-  std::shared_ptr<NativeModule>* const native_module_;
+  CppGCManaged<NativeModule>::Ptr* const native_module_;
 };
 
-}  // namespace
+}  // namespace test
 
 #define RUN_COMPILE(name)                                               \
   v8::HandleScope handle_scope(CcTest::isolate());                      \
   v8::Local<v8::Context> context = v8::Context::New(CcTest::isolate()); \
   v8::Context::Scope context_scope(context);                            \
   Isolate* i_isolate = CcTest::i_isolate();                             \
-  testing::SetupIsolateForWasmModule(i_isolate);                        \
   RunCompile_##name(&platform, i_isolate);
 
-#define COMPILE_TEST(name)                                                     \
-  void RunCompile_##name(MockPlatform*, i::Isolate*);                          \
-  TEST_WITH_PLATFORM(Sync##name, MockPlatform) {                               \
-    i::FlagScope<bool> sync_scope(&i::v8_flags.wasm_async_compilation, false); \
-    RUN_COMPILE(name);                                                         \
-  }                                                                            \
-                                                                               \
-  TEST_WITH_PLATFORM(Async##name, MockPlatform) { RUN_COMPILE(name); }         \
-                                                                               \
-  TEST_WITH_PLATFORM(Streaming##name, MockPlatform) {                          \
-    i::FlagScope<bool> streaming_scope(&i::v8_flags.wasm_test_streaming,       \
-                                       true);                                  \
-    RUN_COMPILE(name);                                                         \
-  }                                                                            \
-  void RunCompile_##name(MockPlatform* platform, i::Isolate* isolate)
+#define COMPILE_TEST(name)                                                   \
+  void RunCompile_##name(test::MockPlatform*, i::Isolate*);                  \
+  TEST_WITH_PLATFORM(Sync##name, test::MockPlatform) {                       \
+    i::FlagScope<bool> single_threaded_scope(&i::v8_flags.single_threaded,   \
+                                             true);                          \
+    RUN_COMPILE(name);                                                       \
+  }                                                                          \
+                                                                             \
+  TEST_WITH_PLATFORM(Async##name, test::MockPlatform) { RUN_COMPILE(name); } \
+                                                                             \
+  TEST_WITH_PLATFORM(Streaming##name, test::MockPlatform) {                  \
+    i::FlagScope<bool> streaming_scope(&i::v8_flags.wasm_test_streaming,     \
+                                       true);                                \
+    RUN_COMPILE(name);                                                       \
+  }                                                                          \
+  void RunCompile_##name(test::MockPlatform* platform, i::Isolate* isolate)
 
 class MetricsRecorder : public v8::metrics::Recorder {
  public:
@@ -287,27 +286,26 @@ COMPILE_TEST(TestEventMetrics) {
   builder->WriteTo(&buffer);
 
   auto enabled_features = WasmEnabledFeatures::FromIsolate(isolate);
-  CompilationStatus status = CompilationStatus::kPending;
+  test::CompilationStatus status = test::CompilationStatus::kPending;
   std::string error_message;
-  std::shared_ptr<NativeModule> native_module;
+  CppGCManaged<NativeModule>::Ptr native_module;
   base::OwnedVector<const uint8_t> bytes = base::OwnedCopyOf(buffer);
   GetWasmEngine()->AsyncCompile(
       isolate, enabled_features, CompileTimeImports{},
-      std::make_shared<TestCompileResolver>(&status, &error_message, isolate,
-                                            &native_module),
+      std::make_shared<test::CompileResolver>(&status, &error_message, isolate,
+                                              &native_module),
       std::move(bytes), "CompileAndInstantiateWasmModuleForTesting");
 
   // Finish compilation tasks.
-  while (status == CompilationStatus::kPending) {
+  while (status == test::CompilationStatus::kPending) {
     platform->ExecuteTasks();
   }
   platform->ExecuteTasks();  // Complete pending tasks beyond compilation.
-  CHECK_EQ(CompilationStatus::kFinished, status);
+  CHECK_EQ(test::CompilationStatus::kFinished, status);
 
   CHECK_EQ(1, recorder->module_decoded_.size());
   CHECK(recorder->module_decoded_.back().success);
-  CHECK_EQ(i::v8_flags.wasm_async_compilation,
-           recorder->module_decoded_.back().async);
+  CHECK(recorder->module_decoded_.back().async);
   CHECK_EQ(i::v8_flags.wasm_test_streaming,
            recorder->module_decoded_.back().streamed);
   CHECK_EQ(buffer.size(),
@@ -317,8 +315,7 @@ COMPILE_TEST(TestEventMetrics) {
 
   CHECK_EQ(1, recorder->module_compiled_.size());
   CHECK(recorder->module_compiled_.back().success);
-  CHECK_EQ(i::v8_flags.wasm_async_compilation,
-           recorder->module_compiled_.back().async);
+  CHECK(recorder->module_compiled_.back().async);
   CHECK_EQ(i::v8_flags.wasm_test_streaming,
            recorder->module_compiled_.back().streamed);
   CHECK(!recorder->module_compiled_.back().cached);
@@ -326,12 +323,7 @@ COMPILE_TEST(TestEventMetrics) {
   CHECK_EQ(v8_flags.wasm_lazy_compilation,
            recorder->module_compiled_.back().lazy);
   CHECK_LT(0, recorder->module_compiled_.back().code_size_in_bytes);
-  // We currently cannot ensure that no code is attributed to Liftoff after the
-  // WasmModuleCompiled event has been emitted. We therefore only assume the
-  // liftoff_code_size() to be an upper limit for the reported size.
-  CHECK_GE(native_module->liftoff_code_size(),
-           recorder->module_compiled_.back().code_size_in_bytes);
-  CHECK_GE(native_module->generated_code_size(),
+  CHECK_EQ(native_module->generated_code_size(),
            recorder->module_compiled_.back().code_size_in_bytes);
   CHECK_LE(0, recorder->module_compiled_.back().wall_clock_duration_in_us);
 
@@ -343,6 +335,4 @@ COMPILE_TEST(TestEventMetrics) {
   CHECK_LE(0, recorder->module_instantiated_.back().wall_clock_duration_in_us);
 }
 
-}  // namespace wasm
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal::wasm

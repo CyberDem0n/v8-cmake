@@ -145,7 +145,11 @@ def update_all():
       if filename.endswith('.pyc'):
         os.remove(join(path, filename))
 
-  git('add', '-f', 'v8', dry_run=dry_run)
+  # Pass -c core.safecrlf=false so re-adding the vendored tree does not emit
+  # "CRLF will be replaced by LF" warnings for third-party files that ship with
+  # CRLF (v8/.gitattributes requests LF normalization, which is fine; we just
+  # silence the per-file warning).
+  git('-c', 'core.safecrlf=false', 'add', '-f', 'v8', dry_run=dry_run)
   git('log', '-1', '--oneline', v8['commit'], cwd=repodir(v8))
 
   newdeps = json.dumps(deps, indent=2)

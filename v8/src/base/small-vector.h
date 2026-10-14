@@ -9,8 +9,10 @@
 #include <type_traits>
 #include <utility>
 
+#include "include/v8config.h"
 #include "src/base/bits.h"
 #include "src/base/macros.h"
+#include "src/base/memcopy.h"
 #include "src/base/vector.h"
 
 namespace v8 {
@@ -20,14 +22,30 @@ namespace base {
 // dynamic storage when it overflows.
 template <typename T, size_t kSize, typename Allocator = std::allocator<T>>
 class SmallVector {
+  // TODO(mliedtke): Remove kHasTrivialElement and replace usages with the
+  // proper conditions.
+  static constexpr bool kHasTrivialElement =
+      is_trivially_copyable<T>::value && is_trivially_destructible<T>::value;
+
  public:
   static constexpr size_t kInlineSize = kSize;
   using value_type = T;
+  using reference = T&;
+  using const_reference = const T&;
+  using iterator = T*;
+  using const_iterator = const T*;
+  using difference_type = std::ptrdiff_t;
+  using size_type = std::size_t;
 
   SmallVector() = default;
   explicit SmallVector(const Allocator& allocator) : allocator_(allocator) {}
+  // Constructs a SmallVector with `size` elements. These elements will be
+  // default-initialized(!), differently to e.g. `std::vector`. If
+  // value-initialization is desired, use the constructor overload with an
+  // explicit `initial_value` instead.
   explicit V8_INLINE SmallVector(size_t size,
                                  const Allocator& allocator = Allocator())
+    requires std::default_initializable<T>
       : allocator_(allocator) {
     resize(size);
   }
@@ -108,7 +126,8 @@ class SmallVector {
       DCHECK_GE(capacity(), other.size());  // Sanity check.
       size_t other_size = other.size();
       if constexpr (kHasTrivialElement) {
-        std::move(other.begin_, other.end_, begin_);
+        // Ranges cannot overlap and we can just emit a trivial memcpy.
+        base::MemCopy(begin_, other.begin_, other_size * sizeof(T));
       } else {
         ptrdiff_t to_move =
             std::min(static_cast<ptrdiff_t>(other_size), end_ - begin_);
@@ -126,69 +145,80 @@ class SmallVector {
     return *this;
   }
 
-  T* data() { return begin_; }
-  const T* data() const { return begin_; }
+  T* data() V8_LIFETIME_BOUND { return begin_; }
+  const T* data() const V8_LIFETIME_BOUND { return begin_; }
 
-  T* begin() { return begin_; }
-  const T* begin() const { return begin_; }
+  T* begin() V8_LIFETIME_BOUND { return begin_; }
+  const T* begin() const V8_LIFETIME_BOUND { return begin_; }
 
-  T* end() { return end_; }
-  const T* end() const { return end_; }
+  T* end() V8_LIFETIME_BOUND { return end_; }
+  const T* end() const V8_LIFETIME_BOUND { return end_; }
 
-  auto rbegin() { return std::make_reverse_iterator(end_); }
-  auto rbegin() const { return std::make_reverse_iterator(end_); }
+  auto rbegin() V8_LIFETIME_BOUND { return std::make_reverse_iterator(end_); }
+  auto rbegin() const V8_LIFETIME_BOUND {
+    return std::make_reverse_iterator(end_);
+  }
 
-  auto rend() { return std::make_reverse_iterator(begin_); }
-  auto rend() const { return std::make_reverse_iterator(begin_); }
+  auto rend() V8_LIFETIME_BOUND { return std::make_reverse_iterator(begin_); }
+  auto rend() const V8_LIFETIME_BOUND {
+    return std::make_reverse_iterator(begin_);
+  }
 
   size_t size() const { return end_ - begin_; }
   bool empty() const { return end_ == begin_; }
   size_t capacity() const { return end_of_storage_ - begin_; }
 
-  T& front() {
+  T& front() V8_LIFETIME_BOUND {
     DCHECK_NE(0, size());
     return begin_[0];
   }
-  const T& front() const {
+  const T& front() const V8_LIFETIME_BOUND {
     DCHECK_NE(0, size());
     return begin_[0];
   }
 
-  T& back() {
+  T& back() V8_LIFETIME_BOUND {
     DCHECK_NE(0, size());
     return end_[-1];
   }
-  const T& back() const {
+  const T& back() const V8_LIFETIME_BOUND {
     DCHECK_NE(0, size());
     return end_[-1];
   }
 
-  T& at(size_t index) {
+  T& at(size_t index) V8_LIFETIME_BOUND {
     DCHECK_GT(size(), index);
     return begin_[index];
   }
 
-  T& operator[](size_t index) {
+  T& operator[](size_t index) V8_LIFETIME_BOUND {
     DCHECK_GT(size(), index);
     return begin_[index];
   }
 
-  const T& at(size_t index) const {
+  const T& at(size_t index) const V8_LIFETIME_BOUND {
     DCHECK_GT(size(), index);
     return begin_[index];
   }
 
-  const T& operator[](size_t index) const { return at(index); }
+  const T& operator[](size_t index) const V8_LIFETIME_BOUND {
+    return at(index);
+  }
 
   template <typename... Args>
   void emplace_back(Args&&... args) {
-    if (V8_UNLIKELY(end_ == end_of_storage_)) Grow();
-    void* storage = end_;
-    end_ += 1;
-    new (storage) T(std::forward<Args>(args)...);
+    if (V8_UNLIKELY(end_ == end_of_storage_)) {
+      return grow_and_emplace_back(std::forward<Args>(args)...);
+    }
+    emplace_back_unchecked(std::forward<Args>(args)...);
   }
 
-  void push_back(T x) { emplace_back(std::move(x)); }
+  void push_back(T x) {
+    if (V8_UNLIKELY(end_ == end_of_storage_)) {
+      return grow_and_push_back(std::move(x));
+    }
+    emplace_back_unchecked(std::move(x));
+  }
 
   void pop_back(size_t count = 1) {
     DCHECK_GE(size(), count);
@@ -196,10 +226,10 @@ class SmallVector {
     std::destroy_n(end_, count);
   }
 
-  T* insert(T* pos, const T& value) {
+  T* insert(T* pos, const T& value) V8_LIFETIME_BOUND {
     return insert(pos, static_cast<size_t>(1), value);
   }
-  T* insert(T* pos, size_t count, const T& value) {
+  T* insert(T* pos, size_t count, const T& value) V8_LIFETIME_BOUND {
     DCHECK_LE(pos, end_);
     size_t offset = pos - begin_;
     size_t old_size = size();
@@ -212,7 +242,7 @@ class SmallVector {
     return pos;
   }
   template <typename It>
-  T* insert(T* pos, It begin, It end) {
+  T* insert(T* pos, It begin, It end) V8_LIFETIME_BOUND {
     DCHECK_LE(pos, end_);
     size_t offset = pos - begin_;
     size_t count = std::distance(begin, end);
@@ -226,27 +256,52 @@ class SmallVector {
     return pos;
   }
 
-  T* insert(T* pos, std::initializer_list<T> values) {
+  T* insert(T* pos, std::initializer_list<const T> values) V8_LIFETIME_BOUND {
     return insert(pos, values.begin(), values.end());
   }
 
-  void erase(T* erase_start) {
-    DCHECK_GE(erase_start, begin_);
-    DCHECK_LE(erase_start, end_);
-    ptrdiff_t count = end_ - erase_start;
-    end_ = erase_start;
-    std::destroy_n(end_, count);
+  template <typename Container>
+    requires requires(const Container& v) {
+      std::is_same_v<decltype(std::begin(v)), decltype(std::end(v))>;
+    }
+  T* insert(T* pos, const Container& values) V8_LIFETIME_BOUND {
+    return insert(pos, std::begin(values), std::end(values));
   }
 
-  void resize(size_t new_size) {
+  T* erase(T* erase_start, T* erase_end) V8_LIFETIME_BOUND {
+    DCHECK_GE(erase_start, begin_);
+    DCHECK_LE(erase_start, erase_end);
+    DCHECK_LE(erase_end, end_);
+    T* new_end = std::move(erase_end, end_, erase_start);
+    std::destroy(new_end, end_);
+    end_ = new_end;
+    return erase_start;
+  }
+
+  T* erase(T* pos) V8_LIFETIME_BOUND { return erase(pos, pos + 1); }
+
+  // Resizes the SmallVector to the provided `new_size`. If `new_size` is larger
+  // than the current size, the new elements will not be default-initialized,
+  // (meaning the objects will only be allocated, not constructed.)
+  // This is only valid if `T` is an implicit lifetime type.
+  void resize_no_init(size_t new_size)
+    requires kHasTrivialElement
+  {
+    if (new_size > capacity()) Grow(new_size);
+    end_ = begin_ + new_size;
+  }
+
+  // Resizes the SmallVector to the provided `new_size`. If `new_size` is larger
+  // than the current size, the new elements will be default-initialized.
+  void resize(size_t new_size)
+    requires std::default_initializable<T>
+  {
     if (new_size > capacity()) Grow(new_size);
     T* new_end = begin_ + new_size;
-    if constexpr (!kHasTrivialElement) {
-      if (new_end > end_) {
-        std::uninitialized_default_construct(end_, new_end);
-      } else {
-        std::destroy_n(new_end, end_ - new_end);
-      }
+    if (new_end > end_) {
+      std::uninitialized_default_construct(end_, new_end);
+    } else {
+      std::destroy(new_end, end_);
     }
     end_ = new_end;
   }
@@ -257,7 +312,7 @@ class SmallVector {
     if (new_end > end_) {
       std::uninitialized_fill(end_, new_end, initial_value);
     } else {
-      std::destroy_n(new_end, end_ - new_end);
+      std::destroy(new_end, end_);
     }
     end_ = new_end;
   }
@@ -268,7 +323,7 @@ class SmallVector {
 
   // Clear without reverting back to inline storage.
   void clear() {
-    std::destroy_n(begin_, end_ - begin_);
+    std::destroy(begin_, end_);
     end_ = begin_;
   }
 
@@ -278,6 +333,24 @@ class SmallVector {
   // Grows the backing store by a factor of two. Returns the new end of the used
   // storage (this reduces binary size).
   V8_NOINLINE V8_PRESERVE_MOST void Grow() { Grow(0); }
+
+  template <typename... Args>
+  V8_INLINE void emplace_back_unchecked(Args&&... args) {
+    void* storage = end_;
+    end_ += 1;
+    new (storage) T(std::forward<Args>(args)...);
+  }
+
+  template <typename... Args>
+  V8_NOINLINE V8_PRESERVE_MOST void grow_and_emplace_back(Args&&... args) {
+    Grow();
+    emplace_back_unchecked(std::forward<Args>(args)...);
+  }
+
+  V8_NOINLINE V8_PRESERVE_MOST void grow_and_push_back(T x) {
+    Grow();
+    emplace_back_unchecked(std::move(x));
+  }
 
   // Grows the backing store by a factor of two, and at least to {min_capacity}.
   V8_NOINLINE V8_PRESERVE_MOST void Grow(size_t min_capacity) {
@@ -300,7 +373,7 @@ class SmallVector {
   }
 
   V8_NOINLINE V8_PRESERVE_MOST void FreeStorage() {
-    std::destroy_n(begin_, end_ - begin_);
+    std::destroy(begin_, end_);
     if (is_big()) allocator_.deallocate(begin_, end_of_storage_ - begin_);
   }
 
@@ -308,7 +381,7 @@ class SmallVector {
   // internal use only.
   void reset_to_inline_storage() {
     if constexpr (!kHasTrivialElement) {
-      if (!is_big()) std::destroy_n(begin_, end_ - begin_);
+      if (!is_big()) std::destroy(begin_, end_);
     }
     begin_ = inline_storage_begin();
     end_ = begin_;
@@ -334,9 +407,6 @@ class SmallVector {
   T* end_ = begin_;
   T* end_of_storage_ = begin_ + kInlineSize;
   alignas(T) char inline_storage_[sizeof(T) * kInlineSize];
-
-  static constexpr bool kHasTrivialElement =
-      is_trivially_copyable<T>::value && is_trivially_destructible<T>::value;
 };
 
 }  // namespace base

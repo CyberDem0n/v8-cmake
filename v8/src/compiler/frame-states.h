@@ -108,6 +108,10 @@ class FrameStateFunctionInfo {
         bytecode_array_(bytecode_array) {
   }
 
+  // Prevent slicing when copying through base-class references.
+  FrameStateFunctionInfo(const FrameStateFunctionInfo&) = delete;
+  FrameStateFunctionInfo& operator=(const FrameStateFunctionInfo&) = delete;
+
   int local_count() const { return local_count_; }
   uint16_t parameter_count() const { return parameter_count_; }
   uint16_t parameter_count_without_receiver() const {
@@ -232,6 +236,8 @@ size_t hash_value(FrameStateInfo const&);
 std::ostream& operator<<(std::ostream&, FrameStateInfo const&);
 
 enum class ContinuationFrameStateMode { EAGER, LAZY, LAZY_WITH_CATCH };
+
+uint8_t DeoptimizerParameterCountFor(ContinuationFrameStateMode mode);
 
 class FrameState;
 

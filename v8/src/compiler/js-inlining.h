@@ -24,8 +24,6 @@ class OptimizedCompilationInfo;
 namespace compiler {
 
 class SourcePositionTable;
-class JSWasmCallParameters;
-using JsWasmCallsSidetable = ZoneMap<NodeId, const JSWasmCallParameters*>;
 
 // The JSInliner provides the core graph inlining machinery. Note that this
 // class only deals with the mechanics of how to inline one graph into another,
@@ -35,8 +33,8 @@ class JSInliner final : public AdvancedReducer {
   JSInliner(Editor* editor, Zone* local_zone, OptimizedCompilationInfo* info,
             JSGraph* jsgraph, JSHeapBroker* broker,
             SourcePositionTable* source_positions,
-            NodeOriginTable* node_origins, const wasm::WasmModule* wasm_module,
-            JsWasmCallsSidetable* js_wasm_calls_sidetable,
+            NodeOriginTable* node_origins,
+            const wasm::NativeModule* wasm_native_module,
             bool inline_wasm_fct_if_supported)
       : AdvancedReducer(editor),
         local_zone_(local_zone),
@@ -45,14 +43,13 @@ class JSInliner final : public AdvancedReducer {
         broker_(broker),
         source_positions_(source_positions),
         node_origins_(node_origins),
-        wasm_module_(wasm_module),
-        js_wasm_calls_sidetable_(js_wasm_calls_sidetable),
+        wasm_native_module_(wasm_native_module),
         inline_wasm_fct_if_supported_(inline_wasm_fct_if_supported) {
     // In case WebAssembly is disabled.
-    USE(wasm_module_);
+    USE(wasm_native_module_);
     USE(inline_wasm_fct_if_supported_);
-    USE(js_wasm_calls_sidetable_);
-    DCHECK_IMPLIES(inline_wasm_fct_if_supported_, wasm_module_ != nullptr);
+    DCHECK_IMPLIES(inline_wasm_fct_if_supported_,
+                   wasm_native_module_ != nullptr);
   }
 
   const char* reducer_name() const override { return "JSInliner"; }
@@ -95,8 +92,7 @@ class JSInliner final : public AdvancedReducer {
   JSHeapBroker* const broker_;
   SourcePositionTable* const source_positions_;
   NodeOriginTable* const node_origins_;
-  const wasm::WasmModule* wasm_module_;
-  JsWasmCallsSidetable* js_wasm_calls_sidetable_;
+  const wasm::NativeModule* wasm_native_module_;
 
   // Inline not only the wasm wrapper but also the wasm function itself if
   // inlining into JavaScript is supported and the function is small enough.

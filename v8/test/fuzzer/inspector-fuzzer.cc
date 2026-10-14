@@ -18,6 +18,7 @@
 #include "src/base/platform/time.h"
 #include "src/base/small-vector.h"
 #include "src/base/vector.h"
+#include "test/fuzzer/fuzzer-support.h"
 #include "test/inspector/frontend-channel.h"
 #include "test/inspector/isolate-data.h"
 #include "test/inspector/task-runner.h"
@@ -181,8 +182,8 @@ class UtilsExtension : public InspectorIsolateData::SetupGlobalTask {
     DCHECK(ValidateCallbackInfo(info));
     if (!IsValidConnectSessionArgs(info)) return;
     v8::Local<v8::Context> context = info.GetIsolate()->GetCurrentContext();
-    std::unique_ptr<FrontendChannelImpl> channel =
-        std::make_unique<FrontendChannelImpl>(
+    std::shared_ptr<FrontendChannelImpl> channel =
+        std::make_shared<FrontendChannelImpl>(
             InspectorIsolateData::FromContext(context)->task_runner(),
             InspectorIsolateData::FromContext(context)->GetContextGroupId(
                 context),
@@ -464,9 +465,9 @@ class InspectorExtension : public InspectorIsolateData::SetupGlobalTask {
     isolate->ThrowError("Getter is called");
   }
 
-  static void AccessorSetter(v8::Local<v8::Name> property,
-                             v8::Local<v8::Value> value,
-                             const v8::PropertyCallbackInfo<void>& info) {
+  static void AccessorSetter(
+      v8::Local<v8::Name> property, v8::Local<v8::Value> value,
+      const v8::PropertyCallbackInfo<v8::Boolean>& info) {
     v8::Isolate* isolate = info.GetIsolate();
     isolate->ThrowError("Setter is called");
   }
@@ -635,6 +636,11 @@ void FuzzInspector(const uint8_t* data, size_t size) {
 }  // namespace
 }  // namespace internal
 }  // namespace v8
+
+V8_SYMBOL_USED extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv) {
+  v8_fuzzer::FuzzerSupport::InitializeFuzzerSupport(argc, argv);
+  return 0;
+}
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   v8::internal::FuzzInspector(data, size);

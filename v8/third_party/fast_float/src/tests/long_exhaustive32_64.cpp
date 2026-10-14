@@ -24,7 +24,7 @@ void all_32bit_values() {
     double v = v32;
 
     {
-      const char *string_end = to_string(v, buffer);
+      char const *string_end = to_string(v, buffer);
       double result_value;
       auto result = fast_float::from_chars(buffer, string_end, result_value);
       // Starting with version 4.0 for fast_float, we return result_out_of_range
@@ -45,11 +45,6 @@ void all_32bit_values() {
         std::cerr << "I got " << std::hexfloat << result_value
                   << " but I was expecting " << v << std::endl;
         abort();
-      } else if (std::isnan(v)) {
-        if (!std::isnan(result_value)) {
-          std::cerr << "not nan" << buffer << std::endl;
-          abort();
-        }
       } else if (result_value != v) {
         std::cerr << "no match ? " << buffer << std::endl;
         std::cout << "started with " << std::hexfloat << v << std::endl;

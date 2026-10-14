@@ -5,11 +5,13 @@
 #ifndef V8_INTERPRETER_BYTECODE_GENERATOR_H_
 #define V8_INTERPRETER_BYTECODE_GENERATOR_H_
 
+#include "absl/container/flat_hash_set.h"
 #include "src/ast/ast.h"
 #include "src/execution/isolate.h"
 #include "src/interpreter/bytecode-array-builder.h"
 #include "src/interpreter/bytecode-label.h"
 #include "src/interpreter/bytecode-register.h"
+#include "src/interpreter/prototype-assignment-sequence-builder.h"
 #include "src/objects/feedback-vector.h"
 #include "src/objects/function-kind.h"
 
@@ -28,6 +30,13 @@ class TopLevelDeclarationsBuilder;
 class LoopBuilder;
 class BlockCoverageBuilder;
 class BytecodeJumpTable;
+
+struct PrototypeAssignments {
+  Variable* var;
+  HoleCheckMode hole_check_mode;
+  ZoneVector<PrototypeAssignment> properties;
+  absl::flat_hash_set<const AstRawString*> duplicates;
+};
 
 class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
  public:
@@ -62,12 +71,17 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   }
 
 #ifdef DEBUG
-  int CheckBytecodeMatches(Tagged<BytecodeArray> bytecode);
+  int CheckBytecodeMatches(Handle<BytecodeArray> bytecode);
 #endif
 
 #define DECLARE_VISIT(type) void Visit##type(type* node);
   AST_NODE_LIST(DECLARE_VISIT)
 #undef DECLARE_VISIT
+
+  bool IsPrototypeAssignment(
+      Statement* stmt, std::unique_ptr<PrototypeAssignments>* assignments);
+  V8_NOINLINE void VisitConsecutivePrototypeAssignments(
+      std::unique_ptr<PrototypeAssignments> assignments);
 
   // Visiting function for declarations list and statements are overridden.
   void VisitModuleDeclarations(Declaration::List* declarations);
@@ -108,10 +122,10 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   enum class TestFallthrough { kThen, kElse, kNone };
   enum class AccumulatorPreservingMode { kNone, kPreserve };
 
-  // An assignment has to evaluate its LHS before its RHS, but has to assign to
-  // the LHS after both evaluations are done. This class stores the data
-  // computed in the LHS evaluation that has to live across the RHS evaluation,
-  // and is used in the actual LHS assignment.
+  // An assignment has to evaluate its LHS before its RHS, but has to assign
+  // to the LHS after both evaluations are done. This class stores the data
+  // computed in the LHS evaluation that has to live across the RHS
+  // evaluation, and is used in the actual LHS assignment.
   class AssignmentLhsData {
    public:
     static AssignmentLhsData NonProperty(Expression* expr);
@@ -130,6 +144,8 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
         RegisterList super_property_args);
     static AssignmentLhsData KeyedSuperProperty(
         RegisterList super_property_args);
+    static AssignmentLhsData PrivateField(Register object, int slot_index,
+                                          int depth);
 
     AssignType assign_type() const { return assign_type_; }
     bool is_private_assign_type() const {
@@ -139,8 +155,11 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
              assign_type_ == PRIVATE_GETTER_AND_SETTER ||
              assign_type_ == PRIVATE_DEBUG_DYNAMIC;
     }
+    bool is_private_field() const { return is_private_field_; }
+
     Expression* expr() const {
-      DCHECK(assign_type_ == NON_PROPERTY || is_private_assign_type());
+      DCHECK(assign_type_ == NON_PROPERTY || is_private_assign_type() ||
+             (v8_flags.private_field_bytecodes && is_private_field()));
       return expr_;
     }
     Expression* object_expr() const {
@@ -158,7 +177,8 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
       return key_;
     }
     const AstRawString* name() const {
-      DCHECK(assign_type_ == NAMED_PROPERTY);
+      DCHECK(assign_type_ == NAMED_PROPERTY ||
+             (v8_flags.private_field_bytecodes && is_private_field_));
       return name_;
     }
     RegisterList super_property_args() const {
@@ -166,19 +186,33 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
              assign_type_ == KEYED_SUPER_PROPERTY);
       return super_property_args_;
     }
+    int slot_index() const {
+      DCHECK(is_private_field_);
+      return slot_index_;
+    }
+    int depth() const {
+      DCHECK(is_private_field_);
+      return depth_;
+    }
+
+    void set_depth(int d) { depth_ = d; }
 
    private:
     AssignmentLhsData(AssignType assign_type, Expression* expr,
                       RegisterList super_property_args, Register object,
                       Register key, Expression* object_expr,
-                      const AstRawString* name)
+                      const AstRawString* name, bool is_private_field = false,
+                      int slot_index = 0, int depth = 0)
         : assign_type_(assign_type),
           expr_(expr),
           super_property_args_(super_property_args),
           object_(object),
           key_(key),
           object_expr_(object_expr),
-          name_(name) {}
+          name_(name),
+          is_private_field_(is_private_field),
+          slot_index_(slot_index),
+          depth_(depth) {}
 
     AssignType assign_type_;
 
@@ -189,12 +223,16 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
     // KEYED_PROPERTY, PRIVATE_METHOD: object, key
     // NAMED_SUPER_PROPERTY: super_property_args
     // KEYED_SUPER_PROPERT:  super_property_args
+    // PRIVATE_FIELD: object, name
     Expression* expr_;
     RegisterList super_property_args_;
     Register object_;
     Register key_;
     Expression* object_expr_;
     const AstRawString* name_;
+    bool is_private_field_;
+    int slot_index_;
+    int depth_;
   };
 
   void GenerateBytecodeBody();
@@ -328,6 +366,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
 
   void BuildGeneratorPrologue();
   void BuildSuspendPoint(int position);
+  void BuildGeneratorEpilogue();
 
   void BuildAwait(int position = kNoSourcePosition);
   void BuildAwait(Expression* await_expr);
@@ -358,7 +397,6 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
                                   Register index, Register value,
                                   FeedbackSlot next_value_slot,
                                   FeedbackSlot next_done_slot,
-                                  FeedbackSlot index_slot,
                                   FeedbackSlot element_slot);
   // Create Array literals. |expr| can be nullptr, but if provided,
   // a boilerplate will be used to create an initial array for elements
@@ -471,8 +509,8 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
                                   BytecodeLabel* super_ctor_call_done);
 
   // Visitors for obtaining expression result in the accumulator, in a
-  // register, or just getting the effect. Some visitors return a TypeHint which
-  // specifies the type of the result of the visited expression.
+  // register, or just getting the effect. Some visitors return a TypeHint
+  // which specifies the type of the result of the visited expression.
   TypeHint VisitForAccumulatorValue(Expression* expr);
   TypeHint VisitForAccumulatorValueAsPropertyKey(Expression* expr);
   TypeHint VisitForAccumulatorValueImpl(Expression* expr,
@@ -521,8 +559,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
                                     const AstRawString* name);
   FeedbackSlot GetDummyCompareICSlot();
 
-  int GetCachedCreateClosureSlot(FunctionLiteral* literal);
-
+  int GetNewClosureSlot(FunctionLiteral* literal);
   void AddToEagerLiteralsIfEager(FunctionLiteral* literal);
 
   static constexpr ToBooleanMode ToBooleanModeFromTypeHint(TypeHint type_hint) {
@@ -627,6 +664,7 @@ class BytecodeGenerator final : public AstVisitor<BytecodeGenerator> {
   ZoneVector<std::pair<GetTemplateObject*, size_t>> template_objects_;
   ZoneVector<Variable*> vars_in_hole_check_bitmap_;
   ZoneVector<std::pair<Call*, Scope*>> eval_calls_;
+  ZoneVector<std::pair<ProtoAssignmentSeqBuilder*, size_t>> proto_assign_seq_;
 
   ControlScope* execution_control_;
   ContextScope* execution_context_;

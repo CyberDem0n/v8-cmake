@@ -112,6 +112,8 @@ EXTERN_DECLARE_HASH_TABLE(CompilationCacheTable, CompilationCacheShape)
 
 class CompilationCacheTable
     : public HashTable<CompilationCacheTable, CompilationCacheShape> {
+  V8_IT_NO_AUTO_CHECKER;
+
  public:
   // The 'script' cache contains SharedFunctionInfos. Once a root
   // SharedFunctionInfo has become old enough that its bytecode is flushed, the
@@ -166,9 +168,10 @@ class CompilationCacheTable
   inline Tagged<Object> PrimaryValueAt(InternalIndex entry);
   inline void SetPrimaryValueAt(InternalIndex entry, Tagged<Object> value,
                                 WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
-  inline Tagged<Object> EvalJSFunctionsValueAt(InternalIndex entry);
+  inline Tagged<UnionOf<TheHole, WeakFixedArray>> EvalJSFunctionsValueAt(
+      InternalIndex entry);
   inline void SetEvalJSFunctionsValueAt(
-      InternalIndex entry, Tagged<Object> value,
+      InternalIndex entry, Tagged<UnionOf<TheHole, WeakFixedArray>> value,
       WriteBarrierMode mode = UPDATE_WRITE_BARRIER);
 
   // The initial placeholder insertion of the eval cache survives this many GCs.

@@ -5,6 +5,7 @@
 #ifndef V8_BASE_MACROS_H_
 #define V8_BASE_MACROS_H_
 
+#include <bit>
 #include <limits>
 #include <type_traits>
 
@@ -39,6 +40,9 @@
 #define GET_NTH_ARG_IMPL_5(_0, _1, _2, _3, _4, _5, ...) _5
 #define GET_NTH_ARG_IMPL_6(_0, _1, _2, _3, _4, _5, _6, ...) _6
 #define GET_NTH_ARG_IMPL_7(_0, _1, _2, _3, _4, _5, _6, _7, ...) _7
+
+// Expands to true if __VA_ARGS__ is empty, false otherwise.
+#define IS_VA_EMPTY(...) GET_NTH_ARG(0, __VA_OPT__(false, ) true)
 
 // UNPAREN(x) removes a layer of nested parentheses on x, if any. This means
 // that both UNPAREN(x) and UNPAREN((x)) expand to x. This is helpful for macros
@@ -80,6 +84,51 @@ template <typename T, size_t N>
 char (&ArraySizeHelper(const T (&array)[N]))[N];
 #endif
 
+// Clang/GCC helpfully warn us about dangling else in nested if statements. This
+// dangling is intentional for the way some macros work, so we can suppress the
+// warning with Pragmas. Clang and GCC helpfully disagree on where the warning
+// is (on the if or the else), so they need separate macros.
+// NOLINTBEGIN
+#if defined(__clang__)
+#define SUPPRESSED_DANGLING_ELSE_WARNING_IF(...) if (__VA_ARGS__)
+#define SUPPRESSED_DANGLING_ELSE_WARNING_ELSE                             \
+  _Pragma("GCC diagnostic push")                                          \
+      _Pragma("GCC diagnostic ignored \"-Wdangling-else\"") else _Pragma( \
+          "GCC diagnostic pop")
+#elif defined(__GNUC__)
+#define SUPPRESSED_DANGLING_ELSE_WARNING_IF(...)                             \
+  _Pragma("GCC diagnostic push")                                             \
+      _Pragma("GCC diagnostic ignored \"-Wdangling-else\"") if (__VA_ARGS__) \
+          _Pragma("GCC diagnostic pop")
+#define SUPPRESSED_DANGLING_ELSE_WARNING_ELSE else
+#else
+#define SUPPRESSED_DANGLING_ELSE_WARNING_IF(...) if (__VA_ARGS__)
+#define SUPPRESSED_DANGLING_ELSE_WARNING_ELSE else
+#endif
+// NOLINTEND
+
+// Macro magic for the syntax:
+//   SCOPED_VARIABLE(FooScope x) {
+//     // x is alive here.
+//   }
+//   // x is dead here.
+//
+// This is a little macro trick: C++17 onwards allows `if` conditions to have an
+// initializer, whose value is alive in both the true and false branches of
+// the `if`. We can therefore create a variable declaration that is scoped to
+// the next block (or single statement) by declaring it in this if. To avoid
+// accidentally making `SCOPED_VARIABLE(init) {} else {}` valid syntax, we make
+// the block be part of the else branch of the if.
+//
+// This is particularly useful for macros that want to internally define some
+// variables, and be followed by a block.
+#define SCOPED_VARIABLE(init)                         \
+  SUPPRESSED_DANGLING_ELSE_WARNING_IF(init; false) {} \
+  SUPPRESSED_DANGLING_ELSE_WARNING_ELSE
+
+// -- Copied from chromium's "base/bit_cast.h", but uses `std::bit_cast` instead
+// of `__builtin_bit_cast`.
+//
 // This is an equivalent to C++20's std::bit_cast<>(), but with additional
 // warnings. It morally does what `*reinterpret_cast<Dest*>(&source)` does, but
 // the cast/deref pair is undefined behavior, while bit_cast<>() isn't.
@@ -92,7 +141,7 @@ char (&ArraySizeHelper(const T (&array)[N]))[N];
 namespace v8::base {
 
 template <class Dest, class Source>
-V8_INLINE Dest bit_cast(Source const& source) {
+V8_INLINE constexpr Dest bit_cast(Source const& source) noexcept {
   static_assert(!std::is_pointer_v<Source>,
                 "bit_cast must not be used on pointer types");
   static_assert(!std::is_pointer_v<Dest>,
@@ -108,13 +157,7 @@ V8_INLINE Dest bit_cast(Source const& source) {
       std::is_trivially_copyable_v<Dest>,
       "bit_cast requires the destination type to be trivially copyable");
 
-#if V8_HAS_BUILTIN_BIT_CAST
-  return __builtin_bit_cast(Dest, source);
-#else
-  Dest dest;
-  memcpy(&dest, &source, sizeof(dest));
-  return dest;
-#endif
+  return std::bit_cast<Dest, Source>(source);
 }
 
 }  // namespace v8::base
@@ -404,13 +447,20 @@ constexpr inline bool IsAligned(T value, U alignment) {
   return (value & (alignment - 1)) == 0;
 }
 
-inline void* AlignedAddress(void* address, size_t alignment) {
-  return reinterpret_cast<void*>(
+template <typename T>
+constexpr inline bool IsAlignedAddress(T* address, size_t alignment) {
+  return IsAligned(reinterpret_cast<uintptr_t>(address), alignment);
+}
+
+template <typename T>
+inline T* AlignedAddress(T* address, size_t alignment) {
+  return reinterpret_cast<T*>(
       RoundDown(reinterpret_cast<uintptr_t>(address), alignment));
 }
 
-inline void* RoundUpAddress(void* address, size_t alignment) {
-  return reinterpret_cast<void*>(
+template <typename T>
+inline T* RoundUpAddress(T* address, size_t alignment) {
+  return reinterpret_cast<T*>(
       RoundUp(reinterpret_cast<uintptr_t>(address), alignment));
 }
 
@@ -472,6 +522,27 @@ bool is_inbounds(float_t v) {
 #define IF_WASM(V, ...)
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+#if V8_ENABLE_WEBASSEMBLY
+#define V8_ENABLE_SIMD128 1
+#ifdef V8_ENABLE_WASM_SIMD256_REVEC
+#define V8_ENABLE_SIMD256 1
+#endif  // V8_ENABLE_WASM_SIMD256_REVEC
+#endif  // V8_ENABLE_WEBASSEMBLY
+
+#if V8_ENABLE_SIMD128
+#define IF_SIMD128(V, ...) EXPAND(V(__VA_ARGS__))
+#else
+#define IF_SIMD128(V, ...)
+#endif  // V8_ENABLE_SIMD128
+
+#if V8_ENABLE_SIMD256
+// 256 bit simd cannot be enabled without 128 bit simd.
+static_assert(V8_ENABLE_SIMD128);
+#define IF_SIMD256(V, ...) EXPAND(V(__VA_ARGS__))
+#else
+#define IF_SIMD256(V, ...)
+#endif  // V8_ENABLE_SIMD256
+
 #ifdef V8_ENABLE_DRUMBRAKE
 #define IF_WASM_DRUMBRAKE(V, ...) EXPAND(V(__VA_ARGS__))
 #else
@@ -493,6 +564,18 @@ bool is_inbounds(float_t v) {
 #define IF_TSAN(V, ...)
 #endif  // V8_IS_TSAN
 
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+#define IF_HARDWARE_SANDBOX(V, ...) EXPAND(V(__VA_ARGS__))
+#else
+#define IF_HARDWARE_SANDBOX(V, ...)
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+
+#ifdef V8_ENABLE_SANDBOX
+#define IF_SANDBOX(V, ...) EXPAND(V(__VA_ARGS__))
+#else
+#define IF_SANDBOX(V, ...)
+#endif  // V8_ENABLE_SANDBOX
+
 // Defines IF_INTL, to be used in macro lists for elements that should only be
 // there if INTL is enabled.
 #ifdef V8_INTL_SUPPORT
@@ -511,14 +594,26 @@ bool is_inbounds(float_t v) {
 #define IF_SHADOW_STACK(V, ...)
 #endif  // V8_ENABLE_CET_SHADOW_STACK
 
-// Defines IF_TARGET_ARCH_64_BIT, to be used in macro lists for elements that
-// should only be there if the target architecture is a 64-bit one.
+// Defines IF_TARGET_ARCH_64_BIT and IF_TARGET_ARCH_32_BIT, to be used in macro
+// lists for elements that should only be there if the target architecture is
+// 64-bit or 32-bit respectively.
 #if V8_TARGET_ARCH_64_BIT
 // EXPAND is needed to work around MSVC's broken __VA_ARGS__ expansion.
 #define IF_TARGET_ARCH_64_BIT(V, ...) EXPAND(V(__VA_ARGS__))
+#define IF_TARGET_ARCH_32_BIT(V, ...)
 #else
 #define IF_TARGET_ARCH_64_BIT(V, ...)
+#define IF_TARGET_ARCH_32_BIT(V, ...) EXPAND(V(__VA_ARGS__))
 #endif  // V8_TARGET_ARCH_64_BIT
+
+// Defines IF_TARGET_ARCH_X64, to be used in macro lists for elements that
+// should only be there if the target architecture is x64.
+#if V8_TARGET_ARCH_X64
+// EXPAND is needed to work around MSVC's broken __VA_ARGS__ expansion.
+#define IF_TARGET_ARCH_X64(V, ...) EXPAND(V(__VA_ARGS__))
+#else
+#define IF_TARGET_ARCH_X64(V, ...)
+#endif  // V8_TARGET_ARCH_X64
 
 // Defines IF_V8_WASM_RANDOM_FUZZERS and IF_NO_V8_WASM_RANDOM_FUZZERS, to be
 // used in macro lists for elements that should only be there/absent when
@@ -546,5 +641,55 @@ bool is_inbounds(float_t v) {
 // Disable FRIEND_TEST macro in Google3.
 #define FRIEND_TEST(test_case_name, test_name)
 #endif
+
+// Enable/disable -Wsign-* warnings in code.
+// See http://crbug.com/441221573 for detail.
+#if defined(__clang__)
+#define START_PROHIBIT_SIGN_CONVERSION()                      \
+  _Pragma("clang diagnostic push")                            \
+      _Pragma("clang diagnostic error \"-Wsign-conversion\"") \
+          _Pragma("clang diagnostic error \"-Wsign-compare\"")
+#define END_PROHIBIT_SIGN_CONVERSION() _Pragma("clang diagnostic pop")
+#else
+#define START_PROHIBIT_SIGN_CONVERSION()
+#define END_PROHIBIT_SIGN_CONVERSION()
+#endif  // defined(__clang__)
+
+// Disable/enable -Wmissing-designated-field-initializers warnings in code.
+#if defined(__clang__)
+#define START_ALLOW_MISSING_DESIGNATED_FIELD_INITIALIZERS() \
+  _Pragma("clang diagnostic push") _Pragma(                 \
+      "clang diagnostic ignored \"-Wmissing-designated-field-initializers\"")
+#define END_ALLOW_MISSING_DESIGNATED_FIELD_INITIALIZERS() \
+  _Pragma("clang diagnostic pop")
+#else
+#define START_ALLOW_MISSING_DESIGNATED_FIELD_INITIALIZERS()
+#define END_ALLOW_MISSING_DESIGNATED_FIELD_INITIALIZERS()
+#endif  // defined(__clang__)
+
+// Disable/enable -Wlifetime-safety warnings in code.
+#if defined(__clang__) && defined(__has_warning) && \
+    __has_warning("-Wlifetime-safety")
+#define START_IGNORE_LIFETIME_SAFETY_WARNINGS() \
+  _Pragma("clang diagnostic push")              \
+      _Pragma("clang diagnostic ignored \"-Wlifetime-safety\"")
+#define END_IGNORE_LIFETIME_SAFETY_WARNINGS() _Pragma("clang diagnostic pop")
+#else
+#define START_IGNORE_LIFETIME_SAFETY_WARNINGS()
+#define END_IGNORE_LIFETIME_SAFETY_WARNINGS()
+#endif  // defined(__clang__)
+
+// Disable/enable -Wreturn-stack-address warnings in code.
+#if defined(__clang__) && defined(__has_warning) && \
+    __has_warning("-Wreturn-stack-address")
+#define START_IGNORE_RETURN_STACK_ADDRESS_WARNINGS() \
+  _Pragma("clang diagnostic push")                   \
+      _Pragma("clang diagnostic ignored \"-Wreturn-stack-address\"")
+#define END_IGNORE_RETURN_STACK_ADDRESS_WARNINGS() \
+  _Pragma("clang diagnostic pop")
+#else
+#define START_IGNORE_RETURN_STACK_ADDRESS_WARNINGS()
+#define END_IGNORE_RETURN_STACK_ADDRESS_WARNINGS()
+#endif  // defined(__clang__)
 
 #endif  // V8_BASE_MACROS_H_

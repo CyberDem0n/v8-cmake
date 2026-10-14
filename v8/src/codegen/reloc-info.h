@@ -113,12 +113,16 @@ class RelocInfo {
     // TODO(ishell): rename to NEAR_CODE_TARGET.
     RELATIVE_CODE_TARGET,  // LAST_CODE_TARGET_MODE
     COMPRESSED_EMBEDDED_OBJECT,
-    FULL_EMBEDDED_OBJECT,  // LAST_GCED_ENUM
+    FULL_EMBEDDED_OBJECT,
+    // An integer JSDispatchHandle, referring to an entry in the
+    // JSDispatchTable.
+    JS_DISPATCH_HANDLE,  // LAST_GCED_ENUM
 
     WASM_CALL,  // FIRST_SHAREABLE_RELOC_MODE
     WASM_STUB_CALL,
     WASM_CODE_POINTER_TABLE_ENTRY,
     WASM_CANONICAL_SIG_ID,
+    WASM_CODE_POINTER,
 
     EXTERNAL_REFERENCE,  // The address of an external C++ function.
     INTERNAL_REFERENCE,  // An address inside the same function.
@@ -126,10 +130,6 @@ class RelocInfo {
     // Encoded internal reference, used only on RISCV64, RISCV32, MIPS64
     // and PPC.
     INTERNAL_REFERENCE_ENCODED,
-
-    // An integer JSDispatchHandle, referring to an entry in the
-    // JSDispatchTable.
-    JS_DISPATCH_HANDLE,
 
     // An off-heap instruction stream target. See:
     // https://docs.google.com/document/d/1XmiXT54FQ0qqroWzRc8nzrpSSo_xoyFRkVgmonONEJk
@@ -163,10 +163,12 @@ class RelocInfo {
     LAST_REAL_RELOC_MODE = VENEER_POOL,
     FIRST_EMBEDDED_OBJECT_RELOC_MODE = COMPRESSED_EMBEDDED_OBJECT,
     LAST_EMBEDDED_OBJECT_RELOC_MODE = FULL_EMBEDDED_OBJECT,
-    LAST_GCED_ENUM = LAST_EMBEDDED_OBJECT_RELOC_MODE,
+    LAST_GCED_ENUM = JS_DISPATCH_HANDLE,
     FIRST_BUILTIN_ENTRY_MODE = OFF_HEAP_TARGET,
     LAST_BUILTIN_ENTRY_MODE = NEAR_BUILTIN_ENTRY,
     FIRST_SHAREABLE_RELOC_MODE = WASM_CALL,
+    FIRST_DEOPT_MODE = DEOPT_SCRIPT_OFFSET,
+    LAST_DEOPT_MODE = DEOPT_NODE_ID,
   };
 
   static_assert(NUMBER_OF_MODES <= kBitsPerInt);
@@ -218,11 +220,17 @@ class RelocInfo {
   static constexpr bool IsWasmCanonicalSigId(Mode mode) {
     return mode == WASM_CANONICAL_SIG_ID;
   }
+  static constexpr bool IsWasmCodePointer(Mode mode) {
+    return mode == WASM_CODE_POINTER;
+  }
   static constexpr bool IsWasmCodePointerTableEntry(Mode mode) {
     return mode == WASM_CODE_POINTER_TABLE_ENTRY;
   }
   static constexpr bool IsConstPool(Mode mode) { return mode == CONST_POOL; }
   static constexpr bool IsVeneerPool(Mode mode) { return mode == VENEER_POOL; }
+  static constexpr bool IsDeoptMode(Mode mode) {
+    return mode >= FIRST_DEOPT_MODE && mode <= LAST_DEOPT_MODE;
+  }
   static constexpr bool IsDeoptPosition(Mode mode) {
     return mode == DEOPT_SCRIPT_OFFSET || mode == DEOPT_INLINING_ID;
   }
@@ -295,6 +303,7 @@ class RelocInfo {
   Address wasm_stub_call_address() const;
   V8_EXPORT_PRIVATE uint32_t wasm_canonical_sig_id() const;
   V8_INLINE WasmCodePointer wasm_code_pointer_table_entry() const;
+  V8_INLINE Address wasm_code_pointer() const;
 
   uint32_t wasm_call_tag() const;
 
@@ -306,7 +315,7 @@ class RelocInfo {
   // can only be called if IsCodeTarget(rmode_)
   V8_INLINE Address target_address();
   // Cage base value is used for decompressing compressed embedded references.
-  V8_INLINE Tagged<HeapObject> target_object(PtrComprCageBase cage_base);
+  V8_INLINE Tagged<HeapObject> target_object();
 
   V8_INLINE DirectHandle<HeapObject> target_object_handle(Assembler* origin);
 
@@ -355,6 +364,11 @@ class RelocInfo {
   // can only be called if rmode_ is JS_DISPATCH_HANDLE.
   V8_INLINE JSDispatchHandle js_dispatch_handle();
 
+  // Returns address and size of a slot for garbage collection reasons. Only
+  // usable if `IsGCRelocMode()` is true.
+  V8_INLINE Address target_address_address_for_gc();
+  V8_INLINE uint32_t target_address_size_for_gc();
+
   template <typename ObjectVisitor>
   void Visit(Tagged<InstructionStream> host, ObjectVisitor* visitor);
 
@@ -394,7 +408,8 @@ class RelocInfo {
            ModeMask(RelocInfo::FULL_EMBEDDED_OBJECT) |
            ModeMask(RelocInfo::NEAR_BUILTIN_ENTRY) |
            ModeMask(RelocInfo::WASM_STUB_CALL) |
-           ModeMask(RelocInfo::RELATIVE_CODE_TARGET) | kApplyMask;
+           ModeMask(RelocInfo::RELATIVE_CODE_TARGET) |
+           JSDispatchHandleModeMask() | kApplyMask;
   }
 
  protected:
@@ -431,6 +446,7 @@ class WritableRelocInfo : public RelocInfo {
   V8_INLINE void set_wasm_code_pointer_table_entry(
       WasmCodePointer,
       ICacheFlushMode icache_flush_mode = FLUSH_ICACHE_IF_NEEDED);
+  V8_INLINE void set_wasm_code_pointer(Address);
 
   void set_target_address(
       Tagged<InstructionStream> host, Address target,

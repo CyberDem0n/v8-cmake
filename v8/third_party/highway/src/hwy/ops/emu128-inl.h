@@ -78,6 +78,10 @@ struct Vec128 {
 template <typename T, size_t N = 16 / sizeof(T)>
 struct Mask128 {
   using Raw = hwy::MakeUnsigned<T>;
+
+  using PrivateT = T;                     // only for DFromM
+  static constexpr size_t kPrivateN = N;  // only for DFromM
+
   static HWY_INLINE Raw FromBool(bool b) {
     return b ? static_cast<Raw>(~Raw{0}) : 0;
   }
@@ -88,6 +92,9 @@ struct Mask128 {
 
 template <class V>
 using DFromV = Simd<typename V::PrivateT, V::kPrivateN, 0>;
+
+template <class M>
+using DFromM = Simd<typename M::PrivateT, M::kPrivateN, 0>;
 
 template <class V>
 using TFromV = typename V::PrivateT;
@@ -309,12 +316,6 @@ HWY_API Vec128<T, N> operator^(Vec128<T, N> a, Vec128<T, N> b) {
   return Xor(a, b);
 }
 
-// ------------------------------ Xor3
-template <typename T, size_t N>
-HWY_API Vec128<T, N> Xor3(Vec128<T, N> x1, Vec128<T, N> x2, Vec128<T, N> x3) {
-  return Xor(x1, Xor(x2, x3));
-}
-
 // ------------------------------ Or3
 template <typename T, size_t N>
 HWY_API Vec128<T, N> Or3(Vec128<T, N> o1, Vec128<T, N> o2, Vec128<T, N> o3) {
@@ -384,6 +385,15 @@ VFromD<D> VecFromMask(D /* tag */, MFromD<D> mask) {
   VFromD<D> v;
   CopySameSize(&mask.bits, &v.raw);
   return v;
+}
+
+template <class D>
+uint64_t BitsFromMask(D d, MFromD<D> mask) {
+  uint64_t bits = 0;
+  for (size_t i = 0; i < Lanes(d); ++i) {
+    bits |= mask.bits[i] ? (1ull << i) : 0;
+  }
+  return bits;
 }
 
 template <class D>
@@ -669,8 +679,7 @@ HWY_API Vec128<T, N> AverageRound(Vec128<T, N> a, Vec128<T, N> b) {
   for (size_t i = 0; i < N; ++i) {
     const T a_val = a.raw[i];
     const T b_val = b.raw[i];
-    a.raw[i] = static_cast<T>(ScalarShr(a_val, 1) + ScalarShr(b_val, 1) +
-                              ((a_val | b_val) & 1));
+    a.raw[i] = static_cast<T>((a_val | b_val) - ScalarShr(a_val ^ b_val, 1));
   }
   return a;
 }
@@ -2297,6 +2306,28 @@ HWY_API Vec128<T, N> SwapAdjacentBlocks(Vec128<T, N> v) {
   return v;
 }
 
+// ------------------------------ InterleaveEvenBlocks
+template <class D, class V = VFromD<D>>
+HWY_API V InterleaveEvenBlocks(D, V a, V /*b*/) {
+  return a;
+}
+// ------------------------------ InterleaveOddBlocks
+template <class D, class V = VFromD<D>>
+HWY_API V InterleaveOddBlocks(D, V a, V /*b*/) {
+  return a;
+}
+
+// ------------------------------ InterleaveLowerBlocks
+template <class D, class V = VFromD<D>>
+HWY_API V InterleaveLowerBlocks(D, V a, V /*b*/) {
+  return a;
+}
+// ------------------------------ InterleaveUpperBlocks
+template <class D, class V = VFromD<D>>
+HWY_API V InterleaveUpperBlocks(D, V a, V /*b*/) {
+  return a;
+}
+
 // ------------------------------ TableLookupLanes
 
 // Returned by SetTableIndices for use by TableLookupLanes.
@@ -2879,7 +2910,7 @@ HWY_API VFromD<D> ReorderWidenMulAccumulate(D d32, V16 a, V16 b,
 }
 
 // ------------------------------ RearrangeToOddPlusEven
-template <class VW>
+template <class VW, HWY_IF_NOT_FLOAT_V(VW)>
 HWY_API VW RearrangeToOddPlusEven(VW sum0, VW sum1) {
   return Add(sum0, sum1);
 }
@@ -2900,9 +2931,10 @@ HWY_API T ReduceSum(D d, VFromD<D> v) {
   }
   return sum;
 }
+
 template <class D, typename T = TFromD<D>, HWY_IF_REDUCE_D(D)>
 HWY_API T ReduceMin(D d, VFromD<D> v) {
-  T min = HighestValue<T>();
+  T min = PositiveInfOrHighestValue<T>();
   for (size_t i = 0; i < MaxLanes(d); ++i) {
     min = HWY_MIN(min, v.raw[i]);
   }
@@ -2910,7 +2942,7 @@ HWY_API T ReduceMin(D d, VFromD<D> v) {
 }
 template <class D, typename T = TFromD<D>, HWY_IF_REDUCE_D(D)>
 HWY_API T ReduceMax(D d, VFromD<D> v) {
-  T max = LowestValue<T>();
+  T max = NegativeInfOrLowestValue<T>();
   for (size_t i = 0; i < MaxLanes(d); ++i) {
     max = HWY_MAX(max, v.raw[i]);
   }

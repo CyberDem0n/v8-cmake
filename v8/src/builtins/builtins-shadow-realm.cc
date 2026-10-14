@@ -14,7 +14,7 @@ namespace internal {
 BUILTIN(ShadowRealmConstructor) {
   HandleScope scope(isolate);
   // 1. If NewTarget is undefined, throw a TypeError exception.
-  if (IsUndefined(*args.new_target(), isolate)) {  // [[Call]]
+  if (IsUndefined(*args.new_target())) {  // [[Call]]
     THROW_NEW_ERROR_RETURN_FAILURE(
         isolate, NewTypeError(MessageTemplate::kConstructorNotFunction,
                               isolate->factory()->ShadowRealm_string()));
@@ -70,12 +70,10 @@ MaybeDirectHandle<Object> GetWrappedValue(
   if (!IsCallable(*value)) {
     // The TypeError thrown is created with creation Realm's TypeError
     // constructor instead of the executing Realm's.
-    THROW_NEW_ERROR_RETURN_VALUE(
-        isolate,
-        NewError(
-            direct_handle(creation_context->type_error_function(), isolate),
-            MessageTemplate::kNotCallable, value),
-        {});
+    THROW_NEW_ERROR(
+        isolate, NewError(direct_handle(creation_context->type_error_function(),
+                                        isolate),
+                          MessageTemplate::kNotCallable, value));
   }
   // 1b. Return ? WrappedFunctionCreate(callerRealm, value).
   return JSWrappedFunction::Create(isolate, creation_context,
@@ -190,6 +188,9 @@ BUILTIN(ShadowRealmPrototypeEvaluate) {
 
   if (result.is_null()) {
     DCHECK(isolate->has_exception());
+    if (isolate->is_execution_terminating()) {
+      return ReadOnlyRoots(isolate).exception();
+    }
     Handle<Object> exception(isolate->exception(), isolate);
     isolate->clear_internal_exception();
     if (is_parse_failed) {

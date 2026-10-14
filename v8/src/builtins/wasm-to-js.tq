@@ -19,6 +19,14 @@ struct WasmToJSResult {
 
 extern builtin IterableToFixedArrayForWasm(Context, JSAny, Smi): FixedArray;
 
+extern builtin CallVarargs(
+    Context,
+    JSAny,      // target
+    int32,      // number of arguments already on the stack
+    int32,      // number of arguments in the FixedArray
+    FixedArray  // arguments list
+    ): JSAny;
+
 extern macro StackAlignmentInBytes(): intptr;
 
 const kSignatureOffset: constexpr intptr
@@ -61,11 +69,12 @@ transitioning macro WasmToJSWrapper(data: WasmImportData): WasmToJSResult {
   // 1 fixed slot, rounded up to stack alignment.
   const numFixedSlots = alignment;
 
-  ModifyThreadInWasmFlag(0);
   // Trigger a wrapper tier-up when this function got called often enough.
-  dcheck(data.wrapper_budget > 0);
-  data.wrapper_budget = data.wrapper_budget - 1;
-  if (data.wrapper_budget == 0) {
+  let budget: Smi = UnsafeCast<Smi>(data.wrapper_budget.value);
+  dcheck(budget > 0);
+  budget -= 1;
+  data.wrapper_budget.value = budget;
+  if (budget == 0) {
     runtime::TierUpWasmToJSWrapper(kNoContext, data);
   }
 
@@ -172,7 +181,7 @@ transitioning macro WasmToJSWrapper(data: WasmImportData): WasmToJSResult {
         const rawRef = *slot;
         const value = BitcastWordToTagged(rawRef);
         outParams.objects[nextIndex] =
-            WasmToJSObject(data.native_context, value, paramType);
+            WasmToJSObject(data.native_context, value);
       }
       nextIndex++;
     }
@@ -187,11 +196,6 @@ transitioning macro WasmToJSWrapper(data: WasmImportData): WasmToJSResult {
   const result = CallVarargs(
       context, target, 0, Convert<int32>(numStackParams), outParams);
 
-  // Put a marker on the stack to indicate to the frame iterator that the call
-  // to JavaScript is finished. For asm.js source positions it is important to
-  // know if an exception happened in the call to JS, or in the ToNumber
-  // conversion afterwards.
-  *GetRefAt<intptr>(sigSlot, 0) = -1;
   let resultFixedArray: FixedArray;
   if (returnCount > 1) {
     resultFixedArray =
@@ -227,10 +231,10 @@ transitioning macro WasmToJSWrapper(data: WasmImportData): WasmToJSResult {
       let toRef = locationAllocator.GetGPSlot();
       typeswitch (retVal) {
         case (smiVal: Smi): {
-          *toRef = Convert<intptr>(Unsigned(SmiToInt32(smiVal)));
+          *toRef = Convert<intptr>(SmiToInt32(smiVal));
         }
         case (heapVal: JSAnyNotSmi): {
-          *toRef = Convert<intptr>(Unsigned(WasmTaggedNonSmiToInt32(heapVal)));
+          *toRef = Convert<intptr>(WasmTaggedNonSmiToInt32(heapVal));
         }
       }
     } else if (retType == kWasmF32Type) {
@@ -297,7 +301,6 @@ transitioning macro WasmToJSWrapper(data: WasmImportData): WasmToJSResult {
           torque_internal::SizeOf<intptr>() +
       numFixedSlots;
 
-  ModifyThreadInWasmFlag(1);
   const wasmToJSResult = WasmToJSResult{
     popCount: popCount,
     result0: *GetRefAt<intptr>(gpRegSlots, 0),

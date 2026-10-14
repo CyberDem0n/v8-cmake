@@ -74,16 +74,21 @@ LINT_RULES = """
 """.split()
 
 LINT_OUTPUT_PATTERN = re.compile(r'^.+[:(]\d+[:)]')
-FLAGS_LINE = re.compile("//\s*Flags:.*--([A-z0-9-])+_[A-z0-9].*\n")
+FLAGS_LINE = re.compile(r"//\s*Flags:.*--([A-z0-9-])+_[A-z0-9].*\n")
 ASSERT_OPTIMIZED_PATTERN = re.compile("assertOptimized")
-FLAGS_ENABLE_MAGLEV = re.compile("//\s*Flags:.*--maglev[^-].*\n")
-FLAGS_ENABLE_TURBOFAN = re.compile("//\s*Flags:.*--turbofan[^-].*\n")
+FLAGS_ENABLE_MAGLEV = re.compile(r"//\s*Flags:.*--maglev[^-].*\n")
+FLAGS_ENABLE_TURBOLEV = re.compile(r"//\s*Flags:.*--turbolev[^-].*\n")
+FLAGS_ENABLE_TURBOFAN = re.compile(r"//\s*Flags:.*--turbofan[^-].*\n")
 ASSERT_UNOPTIMIZED_PATTERN = re.compile("assertUnoptimized")
-FLAGS_NO_ALWAYS_OPT = re.compile("//\s*Flags:.*--no-?always-turbofan.*\n")
 
 TOOLS_PATH = dirname(abspath(__file__))
 DEPS_DEPOT_TOOLS_PATH = abspath(
     join(TOOLS_PATH, '..', 'third_party', 'depot_tools'))
+# If the depot_tools don't exist in the V8 directory, we are probably in a
+# chromium checkout, so we can use the depot tools of the chromium checkout.
+if not isdir(DEPS_DEPOT_TOOLS_PATH):
+  DEPS_DEPOT_TOOLS_PATH = abspath(
+      join(TOOLS_PATH, '..', '..', 'third_party', 'depot_tools'))
 
 sys.path.append(DEPS_DEPOT_TOOLS_PATH)
 import rdb_wrapper
@@ -118,6 +123,16 @@ def CppLintWorker(command):
     print('Error running cpplint.py. Please make sure you have depot_tools' +
           ' in your third_party directory. Lint check skipped.')
     process.kill()
+
+def ClangFormatWorker(command):
+  try:
+    # Run unchecked to only flag timeouts.
+    subprocess.run(
+        command, stderr=subprocess.PIPE, check=False, timeout=30)
+  except:
+    sys.stdout.write(f'Got a clang-format timeout with {command.pop()}\n')
+    return 1
+  return 0
 
 def TorqueLintWorker(command):
   try:
@@ -433,6 +448,7 @@ class TorqueLintProcessor(CacheableSourceFileProcessor):
 
     return None, arguments
 
+
 class JSLintProcessor(CacheableSourceFileProcessor):
   """
   Check .{m}js file to verify they follow the JS Style guide.
@@ -454,6 +470,49 @@ class JSLintProcessor(CacheableSourceFileProcessor):
   def GetProcessorScript(self):
     jslint = join(DEPS_DEPOT_TOOLS_PATH, 'clang_format.py')
     return jslint, []
+
+
+class ClangFormatProcessor(CacheableSourceFileProcessor):
+  """
+  Check if clang-format runs into timeouts with any files.
+
+  Note, we are not actually enforcing the format as that creates too
+  many differences on config updates.
+  """
+
+  def __init__(self, use_cache=True):
+    super(ClangFormatProcessor, self).__init__(
+      use_cache=use_cache, cache_file_path='.clang-format-cache', file_type='C/C++')
+
+  def IsRelevant(self, name):
+    return name.endswith('.cc') or name.endswith('.h')
+
+  def IgnoreDir(self, name):
+    return (super(ClangFormatProcessor, self).IgnoreDir(name)
+            or (name == 'third_party'))
+
+  # Clang-format is too slow on these files.
+  IGNORE_FORMAT = [
+    'gay-fixed.cc',
+    'gay-precision.cc',
+    'gay-shortest.cc',
+  ]
+
+  def IgnoreFile(self, name):
+    return (super(ClangFormatProcessor, self).IgnoreFile(name)
+              or (name in ClangFormatProcessor.IGNORE_FORMAT))
+
+  def GetPathsToSearch(self):
+    dirs = ['include', 'samples', 'src']
+    test_dirs = ['cctest', 'common', 'fuzzer', 'inspector', 'unittests']
+    return dirs + [join('test', dir) for dir in test_dirs]
+
+  def GetProcessorWorker(self):
+    return ClangFormatWorker
+
+  def GetProcessorScript(self):
+    arguments = ['--fail-on-incomplete-format', '--Werror', '-n']
+    return join(DEPS_DEPOT_TOOLS_PATH, 'clang_format.py'), arguments
 
 
 COPYRIGHT_HEADER_PATTERN = re.compile(
@@ -482,7 +541,7 @@ class SourceProcessor(SourceFileProcessor):
       print ("Runtime functions list is suspiciously short. "
              "Consider updating the presubmit script.")
       sys.exit(1)
-    str = '(\%\s+(' + '|'.join(runtime_functions) + '))[\s\(]'
+    str = r'(\%\s+(' + '|'.join(runtime_functions) + r'))[\s\(]'
     return re.compile(str)
 
   # Overwriting the one in the parent class.
@@ -604,14 +663,10 @@ class SourceProcessor(SourceFileProcessor):
           not "mjsunit/mjsunit_numfuzz.js" in name):
         if ASSERT_OPTIMIZED_PATTERN.search(contents) and \
             not FLAGS_ENABLE_MAGLEV.search(contents) and \
+            not FLAGS_ENABLE_TURBOLEV.search(contents) and \
             not FLAGS_ENABLE_TURBOFAN.search(contents):
-          print("%s Flag --maglev or --turbofan should be set if " \
-                "assertOptimized() is used" % name)
-          result = False
-        if ASSERT_UNOPTIMIZED_PATTERN.search(contents) and \
-            not FLAGS_NO_ALWAYS_OPT.search(contents):
-          print("%s Flag --no-always-turbofan should be set if " \
-                "assertUnoptimized() is used" % name)
+          print("%s Flag --maglev, --turbolev, or --turbofan should be " \
+                "set if assertOptimized() is used" % name)
           result = False
 
       match = self.runtime_function_call_pattern.search(contents)
@@ -734,7 +789,7 @@ class GCMoleProcessor(SourceFileProcessor):
   tools/gcmole/gcmole.py::build_file_list()
   """
   gcmole_re = re.compile('### gcmole(.*)')
-  arch_re = re.compile('\((.+)\) ###')
+  arch_re = re.compile(r'\((.+)\) ###')
 
   def IsRelevant(self, name):
     return True
@@ -781,6 +836,8 @@ def FindTests(workspace):
       'tools/ignition/linux_perf_report_test.py',
       'tools/ignition/bytecode_dispatches_report_test.py',
       'tools/ignition/linux_perf_bytecode_annotate_test.py',
+      # TODO(https://crbug.com/430336825): Unskip once bug is resolved.
+      'tools/protoc_wrapper/protoc_wrapper_test.py',
   ]
   scripts_without_excluded = []
   for root, dirs, files in os.walk(join(workspace, 'tools')):
@@ -792,6 +849,12 @@ def FindTests(workspace):
     if not any(exc_dir in script for exc_dir in exclude):
       scripts_without_excluded.append(script)
   return scripts_without_excluded
+
+
+def CheckMarkdown(workspace):
+  script = join(workspace, 'tools', 'dev', 'markdown_checker.py')
+  print('Running ' + script)
+  return subprocess.call(['vpython3', script], stdout=subprocess.PIPE) == 0
 
 
 def PyTests(workspace):
@@ -885,13 +948,15 @@ def Main():
   (options, args) = parser.parse_args()
   use_linter_cache = not options.no_linter_cache
   checks = [
-    CheckDeps,
-    TorqueLintProcessor(use_cache=use_linter_cache),
-    JSLintProcessor(use_cache=use_linter_cache),
-    SourceProcessor(),
-    StatusFilesProcessor(),
-    PyTests,
-    GCMoleProcessor(),
+      CheckDeps,
+      ClangFormatProcessor(use_cache=use_linter_cache),
+      TorqueLintProcessor(use_cache=use_linter_cache),
+      JSLintProcessor(use_cache=use_linter_cache),
+      SourceProcessor(),
+      StatusFilesProcessor(),
+      CheckMarkdown,
+      PyTests,
+      GCMoleProcessor(),
   ]
   if not options.no_lint:
     checks.append(CppLintProcessor(use_cache=use_linter_cache))

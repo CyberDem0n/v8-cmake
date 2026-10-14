@@ -36,8 +36,8 @@ class V8_EXPORT_PRIVATE BytecodeLoopAssignments {
   int local_count() const { return bit_vector_->length() - parameter_count_; }
 
  private:
-  int const parameter_count_;
-  BitVector* const bit_vector_;
+  int parameter_count_;
+  BitVector* bit_vector_;
 };
 
 // Jump targets for resuming a suspended generator.
@@ -68,17 +68,29 @@ class V8_EXPORT_PRIVATE ResumeJumpTarget {
 
 struct V8_EXPORT_PRIVATE LoopInfo {
  public:
-  LoopInfo(int parent_offset, int loop_start, int loop_end, int parameter_count,
-           int register_count, Zone* zone)
+  LoopInfo(int parent_offset, int loop_start, int loop_end,
+           int jump_loop_offset, int parameter_count, int register_count,
+           Zone* zone)
       : parent_offset_(parent_offset),
         loop_start_(loop_start),
         loop_end_(loop_end),
+        jump_loop_offset_(jump_loop_offset),
         assignments_(parameter_count, register_count, zone),
         resume_jump_targets_(zone) {}
+  LoopInfo(int parent_offset, int loop_start, int loop_end, int parameter_count,
+           int register_count, Zone* zone)
+      : LoopInfo(parent_offset, loop_start, loop_end, -1, parameter_count,
+                 register_count, zone) {}
+  LoopInfo(const LoopInfo&) V8_NOEXCEPT = default;
+  LoopInfo(LoopInfo&&) V8_NOEXCEPT = default;
+  LoopInfo& operator=(const LoopInfo&) V8_NOEXCEPT = default;
+  LoopInfo& operator=(LoopInfo&&) V8_NOEXCEPT = default;
+  ~LoopInfo() = default;
 
   int parent_offset() const { return parent_offset_; }
   int loop_start() const { return loop_start_; }
   int loop_end() const { return loop_end_; }
+  int jump_loop_offset() const { return jump_loop_offset_; }
   bool resumable() const { return resumable_; }
   void mark_resumable() { resumable_ = true; }
   bool innermost() const { return innermost_; }
@@ -103,6 +115,7 @@ struct V8_EXPORT_PRIVATE LoopInfo {
   int parent_offset_;
   int loop_start_;
   int loop_end_;
+  int jump_loop_offset_;
   bool resumable_ = false;
   bool innermost_ = true;
   BytecodeLoopAssignments assignments_;
@@ -133,7 +146,9 @@ class V8_EXPORT_PRIVATE BytecodeAnalysis : public ZoneObject {
   // null if there isn't any.
   const LoopInfo* TryGetLoopInfoFor(int header_offset) const;
 
-  const ZoneMap<int, LoopInfo>& GetLoopInfos() const { return header_to_info_; }
+  const base::Vector<const LoopInfo>& GetLoopInfos() const {
+    return loop_infos_;
+  }
 
   // Get the top-level resume jump targets.
   const ZoneVector<ResumeJumpTarget>& resume_jump_targets() const {
@@ -175,7 +190,8 @@ class V8_EXPORT_PRIVATE BytecodeAnalysis : public ZoneObject {
   bool const analyze_liveness_;
   ZoneVector<ResumeJumpTarget> resume_jump_targets_;
   ZoneMap<int, int> end_to_header_;
-  ZoneMap<int, LoopInfo> header_to_info_;
+  // Sorted vector of LoopInfos, in order of loop header offset.
+  base::Vector<const LoopInfo> loop_infos_;
   int osr_entry_point_;
   std::optional<BytecodeLivenessMap> liveness_map_;
   int bytecode_count_ = -1;

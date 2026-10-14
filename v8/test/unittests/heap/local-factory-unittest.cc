@@ -90,7 +90,8 @@ class LocalFactoryTest : public TestWithIsolateAndZone {
 
     // Create the SFI list on the script so that SFI SetScript works.
     DirectHandle<WeakFixedArray> infos = local_factory()->NewWeakFixedArray(
-        parse_info()->max_info_id() + 1, AllocationType::kOld);
+        static_cast<uint32_t>(parse_info()->max_info_id() + 1),
+        AllocationType::kOld);
     script_->set_infos(*infos);
 
     return parse_info()->literal();
@@ -243,7 +244,7 @@ TEST_F(LocalFactoryTest, LazyFunction) {
   EXPECT_EQ(lazy_sfi->function_literal_id(kRelaxedLoad), 1);
   EXPECT_TRUE(lazy_sfi->Name()->IsOneByteEqualTo(base::CStrVector("lazy")));
   EXPECT_FALSE(lazy_sfi->is_compiled());
-  EXPECT_TRUE(lazy_sfi->HasUncompiledDataWithoutPreparseData());
+  EXPECT_TRUE(lazy_sfi->HasUncompiledDataWithoutPreparseData(local_isolate()));
 }
 
 TEST_F(LocalFactoryTest, EagerFunction) {
@@ -269,7 +270,7 @@ TEST_F(LocalFactoryTest, EagerFunction) {
 
   EXPECT_EQ(eager_sfi->function_literal_id(kRelaxedLoad), 1);
   EXPECT_TRUE(eager_sfi->Name()->IsOneByteEqualTo(base::CStrVector("eager")));
-  EXPECT_FALSE(eager_sfi->HasUncompiledData());
+  EXPECT_FALSE(eager_sfi->HasUncompiledData(local_isolate()));
   // TODO(leszeks): Add compilation support and enable these checks.
   // EXPECT_TRUE(eager_sfi->is_compiled());
   // EXPECT_TRUE(eager_sfi->HasBytecodeArray());

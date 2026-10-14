@@ -4,12 +4,14 @@
 
 #include "src/snapshot/context-serializer.h"
 
+#include "include/v8config.h"
 #include "src/api/api-inl.h"
 #include "src/execution/microtask-queue.h"
 #include "src/heap/combined-heap.h"
 #include "src/numbers/math-random.h"
 #include "src/objects/cpp-heap-object-wrapper-inl.h"
 #include "src/objects/embedder-data-array-inl.h"
+#include "src/objects/heap-object-field-inl.h"
 #include "src/objects/js-objects.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/slots.h"
@@ -18,52 +20,6 @@
 
 namespace v8 {
 namespace internal {
-
-namespace {
-
-// During serialization, puts the native context into a state understood by the
-// serializer (e.g. by clearing lists of InstructionStream objects).  After
-// serialization, the original state is restored.
-class V8_NODISCARD SanitizeNativeContextScope final {
- public:
-  SanitizeNativeContextScope(Isolate* isolate,
-                             Tagged<NativeContext> native_context,
-                             bool allow_active_isolate_for_testing,
-                             const DisallowGarbageCollection& no_gc)
-      : native_context_(native_context), no_gc_(no_gc) {
-#ifdef DEBUG
-    if (!allow_active_isolate_for_testing) {
-      // Microtasks.
-      MicrotaskQueue* microtask_queue = native_context_->microtask_queue();
-      DCHECK_EQ(0, microtask_queue->size());
-      DCHECK(!microtask_queue->HasMicrotasksSuppressions());
-      DCHECK_EQ(0, microtask_queue->GetMicrotasksScopeDepth());
-      DCHECK(microtask_queue->DebugMicrotasksScopeDepthIsZero());
-    }
-#endif
-    microtask_queue_external_pointer_ =
-        native_context
-            ->RawExternalPointerField(NativeContext::kMicrotaskQueueOffset,
-                                      kNativeContextMicrotaskQueueTag)
-            .GetAndClearContentForSerialization(no_gc);
-  }
-
-  ~SanitizeNativeContextScope() {
-    // Restore saved fields.
-    native_context_
-        ->RawExternalPointerField(NativeContext::kMicrotaskQueueOffset,
-                                  kNativeContextMicrotaskQueueTag)
-        .RestoreContentAfterSerialization(microtask_queue_external_pointer_,
-                                          no_gc_);
-  }
-
- private:
-  Tagged<NativeContext> native_context_;
-  ExternalPointerSlot::RawContent microtask_queue_external_pointer_;
-  const DisallowGarbageCollection& no_gc_;
-};
-
-}  // namespace
 
 ContextSerializer::ContextSerializer(Isolate* isolate,
                                      Snapshot::SerializerFlags flags,
@@ -90,22 +46,21 @@ void ContextSerializer::Serialize(Tagged<Context>* o,
   reference_map()->AddAttachedReference(context_->global_proxy());
   reference_map()->AddAttachedReference(context_->global_proxy()->map());
 
-  // The bootstrap snapshot has a code-stub context. When serializing the
-  // context snapshot, it is chained into the weak context list on the isolate
-  // and it's next context pointer may point to the code-stub context.  Clear
-  // it before serializing, it will get re-added to the context list
-  // explicitly when it's loaded.
-  // TODO(v8:10416): These mutations should not observably affect the running
-  // context.
-  context_->SetNoCell(Context::NEXT_CONTEXT_LINK,
-                      ReadOnlyRoots(isolate()).undefined_value());
   DCHECK(!IsUndefined(context_->global_object()));
   // Reset math random cache to get fresh random numbers.
   MathRandom::ResetContext(context_);
 
-  SanitizeNativeContextScope sanitize_native_context(
-      isolate(), context_->native_context(), allow_active_isolate_for_testing(),
-      no_gc);
+#ifdef DEBUG
+  if (!allow_active_isolate_for_testing()) {
+    // Microtasks.
+    MicrotaskQueue* microtask_queue =
+        context_->native_context()->microtask_queue();
+    DCHECK_EQ(0, microtask_queue->size());
+    DCHECK(!microtask_queue->HasMicrotasksSuppressions());
+    DCHECK_EQ(0, microtask_queue->GetMicrotasksScopeDepth());
+    DCHECK(microtask_queue->DebugMicrotasksScopeDepthIsZero());
+  }
+#endif  // DEBUG
 
   VisitRootPointer(Root::kStartupObjectCache, nullptr, FullObjectSlot(o));
   SerializeDeferredObjects();
@@ -205,7 +160,7 @@ void ContextSerializer::SerializeObjectImpl(Handle<HeapObject> obj,
     Handle<JSObject> js_obj = Cast<JSObject>(obj);
     int embedder_fields_count = js_obj->GetEmbedderFieldCount();
     if (embedder_fields_count > 0) {
-      DCHECK(!js_obj->NeedsRehashing(cage_base()));
+      DCHECK(!js_obj->NeedsRehashing());
       v8::Local<v8::Object> api_obj = v8::Utils::ToLocal(js_obj);
       v8::SerializeInternalFieldsCallback user_callback =
           serialize_embedder_fields_.js_object_callback;
@@ -270,15 +225,9 @@ bool ContextSerializer::ShouldBeInTheStartupObjectCache(Tagged<HeapObject> o) {
   // script would cause dupes.
   return IsName(o) || IsScript(o) || IsSharedFunctionInfo(o) ||
          IsHeapNumber(o) || IsCode(o) || IsInstructionStream(o) ||
-         IsScopeInfo(o) || IsAccessorInfo(o) || IsTemplateInfo(o) ||
-         IsClassPositions(o) ||
+         IsScopeInfo(o) || IsAccessorInfo(o) || IsInterceptorInfo(o) ||
+         IsTemplateInfo(o) || IsClassPositions(o) ||
          o->map() == ReadOnlyRoots(isolate()).fixed_cow_array_map();
-}
-
-bool ContextSerializer::ShouldBeInTheSharedObjectCache(Tagged<HeapObject> o) {
-  // v8_flags.shared_string_table may be true during deserialization, so put
-  // internalized strings into the shared object snapshot.
-  return IsInternalizedString(o);
 }
 
 namespace {
@@ -365,7 +314,6 @@ void ContextSerializer::SerializeObjectWithEmbedderFields(
   // 3) Serialize the object. References from embedder fields to heap objects or
   //    smis are serialized regularly.
   {
-    AllowGarbageCollection allow_gc;
     ObjectSerializer(this, data_holder, &sink_).Serialize(SlotType::kAnySlot);
     // Reload raw pointer.
     raw_obj = *data_holder;
@@ -404,8 +352,8 @@ void ContextSerializer::SerializeObjectWithEmbedderFields(
 
 void ContextSerializer::CheckRehashability(Tagged<HeapObject> obj) {
   if (!can_be_rehashed_) return;
-  if (!obj->NeedsRehashing(cage_base())) return;
-  if (obj->CanBeRehashed(cage_base())) return;
+  if (!obj->NeedsRehashing()) return;
+  if (obj->CanBeRehashed()) return;
   can_be_rehashed_ = false;
 }
 

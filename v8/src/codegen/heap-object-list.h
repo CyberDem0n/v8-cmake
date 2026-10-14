@@ -92,6 +92,7 @@
   V(keys_string, keys_string, KeysString)                                    \
   V(async_iterator_symbol, async_iterator_symbol, AsyncIteratorSymbol)       \
   V(length_string, length_string, LengthString)                              \
+  V(LoadHandler5Map, load_handler5_map, LoadHandler5Map)                     \
   V(ManyClosuresCellMap, many_closures_cell_map, ManyClosuresCellMap)        \
   V(match_symbol, match_symbol, MatchSymbol)                                 \
   V(megamorphic_symbol, megamorphic_symbol, MegamorphicSymbol)               \
@@ -153,6 +154,7 @@
   V(TrueValue, true_value, True)                                             \
   V(undefined_to_string, undefined_to_string, UndefinedToString)             \
   V(UndefinedValue, undefined_value, Undefined)                              \
+  V(UninitializedValue, uninitialized_value, Uninitialized)                  \
   V(uninitialized_symbol, uninitialized_symbol, UninitializedSymbol)         \
   V(UndefinedContextCell, undefined_context_cell, UndefinedContextCell)      \
   V(valueOf_string, valueOf_string, ValueOfString)                           \

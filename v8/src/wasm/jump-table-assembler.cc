@@ -114,6 +114,10 @@ void JumpTableAssembler::EmitLazyCompileJumpSlot(uint32_t func_index,
 }
 
 bool JumpTableAssembler::EmitJumpSlot(Address target) {
+  intptr_t displacement = target - (pc_ + kJumpTableSlotEntryMarkerSize +
+                                    MacroAssembler::kIntraSegmentJmpInstrSize);
+  if (!is_int32(displacement)) return false;
+
 #ifdef V8_ENABLE_CET_IBT
   uint32_t endbr_insn = 0xfa1e0ff3;
   uint32_t nop = 0x00401f0f;
@@ -122,11 +126,7 @@ bool JumpTableAssembler::EmitJumpSlot(Address target) {
   emit<uint32_t>(nop, kRelaxedStore);
 #endif
 
-  intptr_t displacement =
-      target - (pc_ + MacroAssembler::kIntraSegmentJmpInstrSize);
-  if (!is_int32(displacement)) return false;
-
-  uint8_t inst[kJumpTableSlotSize] = {
+  uint8_t inst[8] = {
       0xe9, 0,    0,    0, 0,  // near_jmp displacement
       0xcc, 0xcc, 0xcc,        // int3 * 3
   };
@@ -426,7 +426,8 @@ void JumpTableAssembler::EmitFarJumpSlot(Address target) {
 // static
 void JumpTableAssembler::PatchFarJumpSlot(WritableJitAllocation& jit_allocation,
                                           Address slot, Address target) {
-  Address target_addr = slot + 8;
+  // See {EmitFarJumpSlot} for the offset of the target.
+  Address target_addr = slot + kFarJumpTableSlotSize - kSystemPointerSize;
   jit_allocation.WriteValue(target_addr, target, kRelaxedStore);
 }
 
@@ -634,9 +635,9 @@ bool JumpTableAssembler::EmitJumpSlot(Address target) {
       0x48000000  // b(relative_target, LeaveLK)
   };
 
-  CHECK((relative_target & (kAAMask | kLKMask)) == 0);
+  CHECK_EQ(0, relative_target & (kAAMask | kLKMask));
   // The jump table is updated live, so the write has to be atomic.
-  emit<uint32_t>(inst[0] | relative_target, kRelaxedStore);
+  emit<uint32_t>(inst[0] | (relative_target & kImm26Mask), kRelaxedStore);
   return true;
 }
 
@@ -671,7 +672,9 @@ void JumpTableAssembler::EmitFarJumpSlot(Address target) {
 // static
 void JumpTableAssembler::PatchFarJumpSlot(WritableJitAllocation& jit_allocation,
                                           Address slot, Address target) {
-  Address target_addr = slot + kFarJumpTableSlotSize - 8;
+  // See {EmitFarJumpSlot} for the offset of the target.
+  Address target_addr =
+      slot + kFarJumpTableSlotSize - (2 * kInstrSize) - kSystemPointerSize;
   jit_allocation.WriteValue(target_addr, target, kRelaxedStore);
 }
 
@@ -684,15 +687,20 @@ void JumpTableAssembler::SkipUntil(int offset) {
 #elif V8_TARGET_ARCH_RISCV64
 void JumpTableAssembler::EmitLazyCompileJumpSlot(uint32_t func_index,
                                                  Address lazy_compile_target) {
-  static_assert(kLazyCompileTableSlotSize == 3 * kInstrSize);
+  static_assert(kLazyCompileTableSlotSize == 4 * kInstrSize);
   int64_t high_20 = (func_index + 0x800) >> 12;
   int64_t low_12 = int64_t(func_index) << 52 >> 52;
 
+  // The lazy compile target (a slot in the far jump table) can be farther away
+  // than the range of a single JAL for large modules. Use a checked AUIPC/JALR
+  // pair instead, so an out-of-range displacement cannot be silently truncated
+  // in release builds.
   int64_t target_offset = MacroAssembler::CalculateTargetOffset(
       lazy_compile_target, RelocInfo::NO_INFO,
       reinterpret_cast<uint8_t*>(pc_ + 2 * kInstrSize));
-  DCHECK(is_int21(target_offset));
-  DCHECK_EQ(target_offset & 0x1, 0);
+  CHECK(is_int32(target_offset));
+  int32_t hi20 = (static_cast<int32_t>(target_offset) + 0x800) >> 12;
+  int32_t lo12 = static_cast<int32_t>(target_offset) << 20 >> 20;
 
   const uint32_t inst[kLazyCompileTableSlotSize / 4] = {
       (RO_LUI | (kWasmCompileLazyFuncIndexRegister.code() << kRdShift) |
@@ -700,73 +708,94 @@ void JumpTableAssembler::EmitLazyCompileJumpSlot(uint32_t func_index,
       (RO_ADDI | (kWasmCompileLazyFuncIndexRegister.code() << kRdShift) |
        (kWasmCompileLazyFuncIndexRegister.code() << kRs1Shift) |
        int32_t(low_12 << kImm12Shift)),  // addi t0, t0, low_12
-      (RO_JAL | (zero_reg.code() << kRdShift) |
-       uint32_t(target_offset & 0xff000) |           // bits 19-12
-       uint32_t((target_offset & 0x800) << 9) |      // bit  11
-       uint32_t((target_offset & 0x7fe) << 20) |     // bits 10-1
-       uint32_t((target_offset & 0x100000) << 11)),  // bit  20 ),  // jal
-  };
-
-  emit<uint32_t>(inst[0]);
-  emit<uint32_t>(inst[1]);
-  emit<uint32_t>(inst[2]);
-}
-
-bool JumpTableAssembler::EmitJumpSlot(Address target) {
-  static_assert(kInstrSize == kInt32Size);
-  static_assert(kJumpTableSlotSize == 2 * kInstrSize);
-  intptr_t relative_target = target - pc_;
-  if (!is_int32(relative_target)) {
-    return false;
-  }
-
-  uint32_t inst[kJumpTableSlotSize / kInstrSize] = {kNopByte, kNopByte};
-  int64_t high_20 = (relative_target + 0x800) >> 12;
-  int64_t low_12 = int64_t(relative_target) << 52 >> 52;
-  inst[0] = (RO_AUIPC | (t6.code() << kRdShift) |
-             int32_t(high_20 << kImm20Shift));  // auipc t6, high_20
-  inst[1] =
-      (RO_JALR | (zero_reg.code() << kRdShift) | (t6.code() << kRs1Shift) |
-       int32_t(low_12 << kImm12Shift));  // jalr t6, t6, low_12
-
-  // This function is also used for patching existing jump slots and the writes
-  // need to be atomic.
-  emit<uint64_t>(*reinterpret_cast<uint64_t*>(inst), kRelaxedStore);
-  return true;
-}
-
-void JumpTableAssembler::EmitFarJumpSlot(Address target) {
-  uint32_t high_20 = (int64_t(4 * kInstrSize + 0x800) >> 12);
-  uint32_t low_12 = (int64_t(4 * kInstrSize) << 52 >> 52);
-
-  const uint32_t inst[kFarJumpTableSlotSize / 4] = {
       (RO_AUIPC | (t6.code() << kRdShift) |
-       (high_20 << kImm20Shift)),  // auipc t6, high_20
-      (RO_LD | (t6.code() << kRdShift) | (t6.code() << kRs1Shift) |
-       (low_12 << kImm12Shift)),  // jalr t6, t6, low_12
-      (RO_JALR | (t6.code() << kRs1Shift) | zero_reg.code() << kRdShift),
-      (kNopByte),  // nop
-      0x0000,      // target[0]
-      0x0000,      // target[1]
+       (uint32_t(hi20) << kImm20Shift)),  // auipc t6, hi20
+      (RO_JALR | (zero_reg.code() << kRdShift) | (t6.code() << kRs1Shift) |
+       (uint32_t(lo12) << kImm12Shift)),  // jalr x0, t6, lo12
   };
+
   emit<uint32_t>(inst[0]);
   emit<uint32_t>(inst[1]);
   emit<uint32_t>(inst[2]);
   emit<uint32_t>(inst[3]);
+}
+
+bool JumpTableAssembler::EmitJumpSlot(Address target) {
+  static_assert(kInstrSize == kInt32Size);
+  static_assert(kJumpTableSlotSize == 6 * kInstrSize);
+
+  // On RISCV-64, we must ensure that the near jump slots can cover enough
+  // range - all of kDefaultMaxWasmCodeSpaceSizeMb - and that we can patch
+  // them atomically. We do that by dynamically changing between a far and
+  // a near variant in the same slot - as dictated by the first instruction
+  // in the sequence.
+  //
+  //        Far          |          Near
+  // ----------------------------------------------
+  // auipc  t6, 0        |   jal    <imm21>
+  // ld     t6, 16(t6)   |   ld     t6, 16(t6)
+  // jalr   x0, t6       |   jalr   x0, t6
+  // nop                 |   nop
+  // .dw    target[0]    |   .dw    target[0]
+  // .dw    target[1]    |   .dw    target[1]
+  //
+  // We cannot have a near variant where the offset is computed across
+  // multiple instructions (typically 'auipc' and 'jalr'), because the CPU
+  // may read and execute parts patched and parts unpatched instructions.
+
+  const uint32_t shared[kJumpTableSlotSize / kInstrSize] = {
+      0x0000,
+      (RO_LD | (t6.code() << kRdShift) | (t6.code() << kRs1Shift) |
+       ((4 * kInstrSize) << kImm12Shift)),
+      (RO_JALR | (t6.code() << kRs1Shift) | zero_reg.code() << kRdShift),
+      (kNopByte),
+      0x0000,
+      0x0000,
+  };
+
+  // This function is also used for patching existing jump slots, but when
+  // we do that we only change the first instruction and the target encoded
+  // as data in the instruction stream.
+  Address first = pc_;
+  pc_ += kInstrSize;  // Skip until the rest of the instructions are in place.
+  emit<uint32_t>(shared[1]);
+  emit<uint32_t>(shared[2]);
+  emit<uint32_t>(shared[3]);
+
+  // Atomically emit the 64-bit value on an aligned address.
+  DCHECK(IsAligned(pc_, kSystemPointerSize));
   emit<Address>(target);
+
+  // Commit the changes to the sequence by (possibly) changing the first
+  // instruction. The instruction will change between 'jal' and 'auipc'.
+  intptr_t relative_target = target - first;
+  if (is_int21(relative_target)) {
+    int32_t imm21 = static_cast<int32_t>(relative_target);
+    DCHECK(((imm21 & 1) == 0));
+    uint32_t near = RO_JAL | (zero_reg.code() << kRdShift) |
+                    (imm21 & 0xff000) |          // bits 19-12
+                    ((imm21 & 0x800) << 9) |     // bit  11
+                    ((imm21 & 0x7fe) << 20) |    // bits 10-1
+                    ((imm21 & 0x100000) << 11);  // bit  20
+    jit_allocation_.WriteUnalignedValue(first, near);
+  } else {
+    uint32_t far = RO_AUIPC | (t6.code() << kRdShift);
+    jit_allocation_.WriteUnalignedValue(first, far);
+  }
+  return true;
+}
+
+void JumpTableAssembler::EmitFarJumpSlot(Address target) {
+  // The far jump slots are only used for runtime stubs, so we never need
+  // to patch them.
+  static_assert(kJumpTableSlotSize == kFarJumpTableSlotSize);
+  EmitJumpSlot(target);
 }
 
 // static
 void JumpTableAssembler::PatchFarJumpSlot(WritableJitAllocation& jit_allocation,
                                           Address slot, Address target) {
-  // See {EmitFarJumpSlot} for the offset of the target (16 bytes with
-  // CFI enabled, 8 bytes otherwise).
-  int kTargetOffset = kFarJumpTableSlotSize - sizeof(Address);
-  jit_allocation.WriteValue(slot + kTargetOffset, target, kRelaxedStore);
-  // The data update is guaranteed to be atomic since it's a properly aligned
-  // and stores a single machine word. This update will eventually be observed
-  // by any concurrent [ldr] on the same address because of the data cache
-  // coherence. It's ok if other cores temporarily jump to the old target.
+  UNREACHABLE();
 }
 
 void JumpTableAssembler::SkipUntil(int offset) {
@@ -778,15 +807,19 @@ void JumpTableAssembler::SkipUntil(int offset) {
 #elif V8_TARGET_ARCH_RISCV32
 void JumpTableAssembler::EmitLazyCompileJumpSlot(uint32_t func_index,
                                                  Address lazy_compile_target) {
-  static_assert(kLazyCompileTableSlotSize == 3 * kInstrSize);
+  static_assert(kLazyCompileTableSlotSize == 4 * kInstrSize);
   int64_t high_20 = (func_index + 0x800) >> 12;
   int64_t low_12 = int64_t(func_index) << 52 >> 52;
 
+  // See the RISC-V64 implementation: use a checked AUIPC/JALR pair instead of
+  // a range-limited JAL so an out-of-range displacement cannot be silently
+  // truncated in release builds.
   int64_t target_offset = MacroAssembler::CalculateTargetOffset(
       lazy_compile_target, RelocInfo::NO_INFO,
       reinterpret_cast<uint8_t*>(pc_ + 2 * kInstrSize));
-  DCHECK(is_int21(target_offset));
-  DCHECK_EQ(target_offset & 0x1, 0);
+  CHECK(is_int32(target_offset));
+  int32_t hi20 = (static_cast<int32_t>(target_offset) + 0x800) >> 12;
+  int32_t lo12 = static_cast<int32_t>(target_offset) << 20 >> 20;
 
   const uint32_t inst[kLazyCompileTableSlotSize / 4] = {
       (RO_LUI | (kWasmCompileLazyFuncIndexRegister.code() << kRdShift) |
@@ -794,16 +827,16 @@ void JumpTableAssembler::EmitLazyCompileJumpSlot(uint32_t func_index,
       (RO_ADDI | (kWasmCompileLazyFuncIndexRegister.code() << kRdShift) |
        (kWasmCompileLazyFuncIndexRegister.code() << kRs1Shift) |
        int32_t(low_12 << kImm12Shift)),  // addi t0, t0, low_12
-      (RO_JAL | (zero_reg.code() << kRdShift) |
-       uint32_t(target_offset & 0xff000) |           // bits 19-12
-       uint32_t((target_offset & 0x800) << 9) |      // bit  11
-       uint32_t((target_offset & 0x7fe) << 20) |     // bits 10-1
-       uint32_t((target_offset & 0x100000) << 11)),  // bit  20 ),  // jal
+      (RO_AUIPC | (t6.code() << kRdShift) |
+       (uint32_t(hi20) << kImm20Shift)),  // auipc t6, hi20
+      (RO_JALR | (zero_reg.code() << kRdShift) | (t6.code() << kRs1Shift) |
+       (uint32_t(lo12) << kImm12Shift)),  // jalr x0, t6, lo12
   };
 
   emit<uint32_t>(inst[0], kRelaxedStore);
   emit<uint32_t>(inst[1], kRelaxedStore);
   emit<uint32_t>(inst[2], kRelaxedStore);
+  emit<uint32_t>(inst[3], kRelaxedStore);
 }
 bool JumpTableAssembler::EmitJumpSlot(Address target) {
   uint32_t high_20 = (int64_t(3 * kInstrSize + 0x800) >> 12);

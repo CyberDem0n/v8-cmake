@@ -75,7 +75,7 @@ TEST_F(FeedbackVectorTest, VectorStructure) {
     CHECK_EQ(helper.slot(7), vector->ToSlot(index));
 
     CHECK_EQ(3 + 5 * FeedbackMetadata::GetSlotSize(FeedbackSlotKind::kCall),
-             vector->length());
+             vector->length().value());
   }
 
   {
@@ -145,7 +145,6 @@ TEST_F(FeedbackVectorTest, VectorICMetadata) {
 
 TEST_F(FeedbackVectorTest, VectorCallICStates) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -174,7 +173,6 @@ TEST_F(FeedbackVectorTest, VectorCallICStates) {
 // Test the Call IC states transfer with Function.prototype.apply
 TEST_F(FeedbackVectorTest, VectorCallICStateApply) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -214,7 +212,6 @@ TEST_F(FeedbackVectorTest, VectorCallICStateApply) {
 
 TEST_F(FeedbackVectorTest, VectorCallFeedback) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -244,7 +241,6 @@ TEST_F(FeedbackVectorTest, VectorCallFeedback) {
 
 TEST_F(FeedbackVectorTest, VectorPolymorphicCallFeedback) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
   v8_flags.lazy_feedback_allocation = false;
 
@@ -267,7 +263,7 @@ TEST_F(FeedbackVectorTest, VectorPolymorphicCallFeedback) {
   CHECK_EQ(InlineCacheState::POLYMORPHIC, nexus.ic_state());
   Tagged<HeapObject> heap_object;
   CHECK(nexus.GetFeedback().GetHeapObjectIfWeak(&heap_object));
-  CHECK(IsFeedbackCell(heap_object, isolate));
+  CHECK(IsFeedbackCell(heap_object));
   // Ensure this is the feedback cell for the closure returned by
   // foo_maker.
   CHECK_EQ(heap_object, a_foo->raw_feedback_cell());
@@ -275,7 +271,6 @@ TEST_F(FeedbackVectorTest, VectorPolymorphicCallFeedback) {
 
 TEST_F(FeedbackVectorTest, VectorCallFeedbackForArray) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -304,7 +299,6 @@ TEST_F(FeedbackVectorTest, VectorCallFeedbackForArray) {
 
 TEST_F(FeedbackVectorTest, VectorCallCounts) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -335,7 +329,6 @@ TEST_F(FeedbackVectorTest, VectorCallCounts) {
 
 TEST_F(FeedbackVectorTest, VectorConstructCounts) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -368,7 +361,6 @@ TEST_F(FeedbackVectorTest, VectorConstructCounts) {
 
 TEST_F(FeedbackVectorTest, VectorSpeculationMode) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -403,7 +395,6 @@ TEST_F(FeedbackVectorTest, VectorSpeculationMode) {
 TEST_F(FeedbackVectorTest, VectorCallSpeculationModeAndFeedbackContent) {
   if (!i::v8_flags.use_ic) return;
   if (!i::v8_flags.turbofan) return;
-  if (i::v8_flags.always_turbofan) return;
   if (i::v8_flags.jitless) return;
   v8_flags.allow_natives_syntax = true;
 
@@ -437,7 +428,6 @@ TEST_F(FeedbackVectorTest, VectorCallSpeculationModeAndFeedbackContent) {
 
 TEST_F(FeedbackVectorTest, VectorLoadICStates) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -478,6 +468,19 @@ TEST_F(FeedbackVectorTest, VectorLoadICStates) {
   nexus.ExtractMaps(&maps);
   CHECK_EQ(4, maps.size());
 
+  // Fill up to max_valid_polymorphic_map_count.
+  TryRunJS(
+      "for (let i = 4; i < 10; ++i) {"
+      "  let obj = { foo: 2 };"
+      "  obj['p' + i] = i;"
+      "  f(obj);"
+      "}");
+  CHECK_EQ(InlineCacheState::POLYMORPHIC, nexus.ic_state());
+  maps.clear();
+  nexus.ExtractMaps(&maps);
+  CHECK_EQ(static_cast<size_t>(v8_flags.max_valid_polymorphic_map_count),
+           maps.size());
+
   // Finally driven megamorphic.
   TryRunJS("f({ blarg: 3, gran: 3, torino: 10, foo: 2 })");
   CHECK_EQ(InlineCacheState::MEGAMORPHIC, nexus.ic_state());
@@ -490,7 +493,6 @@ TEST_F(FeedbackVectorTest, VectorLoadICStates) {
 
 TEST_F(FeedbackVectorTest, VectorLoadGlobalICSlotSharing) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -534,7 +536,6 @@ TEST_F(FeedbackVectorTest, VectorLoadGlobalICSlotSharing) {
 
 TEST_F(FeedbackVectorTest, VectorLoadICOnSmi) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -573,10 +574,11 @@ TEST_F(FeedbackVectorTest, VectorLoadICOnSmi) {
   bool number_map_found = false;
   bool o_map_found = false;
   for (DirectHandle<Map> current : maps) {
-    if (*current == number_map)
+    if (*current == number_map) {
       number_map_found = true;
-    else if (*current == o->map())
+    } else if (*current == o->map()) {
       o_map_found = true;
+    }
   }
   CHECK(number_map_found && o_map_found);
 
@@ -590,7 +592,6 @@ TEST_F(FeedbackVectorTest, VectorLoadICOnSmi) {
 
 TEST_F(FeedbackVectorTest, ReferenceContextAllocatesNoSlots) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -718,23 +719,22 @@ TEST_F(FeedbackVectorTest, ReferenceContextAllocatesNoSlots) {
     DirectHandle<JSFunction> f = GetFunction("testcompound");
 
     // There should be 1 LOAD_GLOBAL_IC for load of a and 2 LOAD_ICs, for load
-    // of x.old and x.young.
+    // of x.old and x.young. The `+` in `x.old + x.young` carries embedded
+    // feedback in the BytecodeArray, so no FeedbackVector slot is allocated.
     Handle<FeedbackVector> feedback_vector(f->feedback_vector(), isolate);
     FeedbackVectorHelper helper(feedback_vector);
-    CHECK_EQ(7, helper.slot_count());
+    CHECK_EQ(6, helper.slot_count());
     CHECK_SLOT_KIND(helper, 0, FeedbackSlotKind::kLoadGlobalNotInsideTypeof);
     CHECK_SLOT_KIND(helper, 1, FeedbackSlotKind::kSetNamedStrict);
     CHECK_SLOT_KIND(helper, 2, FeedbackSlotKind::kSetNamedStrict);
     CHECK_SLOT_KIND(helper, 3, FeedbackSlotKind::kSetNamedStrict);
-    CHECK_SLOT_KIND(helper, 4, FeedbackSlotKind::kBinaryOp);
+    CHECK_SLOT_KIND(helper, 4, FeedbackSlotKind::kLoadProperty);
     CHECK_SLOT_KIND(helper, 5, FeedbackSlotKind::kLoadProperty);
-    CHECK_SLOT_KIND(helper, 6, FeedbackSlotKind::kLoadProperty);
   }
 }
 
 TEST_F(FeedbackVectorTest, VectorStoreICBasic) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -760,7 +760,6 @@ TEST_F(FeedbackVectorTest, VectorStoreICBasic) {
 
 TEST_F(FeedbackVectorTest, DefineNamedOwnIC) {
   if (!i::v8_flags.use_ic) return;
-  if (i::v8_flags.always_turbofan) return;
   v8_flags.allow_natives_syntax = true;
 
   v8::HandleScope scope(v8_isolate());
@@ -782,6 +781,27 @@ TEST_F(FeedbackVectorTest, DefineNamedOwnIC) {
   CHECK_SLOT_KIND(helper, 1, FeedbackSlotKind::kDefineNamedOwn);
   FeedbackNexus nexus(i_isolate(), feedback_vector, helper.slot(1));
   CHECK_EQ(InlineCacheState::MONOMORPHIC, nexus.ic_state());
+}
+
+TEST_F(FeedbackVectorTest, MaxLengthAndSizeFor) {
+  static_assert(FeedbackVector::SizeFor(0) == FeedbackVector::kHeaderSize);
+  static_assert(FeedbackVector::SizeFor(10) ==
+                FeedbackVector::kHeaderSize + 10 * kTaggedSize);
+  static_assert(FeedbackVector::SizeFor(FeedbackVector::kMaxLength) ==
+                FeedbackVector::kHeaderSize +
+                    FeedbackVector::kMaxLength * kTaggedSize);
+
+  EXPECT_EQ(FeedbackVector::kHeaderSize, FeedbackVector::SizeFor(0));
+  EXPECT_EQ(FeedbackVector::kHeaderSize + 10 * kTaggedSize,
+            FeedbackVector::SizeFor(10));
+  EXPECT_EQ(
+      FeedbackVector::kHeaderSize + FeedbackVector::kMaxLength * kTaggedSize,
+      FeedbackVector::SizeFor(FeedbackVector::kMaxLength));
+
+  ASSERT_DEATH_IF_SUPPORTED({ FeedbackVector::SizeFor(-1); }, ".*");
+  ASSERT_DEATH_IF_SUPPORTED(
+      { FeedbackVector::SizeFor(FeedbackVector::kMaxLength + 1); }, ".*");
+  ASSERT_DEATH_IF_SUPPORTED({ FeedbackVector::SizeFor(1 << 30); }, ".*");
 }
 
 }  // namespace internal

@@ -22,6 +22,10 @@
   v8::internal::PrintF("Unsupported instruction %d.\n", __LINE__); \
   UNIMPLEMENTED();
 
+#define ILLEGAL_RISCV()                                        \
+  v8::internal::PrintF("Illegal instruction %d.\n", __LINE__); \
+  UNIMPLEMENTED();
+
 enum Endianness { kLittle, kBig };
 
 #if defined(V8_TARGET_LITTLE_ENDIAN)
@@ -66,7 +70,7 @@ constexpr int kRootRegisterBias = 256;
   V(m2)             \
   V(m4)             \
   V(m8)             \
-  V(RESERVERD)      \
+  V(RESERVED)       \
   V(mf8)            \
   V(mf4)            \
   V(mf2)
@@ -93,8 +97,8 @@ enum VSew {
 
 // RISC-V can perform PC-relative jumps within a 32-bit range using the
 // following two instructions:
-//   auipc   t6, imm20    ; t0 = PC + imm20 * 2^12
-//   jalr    ra, t6, imm12; ra = PC + 4, PC = t0 + imm12,
+//   auipc   t6, imm20    ; t6 = PC + imm20 * 2^12
+//   jalr    ra, t6, imm12; ra = PC + 4, PC = t6 + imm12,
 // Both imm20 and imm12 are treated as two's-complement signed values, usually
 // calculated as:
 //   imm20 = (offset + 0x800) >> 12
@@ -330,18 +334,30 @@ const uint32_t kCSTypeMask = kRvcOpcodeMask | kRvcFunct6Mask;
 const uint32_t kCATypeMask = kRvcOpcodeMask | kRvcFunct6Mask | kRvcFunct2Mask;
 const uint32_t kRvcBImm8Mask = (((1 << 5) - 1) << 2) | (((1 << 3) - 1) << 10);
 
-// for RVV extension
+// We only support 64-bit elements. Also see RVV_SEW above.
 constexpr int kRvvELEN = 64;
-#ifdef RVV_VLEN
-constexpr int kRvvVLEN = RVV_VLEN;
-// TODO(riscv): support rvv 256/512/1024
-static_assert(
-    kRvvVLEN == 128,
-    "RVV extension only supports 128bit wide VLEN at current RISC-V backend.");
-#else
-constexpr int kRvvVLEN = 128;
+
+// Maximum supported VLEN in bits.
+// Code that could fail with larger VLEN should static_assert against this
+// constant.
+constexpr int kMaxRvvVLEN = 512;
+
+#if V8_TARGET_ARCH_RISCV64
+constexpr int kRvXLEN = 64;
+#elif V8_TARGET_ARCH_RISCV32
+constexpr int kRvXLEN = 32;
 #endif
-constexpr int kRvvSLEN = kRvvVLEN;
+
+#ifdef RVV_VLEN
+constexpr int kSimulatorRvvVLEN = RVV_VLEN;
+static_assert(kSimulatorRvvVLEN >= 128, "RvvVLEN must be >= 128 bit");
+static_assert((kSimulatorRvvVLEN & (kSimulatorRvvVLEN - 1)) == 0,
+              "RvvVLEN must be a power of 2");
+static_assert(kSimulatorRvvVLEN <= kMaxRvvVLEN,
+              "RvvVLEN size is unimplemented");
+#else
+constexpr int kSimulatorRvvVLEN = 128;
+#endif
 
 const int kRvvFunct6Shift = 26;
 const int kRvvFunct6Bits = 6;
@@ -396,6 +412,14 @@ const int kRvvMopBits = 2;
 const int kRvvMopShift = 26;
 const uint32_t kRvvMopMask = (((1 << kRvvMopBits) - 1) << kRvvMopShift);
 
+const int kRvvLumopBits = 5;
+const int kRvvLumopShift = 20;
+const uint32_t kRvvLumopMask = (((1 << kRvvLumopBits) - 1) << kRvvLumopShift);
+
+const int kRvvSumopBits = 5;
+const int kRvvSumopShift = 20;
+const uint32_t kRvvSumopMask = (((1 << kRvvSumopBits) - 1) << kRvvSumopShift);
+
 const int kRvvMewBits = 1;
 const int kRvvMewShift = 28;
 const uint32_t kRvvMewMask = (((1 << kRvvMewBits) - 1) << kRvvMewShift);
@@ -432,6 +456,7 @@ const uint32_t kImm12Mask = ((1 << kImm12Bits) - 1) << kImm12Shift;
 const uint32_t kImm11Mask = ((1 << kImm11Bits) - 1) << kImm11Shift;
 const uint32_t kImm31_12Mask = ((1 << 20) - 1) << 12;
 const uint32_t kImm19_0Mask = ((1 << 20) - 1);
+const uint32_t kMopMask = kITypeMask | 0b1 << 31 | 0b11 << 28 | 0b1 << 25;
 
 const int kNopByte = 0x00000013;
 // Original MIPS constants
@@ -582,6 +607,9 @@ enum MemoryOdering {
   PSIORW = PSI | PSO | PSR | PSW
 };
 
+const int kFloat16ExponentBias = 15;
+const int kFloat16MantissaBits = 10;
+const int kFloat16ExponentBits = 5;
 const int kFloat32ExponentBias = 127;
 const int kFloat32MantissaBits = 23;
 const int kFloat32ExponentBits = 8;
@@ -729,14 +757,12 @@ class InstructionBase {
   bool IsShortInstruction() const;
 
   inline uint8_t InstructionSize() const {
-    return (v8_flags.riscv_c_extension && this->IsShortInstruction())
-               ? kShortInstrSize
-               : kInstrSize;
+    return (this->IsShortInstruction()) ? kShortInstrSize : kInstrSize;
   }
 
   // Get the raw instruction bits.
   inline Instr InstructionBits() const {
-    if (v8_flags.riscv_c_extension && this->IsShortInstruction()) {
+    if (this->IsShortInstruction()) {
       return 0x0000FFFF & (*reinterpret_cast<const ShortInstr*>(this));
     }
     return *reinterpret_cast<const Instr*>(this);
@@ -1183,6 +1209,8 @@ class InstructionGetters : public T {
 
   uint32_t Rvvuimm() const;
 
+  uint32_t MopNumber();
+
   inline uint32_t RvvVsew() const {
     uint32_t zimm = this->Rvvzimm();
     uint32_t vsew = (zimm >> 3) & 0x7;
@@ -1228,8 +1256,8 @@ class InstructionGetters : public T {
     }
   }
 
-#define sext(x, len) (((int32_t)(x) << (32 - len)) >> (32 - len))
-#define zext(x, len) (((uint32_t)(x) << (32 - len)) >> (32 - len))
+#define sext(x, len) ((static_cast<int32_t>(x) << (32 - len)) >> (32 - len))
+#define zext(x, len) ((static_cast<uint32_t>(x) << (32 - len)) >> (32 - len))
 
   inline int32_t RvvSimm5() const {
     DCHECK(this->InstructionType() == InstructionBase::kVType);
@@ -1270,21 +1298,6 @@ class Instruction : public InstructionGetters<InstructionBase> {
   // We need to prevent the creation of instances of class Instruction.
   DISALLOW_IMPLICIT_CONSTRUCTORS(Instruction);
 };
-
-// -----------------------------------------------------------------------------
-// RISC-V assembly various constants.
-
-// C/C++ argument slots size.
-const int kCArgSlotCount = 0;
-
-// TODO(plind): below should be based on kSystemPointerSize
-// TODO(plind): find all usages and remove the needless instructions for n64.
-const int kCArgsSlotsSize = kCArgSlotCount * kInstrSize * 2;
-
-const int kInvalidStackOffset = -1;
-const int kBranchReturnOffset = 2 * kInstrSize;
-
-static const int kNegOffset = 0x00008000;
 
 // -----------------------------------------------------------------------------
 // Instructions.

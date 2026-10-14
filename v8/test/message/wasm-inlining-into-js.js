@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 // Flags: --trace-turbo-inlining --allow-natives-syntax
-// Flags: --turbofan --no-always-turbofan --no-always-sparkplug
+// Flags: --turbofan --no-always-sparkplug
 // Concurrent inlining leads to additional traces.
 // Flags: --no-stress-concurrent-inlining
 
@@ -22,7 +22,7 @@ function testOptimized(run, fctToOptimize) {
 function createWasmModule(moduleName) {
   let builder = new WasmModuleBuilder();
   builder.setName(moduleName);
-  let array = builder.addArray(kWasmI32, true);
+  let array = builder.addArray(kWasmI32);
 
   builder.addFunction('createArray', makeSig([kWasmI32], [kWasmExternRef]))
     .addBody([

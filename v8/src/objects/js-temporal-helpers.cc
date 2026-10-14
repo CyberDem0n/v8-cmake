@@ -5,12 +5,13 @@
 #include "src/objects/js-temporal-helpers.h"
 
 #include "src/objects/js-objects-inl.h"
+#include "src/objects/object-conversions-inl.h"
 
 namespace v8::internal::temporal {
 
 namespace {
 
-// #sec-isintegralnumber
+// https://tc39.es/proposal-temporal/#sec-isintegralnumber
 bool IsIntegralNumber(Isolate* isolate, DirectHandle<Object> argument) {
   // 1. If Type(argument) is not Number, return false.
   if (!IsNumber(*argument)) return false;
@@ -23,21 +24,20 @@ bool IsIntegralNumber(Isolate* isolate, DirectHandle<Object> argument) {
   return true;
 }
 
-// #sec-temporal-tointegerwithoutrounding
+// https://tc39.es/proposal-temporal/#sec-temporal-tointegerwithoutrounding
 Maybe<double> ToIntegerWithoutRounding(Isolate* isolate,
                                        DirectHandle<Object> argument) {
   // 1. Let number be ? ToNumber(argument).
   DirectHandle<Number> number;
-  ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-      isolate, number, Object::ToNumber(isolate, argument), Nothing<double>());
+  ASSIGN_RETURN_ON_EXCEPTION(isolate, number,
+                             Object::ToNumber(isolate, argument));
   // 2. If number is NaN, +0𝔽, or −0𝔽 return 0.
   if (IsNaN(*number) || Object::NumberValue(*number) == 0) {
     return Just(static_cast<double>(0));
   }
   // 3. If IsIntegralNumber(number) is false, throw a RangeError exception.
   if (!IsIntegralNumber(isolate, number)) {
-    THROW_NEW_ERROR_RETURN_VALUE(
-        isolate, NEW_TEMPORAL_INVALID_ARG_RANGE_ERROR(), Nothing<double>());
+    THROW_NEW_ERROR(isolate, NEW_TEMPORAL_RANGE_ERROR("Number not integral."));
   }
   // 4. Return ℝ(number).
   return Just(Object::NumberValue(*number));
@@ -75,10 +75,9 @@ Maybe<bool> IterateDurationRecordFieldsTable(
     // row.first is prop: the Property Name value of the current row
     // row.second is the address of result's field whose name is the Field Name
     // value of the current row
-    MAYBE_ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+    ASSIGN_RETURN_ON_EXCEPTION(
         isolate, result,
-        RowFunction(isolate, temporal_duration_like, row.first, row.second),
-        Nothing<bool>());
+        RowFunction(isolate, temporal_duration_like, row.first, row.second));
     any |= result;
   }
   return Just(any);
@@ -86,7 +85,7 @@ Maybe<bool> IterateDurationRecordFieldsTable(
 
 }  // namespace
 
-// #sec-temporal-isvalidduration
+// https://tc39.es/proposal-temporal/#sec-temporal-isvalidduration
 bool IsValidDuration(Isolate* isolate, const DurationRecord& dur) {
   // 1. Let sign be ! DurationSign(years, months, weeks, days, hours, minutes,
   // seconds, milliseconds, microseconds, nanoseconds).
@@ -174,7 +173,7 @@ bool IsValidDuration(Isolate* isolate, const DurationRecord& dur) {
   return true;
 }
 
-// #sec-temporal-durationsign
+// https://tc39.es/proposal-temporal/#sec-temporal-durationsign
 int32_t DurationRecord::Sign(const DurationRecord& dur) {
   // 1. For each value v of « years, months, weeks, days, hours, minutes,
   // seconds, milliseconds, microseconds, nanoseconds », do a. If v < 0, return
@@ -204,7 +203,7 @@ int32_t DurationRecord::Sign(const DurationRecord& dur) {
   return 0;
 }
 
-// #sec-temporal-createtimedurationrecord
+// https://tc39.es/proposal-temporal/#sec-temporal-createtimedurationrecord
 Maybe<TimeDurationRecord> TimeDurationRecord::Create(
     Isolate* isolate, double days, double hours, double minutes, double seconds,
     double milliseconds, double microseconds, double nanoseconds) {
@@ -214,9 +213,7 @@ Maybe<TimeDurationRecord> TimeDurationRecord::Create(
   TimeDurationRecord record = {days,         hours,        minutes,    seconds,
                                milliseconds, microseconds, nanoseconds};
   if (!IsValidDuration(isolate, {0, 0, 0, record})) {
-    THROW_NEW_ERROR_RETURN_VALUE(isolate,
-                                 NEW_TEMPORAL_INVALID_ARG_RANGE_ERROR(),
-                                 Nothing<TimeDurationRecord>());
+    THROW_NEW_ERROR(isolate, NEW_TEMPORAL_RANGE_ERROR("Invalid duration."));
   }
   // 2. Return the Record { [[Days]]: ℝ(𝔽(days)), [[Hours]]: ℝ(𝔽(hours)),
   // [[Minutes]]: ℝ(𝔽(minutes)), [[Seconds]]: ℝ(𝔽(seconds)), [[Milliseconds]]:
@@ -225,7 +222,7 @@ Maybe<TimeDurationRecord> TimeDurationRecord::Create(
   return Just(record);
 }
 
-// #sec-temporal-createdurationrecord
+// https://tc39.es/proposal-temporal/#sec-temporal-createdurationrecord
 Maybe<DurationRecord> DurationRecord::Create(
     Isolate* isolate, double years, double months, double weeks, double days,
     double hours, double minutes, double seconds, double milliseconds,
@@ -239,9 +236,7 @@ Maybe<DurationRecord> DurationRecord::Create(
       weeks,
       {days, hours, minutes, seconds, milliseconds, microseconds, nanoseconds}};
   if (!IsValidDuration(isolate, record)) {
-    THROW_NEW_ERROR_RETURN_VALUE(isolate,
-                                 NEW_TEMPORAL_INVALID_ARG_RANGE_ERROR(),
-                                 Nothing<DurationRecord>());
+    THROW_NEW_ERROR(isolate, NEW_TEMPORAL_RANGE_ERROR("Invalid duration."));
   }
   // 2. Return the Record { [[Years]]: ℝ(𝔽(years)), [[Months]]: ℝ(𝔽(months)),
   // [[Weeks]]: ℝ(𝔽(weeks)), [[Days]]: ℝ(𝔽(days)), [[Hours]]: ℝ(𝔽(hours)),
@@ -251,15 +246,15 @@ Maybe<DurationRecord> DurationRecord::Create(
   return Just(record);
 }
 
-// #sec-temporal-topartialduration
-Maybe<DurationRecord> ToPartialDuration(
+// https://tc39.es/proposal-temporal/#sec-todurationrecord-deleted
+Maybe<DurationRecord> ToDurationRecord(
     Isolate* isolate, DirectHandle<Object> temporal_duration_like_obj,
     const DurationRecord& input) {
   // 1. If Type(temporalDurationLike) is not Object, then
   if (!IsJSReceiver(*temporal_duration_like_obj)) {
     // a. Throw a TypeError exception.
-    THROW_NEW_ERROR_RETURN_VALUE(isolate, NEW_TEMPORAL_INVALID_ARG_TYPE_ERROR(),
-                                 Nothing<DurationRecord>());
+    THROW_NEW_ERROR(isolate, NEW_TEMPORAL_TYPE_ERROR(
+                                 "Duration argument must be an object."));
   }
   DirectHandle<JSReceiver> temporal_duration_like =
       Cast<JSReceiver>(temporal_duration_like_obj);
@@ -274,7 +269,7 @@ Maybe<DurationRecord> ToPartialDuration(
   // Table 8: Duration Record Fields
   // #table-temporal-duration-record-fields
   // 4. For each row of Table 8, except the header row, in table order, do
-  MAYBE_ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+  ASSIGN_RETURN_ON_EXCEPTION(
       isolate, any,
       IterateDurationRecordFieldsTable(
           isolate, temporal_duration_like,
@@ -284,10 +279,9 @@ Maybe<DurationRecord> ToPartialDuration(
             // a. Let prop be the Property value of the current row.
             DirectHandle<Object> val;
             // b. Let val be ? Get(temporalDurationLike, prop).
-            ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+            ASSIGN_RETURN_ON_EXCEPTION(
                 isolate, val,
-                JSReceiver::GetProperty(isolate, temporal_duration_like, prop),
-                Nothing<bool>());
+                JSReceiver::GetProperty(isolate, temporal_duration_like, prop));
             // c. If val is not undefined, then
             if (!IsUndefined(*val)) {
               // i. Set any to true.
@@ -295,20 +289,20 @@ Maybe<DurationRecord> ToPartialDuration(
               // ii. Let val be 𝔽(? ToIntegerWithoutRounding(val)).
               // iii. Set result's field whose name is the Field Name value of
               // the current row to val.
-              MAYBE_ASSIGN_RETURN_ON_EXCEPTION_VALUE(
-                  isolate, *field, ToIntegerWithoutRounding(isolate, val),
-                  Nothing<bool>());
+              ASSIGN_RETURN_ON_EXCEPTION(
+                  isolate, *field, ToIntegerWithoutRounding(isolate, val));
             }
             return Just(not_undefined);
           },
-          &result),
-      Nothing<DurationRecord>());
+          &result));
 
   // 5. If any is false, then
   if (!any) {
     // a. Throw a TypeError exception.
-    THROW_NEW_ERROR_RETURN_VALUE(isolate, NEW_TEMPORAL_INVALID_ARG_TYPE_ERROR(),
-                                 Nothing<DurationRecord>());
+    THROW_NEW_ERROR(
+        isolate,
+        NEW_TEMPORAL_TYPE_ERROR(
+            "Duration argument must contain at least one date/time field."));
   }
   // 6. Return result.
   return Just(result);

@@ -13,6 +13,7 @@
 #include "src/base/logging.h"
 #include "src/common/globals.h"
 #include "src/handles/handles.h"
+#include "src/numbers/hash-seed.h"
 #include "src/objects/function-kind.h"
 #include "src/objects/function-syntax-kind.h"
 #include "src/objects/script.h"
@@ -51,12 +52,10 @@ class Zone;
   V(is_lazy_compile, bool, 1, _)                                \
   V(coverage_enabled, bool, 1, _)                               \
   V(block_coverage_enabled, bool, 1, _)                         \
-  V(is_asm_wasm_broken, bool, 1, _)                             \
   V(class_scope_has_private_brand, bool, 1, _)                  \
   V(private_name_lookup_skips_outer_class, bool, 1, _)          \
   V(requires_instance_members_initializer, bool, 1, _)          \
   V(has_static_private_methods_or_accessors, bool, 1, _)        \
-  V(might_always_turbofan, bool, 1, _)                          \
   V(allow_natives_syntax, bool, 1, _)                           \
   V(allow_lazy_compile, bool, 1, _)                             \
   V(post_parallel_compile_tasks_for_eager_toplevel, bool, 1, _) \
@@ -65,7 +64,8 @@ class Zone;
   V(is_repl_mode, bool, 1, _)                                   \
   V(produce_compile_hints, bool, 1, _)                          \
   V(compile_hints_magic_enabled, bool, 1, _)                    \
-  V(compile_hints_per_function_magic_enabled, bool, 1, _)
+  V(compile_hints_per_function_magic_enabled, bool, 1, _)       \
+  V(is_hoisted_in_context, bool, 1, _)
 
 class V8_EXPORT_PRIVATE UnoptimizedCompileFlags {
  public:
@@ -203,7 +203,7 @@ class V8_EXPORT_PRIVATE ReusableUnoptimizedCompileState {
   AstValueFactory* ast_value_factory() const {
     return ast_value_factory_.get();
   }
-  uint64_t hash_seed() const { return hash_seed_; }
+  HashSeed hash_seed() const { return hash_seed_; }
   AccountingAllocator* allocator() const { return allocator_; }
   const AstStringConstants* ast_string_constants() const {
     return ast_string_constants_;
@@ -213,7 +213,7 @@ class V8_EXPORT_PRIVATE ReusableUnoptimizedCompileState {
   LazyCompileDispatcher* dispatcher() const { return dispatcher_; }
 
  private:
-  uint64_t hash_seed_;
+  const HashSeed hash_seed_;
   AccountingAllocator* allocator_;
   V8FileLogger* v8_file_logger_;
   LazyCompileDispatcher* dispatcher_;
@@ -249,7 +249,7 @@ class V8_EXPORT_PRIVATE ParseInfo {
   const UnoptimizedCompileFlags& flags() const { return flags_; }
 
   // Getters for reusable state.
-  uint64_t hash_seed() const { return reusable_state_->hash_seed(); }
+  HashSeed hash_seed() const { return reusable_state_->hash_seed(); }
   AccountingAllocator* allocator() const {
     return reusable_state_->allocator();
   }
@@ -276,11 +276,6 @@ class V8_EXPORT_PRIVATE ParseInfo {
   // Accessor methods for output flags.
   bool allow_eval_cache() const { return allow_eval_cache_; }
   void set_allow_eval_cache(bool value) { allow_eval_cache_ = value; }
-
-#if V8_ENABLE_WEBASSEMBLY
-  bool contains_asm_module() const { return contains_asm_module_; }
-  void set_contains_asm_module(bool value) { contains_asm_module_ = value; }
-#endif  // V8_ENABLE_WEBASSEMBLY
 
   LanguageMode language_mode() const { return language_mode_; }
   void set_language_mode(LanguageMode value) { language_mode_ = value; }
@@ -352,6 +347,13 @@ class V8_EXPORT_PRIVATE ParseInfo {
   bool has_module_in_scope_chain() const { return has_module_in_scope_chain_; }
   void set_has_module_in_scope_chain() { has_module_in_scope_chain_ = true; }
 
+  bool has_generator_in_scope_chain() const {
+    return has_generator_in_scope_chain_;
+  }
+  void set_has_generator_in_scope_chain() {
+    has_generator_in_scope_chain_ = true;
+  }
+
   void SetCompileHintCallbackAndData(CompileHintCallback callback, void* data) {
     DCHECK_NULL(compile_hint_callback_);
     DCHECK_NULL(compile_hint_callback_data_);
@@ -398,13 +400,11 @@ class V8_EXPORT_PRIVATE ParseInfo {
   //----------- Output of parsing and scope analysis ------------------------
   FunctionLiteral* literal_;
   bool allow_eval_cache_ : 1;
-#if V8_ENABLE_WEBASSEMBLY
-  bool contains_asm_module_ : 1;
-#endif  // V8_ENABLE_WEBASSEMBLY
   LanguageMode language_mode_ : 1;
   bool is_background_compilation_ : 1;
   bool is_streaming_compilation_ : 1;
   bool has_module_in_scope_chain_ : 1;
+  bool has_generator_in_scope_chain_ : 1;
 };
 
 }  // namespace internal

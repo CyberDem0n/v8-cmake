@@ -68,7 +68,7 @@ Handle<String> JSPluralRules::TypeAsString(Isolate* isolate) const {
 // static
 MaybeDirectHandle<JSPluralRules> JSPluralRules::New(
     Isolate* isolate, DirectHandle<Map> map, DirectHandle<Object> locales,
-    DirectHandle<Object> options_obj) {
+    DirectHandle<Object> options_obj, const char* service) {
   // 1. Let requestedLocales be ? CanonicalizeLocaleList(locales).
   Maybe<std::vector<std::string>> maybe_requested_locales =
       Intl::CanonicalizeLocaleList(isolate, locales);
@@ -78,7 +78,6 @@ MaybeDirectHandle<JSPluralRules> JSPluralRules::New(
 
   // 2. Set options to ? CoerceOptionsToObject(options).
   DirectHandle<JSReceiver> options;
-  const char* service = "Intl.PluralRules";
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate, options, CoerceOptionsToObject(isolate, options_obj, service));
 
@@ -93,10 +92,35 @@ MaybeDirectHandle<JSPluralRules> JSPluralRules::New(
   // 7. Let t be ? GetOption(options, "type", "string", « "cardinal",
   // "ordinal" », "cardinal").
   Maybe<Type> maybe_type = GetStringOption<Type>(
-      isolate, options, "type", service, {"cardinal", "ordinal"},
-      {Type::CARDINAL, Type::ORDINAL}, Type::CARDINAL);
+      isolate, options, isolate->factory()->type_string(), service,
+      std::to_array<const std::string_view>({"cardinal", "ordinal"}),
+      std::array{Type::CARDINAL, Type::ORDINAL}, Type::CARDINAL);
   MAYBE_RETURN(maybe_type, MaybeDirectHandle<JSPluralRules>());
   Type type = maybe_type.FromJust();
+
+  Intl::Notation notation = Intl::Notation::STANDARD;
+  // 9. Let notation be ? GetOption(options, "notation", "string", «
+  // "standard", "scientific",  "engineering", "compact" », "standard").
+  ASSIGN_RETURN_ON_EXCEPTION(
+      isolate, notation,
+      GetStringOption<Intl::Notation>(
+          isolate, options, isolate->factory()->notation_string(), service,
+          std::to_array<const std::string_view>(
+              {"standard", "scientific", "engineering", "compact"}),
+          std::array{Intl::Notation::STANDARD, Intl::Notation::SCIENTIFIC,
+                     Intl::Notation::ENGINEERING, Intl::Notation::COMPACT},
+          Intl::Notation::STANDARD));
+  // 10. Set pluralRules.[[Notation]] to notation.
+  // 28. Let compactDisplay be ? GetOption(options, "compactDisplay",
+  // "string", « "short", "long" »,  "short").
+  Maybe<Intl::CompactDisplay> maybe_compact_display =
+      GetStringOption<Intl::CompactDisplay>(
+          isolate, options, isolate->factory()->compactDisplay_string(),
+          service, std::to_array<const std::string_view>({"short", "long"}),
+          std::array{Intl::CompactDisplay::SHORT, Intl::CompactDisplay::LONG},
+          Intl::CompactDisplay::SHORT);
+  MAYBE_RETURN(maybe_compact_display, MaybeDirectHandle<JSPluralRules>());
+  Intl::CompactDisplay compact_display = maybe_compact_display.FromJust();
 
   // Note: The spec says we should do ResolveLocale after performing
   // SetNumberFormatDigitOptions but we need the locale to create all
@@ -135,9 +159,18 @@ MaybeDirectHandle<JSPluralRules> JSPluralRules::New(
     }
   }
 
-  // 9. Perform ? SetNumberFormatDigitOptions(pluralRules, options, 0, 3).
+  // The default notation in ICU is Simple, which mapped from STANDARD
+  // so we can skip setting it.
+  if (notation != Intl::Notation::STANDARD) {
+    settings =
+        settings.notation(Intl::ToICUNotation(notation, compact_display));
+  }
+
+  // 11. Perform ? SetNumberFormatDigitOptions(pluralRules, options, 0, 3,
+  // notation).
   Maybe<Intl::NumberFormatDigitOptions> maybe_digit_options =
-      Intl::SetNumberFormatDigitOptions(isolate, options, 0, 3, false, service);
+      Intl::SetNumberFormatDigitOptions(
+          isolate, options, 0, 3, notation == Intl::Notation::COMPACT, service);
   MAYBE_RETURN(maybe_digit_options, MaybeDirectHandle<JSPluralRules>());
   Intl::NumberFormatDigitOptions digit_options = maybe_digit_options.FromJust();
   settings =
@@ -146,12 +179,13 @@ MaybeDirectHandle<JSPluralRules> JSPluralRules::New(
   icu::number::LocalizedNumberFormatter icu_number_formatter =
       settings.locale(icu_locale);
 
-  DirectHandle<Managed<icu::PluralRules>> managed_plural_rules =
-      Managed<icu::PluralRules>::From(isolate, 0, std::move(icu_plural_rules));
+  DirectHandle<CppGCManaged<icu::PluralRules>> managed_plural_rules =
+      CppGCManaged<icu::PluralRules>::Create(isolate, 0,
+                                             std::move(icu_plural_rules));
 
-  DirectHandle<Managed<icu::number::LocalizedNumberFormatter>>
+  DirectHandle<CppGCManaged<icu::number::LocalizedNumberFormatter>>
       managed_number_formatter =
-          Managed<icu::number::LocalizedNumberFormatter>::From(
+          CppGCManaged<icu::number::LocalizedNumberFormatter>::Create(
               isolate, 0,
               std::make_shared<icu::number::LocalizedNumberFormatter>(
                   icu_number_formatter));
@@ -177,11 +211,12 @@ MaybeDirectHandle<JSPluralRules> JSPluralRules::New(
 
 MaybeDirectHandle<String> JSPluralRules::ResolvePlural(
     Isolate* isolate, DirectHandle<JSPluralRules> plural_rules, double number) {
-  icu::PluralRules* icu_plural_rules = plural_rules->icu_plural_rules()->raw();
+  CppGCManaged<icu::PluralRules>::Ptr icu_plural_rules =
+      plural_rules->icu_plural_rules()->ptr();
   DCHECK_NOT_NULL(icu_plural_rules);
 
-  icu::number::LocalizedNumberFormatter* fmt =
-      plural_rules->icu_number_formatter()->raw();
+  CppGCManaged<icu::number::LocalizedNumberFormatter>::Ptr fmt =
+      plural_rules->icu_number_formatter()->ptr();
   DCHECK_NOT_NULL(fmt);
 
   UErrorCode status = U_ZERO_ERROR;
@@ -199,13 +234,14 @@ MaybeDirectHandle<String> JSPluralRules::ResolvePlural(
 MaybeDirectHandle<String> JSPluralRules::ResolvePluralRange(
     Isolate* isolate, DirectHandle<JSPluralRules> plural_rules, double x,
     double y) {
-  icu::PluralRules* icu_plural_rules = plural_rules->icu_plural_rules()->raw();
+  CppGCManaged<icu::PluralRules>::Ptr icu_plural_rules =
+      plural_rules->icu_plural_rules()->ptr();
   DCHECK_NOT_NULL(icu_plural_rules);
 
   Maybe<icu::number::LocalizedNumberRangeFormatter> maybe_range_formatter =
       JSNumberFormat::GetRangeFormatter(
           isolate, plural_rules->locale(),
-          *plural_rules->icu_number_formatter()->raw());
+          *plural_rules->icu_number_formatter()->ptr());
   MAYBE_RETURN(maybe_range_formatter, MaybeDirectHandle<String>());
 
   icu::number::LocalizedNumberRangeFormatter nrfmt =
@@ -259,10 +295,24 @@ DirectHandle<JSObject> JSPluralRules::ResolvedOptions(
                                plural_rules->TypeAsString(isolate), "type");
 
   UErrorCode status = U_ZERO_ERROR;
-  icu::number::LocalizedNumberFormatter* icu_number_formatter =
-      plural_rules->icu_number_formatter()->raw();
+  CppGCManaged<icu::number::LocalizedNumberFormatter>::Ptr icu_number_formatter =
+      plural_rules->icu_number_formatter()->ptr();
   icu::UnicodeString skeleton = icu_number_formatter->toSkeleton(status);
   DCHECK(U_SUCCESS(status));
+
+  Factory* factory = isolate->factory();
+  Intl::Notation notation = Intl::NotationFromSkeleton(skeleton);
+  CHECK(JSReceiver::CreateDataProperty(
+            isolate, options, factory->notation_string(),
+            Intl::NotationAsString(isolate, notation), Just(kDontThrow))
+            .FromJust());
+  if (notation == Intl::Notation::COMPACT) {
+    // https://github.com/tc39/ecma402/issues/1031
+    CHECK(JSReceiver::CreateDataProperty(
+              isolate, options, factory->compactDisplay_string(),
+              Intl::CompactDisplayString(isolate, skeleton), Just(kDontThrow))
+              .FromJust());
+  }
 
   CreateDataPropertyForOptions(
       isolate, options,
@@ -287,7 +337,8 @@ DirectHandle<JSObject> JSPluralRules::ResolvedOptions(
   // results of PluralRuleSelect for the selected locale pr.[[Locale]], sorted
   // according to the following order: "zero", "one", "two", "few", "many",
   // "other".
-  icu::PluralRules* icu_plural_rules = plural_rules->icu_plural_rules()->raw();
+  CppGCManaged<icu::PluralRules>::Ptr icu_plural_rules =
+      plural_rules->icu_plural_rules()->ptr();
   DCHECK_NOT_NULL(icu_plural_rules);
 
   std::unique_ptr<icu::StringEnumeration> categories(
@@ -296,7 +347,6 @@ DirectHandle<JSObject> JSPluralRules::ResolvedOptions(
   int32_t count = categories->count(status);
   DCHECK(U_SUCCESS(status));
 
-  Factory* factory = isolate->factory();
   DirectHandle<FixedArray> plural_categories = factory->NewFixedArray(count);
   const std::vector<const char*> kCategories = {"zero", "one",  "two",
                                                 "few",  "many", "other"};

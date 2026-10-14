@@ -49,7 +49,7 @@
 #include "src/codegen/arm/constants-arm.h"
 #include "src/codegen/arm/register-arm.h"
 #include "src/codegen/assembler.h"
-#include "src/codegen/constant-pool.h"
+#include "src/codegen/constant-pool-entry.h"
 #include "src/codegen/machine-type.h"
 #include "src/utils/boxed-float.h"
 namespace v8 {
@@ -317,11 +317,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   static RegList DefaultTmpList();
   static VfpRegList DefaultFPTmpList();
 
-  void AbortedCodeGeneration() override {
-    pending_32_bit_constants_.clear();
-    first_const_pool_32_use_ = -1;
-    constant_pool_deadline_ = kMaxInt;
-  }
+  void AbortedCodeGeneration() override { ClearInternalState(); }
 
   // GetCode emits any pending (non-emitted) code and fills the descriptor desc.
   static constexpr int kNoHandlerTable = 0;
@@ -336,6 +332,9 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void GetCode(LocalIsolate* isolate, CodeDesc* desc) {
     GetCode(isolate, desc, kNoSafepointTable, kNoHandlerTable);
   }
+
+  // EABI variant for double arguments in use.
+  bool use_eabi_hardfloat() const { return use_eabi_hardfloat_; }
 
   // Label operations & relative jumps (PPUM Appendix D)
   //
@@ -413,6 +412,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void DataAlign(int m);
   // Aligns code to something that's optimal for a jump target for the platform.
   void CodeTargetAlign();
+  void SwitchTargetAlign() { CodeTargetAlign(); }
+  void BranchTargetAlign() { CodeTargetAlign(); }
   void LoopHeaderAlign() { CodeTargetAlign(); }
 
   // Branch instructions
@@ -1075,6 +1076,14 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
     DISALLOW_IMPLICIT_CONSTRUCTORS(BlockConstPoolScope);
   };
 
+  // Clear any internal state to avoid check failures if we drop
+  // the assembly code.
+  void ClearInternalState() {
+    pending_32_bit_constants_.clear();
+    first_const_pool_32_use_ = -1;
+    constant_pool_deadline_ = kMaxInt;
+  }
+
   // Unused on this architecture.
   void MaybeEmitOutOfLineConstantPool() {}
 
@@ -1293,9 +1302,6 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   VfpRegList scratch_vfp_register_list_;
 
  private:
-  // Avoid overflows for displacements etc.
-  static const int kMaximalBufferSize = 512 * MB;
-
   // Constant pool generation
   // Pools are emitted in the instruction stream, preferably after unconditional
   // jumps or after returns from functions (in dead code locations).
@@ -1329,6 +1335,8 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   // The bound position, before this we cannot do instruction elimination.
   int last_bound_pos_;
 
+  const bool use_eabi_hardfloat_;
+
   V8_INLINE void CheckBuffer();
   void GrowBuffer();
 
@@ -1355,7 +1363,7 @@ class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
   void RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data = 0);
   void ConstantPoolAddEntry(int position, RelocInfo::Mode rmode,
                             intptr_t value);
-  void AllocateAndInstallRequestedHeapNumbers(LocalIsolate* isolate);
+  void PatchInHeapNumberRequest(Address pc, Handle<HeapNumber> object) override;
 
   int WriteCodeComments();
 

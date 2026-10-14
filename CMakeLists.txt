@@ -88,9 +88,26 @@ option(V8_ENABLE_I18N "Enable Internationalization support")
 option(V8_ENABLE_TEMPORAL "Enable Temporal API support" OFF)
 option(V8_ENABLE_SPARKPLUG "Enable Sparkplug baseline JIT" ON)
 option(V8_ENABLE_WEBASSEMBLY "Enable WebAssembly support" OFF)
+# ABI-affecting: embedders must be built with matching settings.
+option(V8_ENABLE_POINTER_COMPRESSION "Enable pointer compression" OFF)
+option(V8_ENABLE_SANDBOX "Enable the V8 sandbox (requires pointer compression)" OFF)
+if(V8_ENABLE_SANDBOX)
+  set(V8_ENABLE_POINTER_COMPRESSION ON CACHE BOOL "Enable pointer compression" FORCE)
+endif()
 
 set(
   v8_defines
+  V8_USE_METAGEN_INSTANCE_TYPES=0
+  # Gates an InstructionBlock member; must be defined for all TUs.
+  BUILTIN_BLOCK_POSITION
+  $<$<BOOL:${V8_ENABLE_POINTER_COMPRESSION}>:V8_COMPRESS_POINTERS>
+  $<$<BOOL:${V8_ENABLE_POINTER_COMPRESSION}>:V8_COMPRESS_POINTERS_IN_SHARED_CAGE>
+  $<$<BOOL:${V8_ENABLE_POINTER_COMPRESSION}>:V8_31BIT_SMIS_ON_64BIT_ARCH>
+  $<$<BOOL:${V8_ENABLE_POINTER_COMPRESSION}>:V8_EXTERNAL_CODE_SPACE>
+  $<$<BOOL:${V8_ENABLE_SANDBOX}>:V8_ENABLE_SANDBOX>
+  # Default-on for x64/arm64 with pointer compression.
+  $<$<AND:$<BOOL:${V8_ENABLE_POINTER_COMPRESSION}>,${is-x64}>:V8_SHORT_BUILTIN_CALLS>
+  $<$<AND:$<BOOL:${V8_ENABLE_POINTER_COMPRESSION}>,${is-arm64}>:V8_SHORT_BUILTIN_CALLS>
   $<${is-darwin}:V8_HAVE_TARGET_OS>
   $<${is-darwin}:V8_TARGET_OS_MACOS>
   $<${is-linux}:V8_HAVE_TARGET_OS>
@@ -104,6 +121,8 @@ set(
   $<${is-win}:NOMINMAX>
   $<$<AND:${is-win},${is-x64}>:V8_OS_WIN_X64>
   $<$<BOOL:${V8_ENABLE_CONCURRENT_MARKING}>:V8_CONCURRENT_MARKING>
+  # Required with concurrent marking.
+  $<$<BOOL:${V8_ENABLE_CONCURRENT_MARKING}>:V8_ATOMIC_OBJECT_FIELD_WRITES>
   $<${is-win}:V8_OS_WIN32>
   V8_TLS_USED_IN_LIBRARY
   V8_ENABLE_LEAPTIERING
@@ -136,9 +155,25 @@ set(enable-fpic
 )
 
 
-set(disable-offset-return-warnings
+set(disable-v8-warnings
   $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-invalid-offsetof>
   $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-return-type>
+  # Silence noisy GCC diagnostics from V8's own headers: `using Name = Name;`
+  # self-aliases and a defaulted constexpr operator== over a non-constexpr
+  # std::atomic. -fpermissive downgrades the self-alias error so the code builds.
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-fpermissive>
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-changes-meaning>
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-invalid-constexpr>
+  # GCC ignores Clang-only attributes (e.g. __attribute__((nodebug))).
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-attributes>
+  # GCC 12/13 false positives from its buffer-overflow/read analysis over V8's
+  # tagged-pointer / atomic / templated MemCopy code (e.g. "destination at
+  # address zero", over-read of a fixed-size padding array).
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-stringop-overflow>
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-stringop-overread>
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-array-bounds>
+  # arm64 notes about the GCC 10.1 ABI change for passing std::pair<float,...>.
+  $<$<AND:$<CXX_COMPILER_ID:GNU>,$<COMPILE_LANGUAGE:CXX>>:-Wno-psabi>
 )
 
 # more granular library support
@@ -245,15 +280,15 @@ file(GLOB heap-sources RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS
   v8/src/heap/*.cc
   v8/src/heap/base/*.cc
   v8/src/heap/cppgc-js/*.cc
-  v8/src/heap/cppgc/*.cc
+  v8/src/heap/cppgc-internal/*.cc
   v8/src/heap/third-party/*.cc
 )
 
 # Caged heap feature is x64/arm64-only at the moment.
 list(REMOVE_ITEM heap-sources
   v8/src/heap/conservative-stack-visitor.cc
-  v8/src/heap/cppgc/caged-heap-local-data.cc
-  v8/src/heap/cppgc/caged-heap.cc
+  v8/src/heap/cppgc-internal/caged-heap-local-data.cc
+  v8/src/heap/cppgc-internal/caged-heap.cc
 )
 
 if(WIN32)
@@ -331,6 +366,7 @@ add_library(v8_base_without_compiler STATIC
   $<${is-x64}:v8/src/execution/x64/frame-constants-x64.cc>
   $<${is-x64}:v8/src/regexp/x64/regexp-macro-assembler-x64.cc>
   $<${is-arm64}:v8/src/codegen/arm64/assembler-arm64.cc>
+  $<${is-arm64}:v8/src/codegen/arm64/constant-pool-arm64.cc>
   $<${is-arm64}:v8/src/codegen/arm64/cpu-arm64.cc>
   $<${is-arm64}:v8/src/codegen/arm64/decoder-arm64.cc>
   $<${is-arm64}:v8/src/codegen/arm64/macro-assembler-arm64.cc>
@@ -345,9 +381,14 @@ add_library(v8_base_without_compiler STATIC
   $<${is-arm64}:v8/src/deoptimizer/arm64/deoptimizer-arm64.cc>
   $<${is-arm64}:v8/src/diagnostics/arm64/disasm-arm64.cc>
   $<${is-arm64}:v8/src/diagnostics/arm64/eh-frame-arm64.cc>
+  $<${is-arm64}:v8/src/diagnostics/arm64/unwinder-arm64.cc>
   $<${is-arm64}:v8/src/execution/arm64/frame-constants-arm64.cc>
+  $<${is-arm64}:v8/src/execution/arm64/pointer-auth-arm64.cc>
+  $<${is-arm64}:v8/src/execution/arm64/simulator-arm64.cc>
+  $<${is-arm64}:v8/src/execution/arm64/simulator-logic-arm64.cc>
   $<${is-arm64}:v8/src/regexp/arm64/regexp-macro-assembler-arm64.cc>
   $<$<AND:${is-ppc},${is-ppc64}>:v8/src/codegen/ppc/assembler-ppc.cc>
+  $<$<AND:${is-ppc},${is-ppc64}>:v8/src/codegen/ppc/constant-pool-ppc.cc>
   $<$<AND:${is-ppc},${is-ppc64}>:v8/src/codegen/ppc/constants-ppc.cc>
   $<$<AND:${is-ppc},${is-ppc64}>:v8/src/codegen/ppc/cpu-ppc.cc>
   $<$<AND:${is-ppc},${is-ppc64}>:v8/src/codegen/ppc/macro-assembler-ppc.cc>
@@ -372,6 +413,10 @@ add_library(v8_base_without_compiler STATIC
   ${codegen-sources}
   v8/src/common/assert-scope.cc
   v8/src/common/code-memory-access.cc
+  # Pointer-compression cage bases; only needed with pointer compression.
+  $<$<BOOL:${V8_ENABLE_POINTER_COMPRESSION}>:v8/src/common/ptr-compr.cc>
+  # Linked by core code, not just test sync points; always compile.
+  v8/src/common/synchronization-point-support.cc
   v8/src/compiler-dispatcher/lazy-compile-dispatcher.cc
   v8/src/compiler-dispatcher/optimizing-compile-dispatcher.cc
   v8/src/date/date.cc
@@ -462,7 +507,10 @@ set_property(SOURCE v8/src/diagnostics/unwinding-info-win64.cc
 )
 
 target_compile_definitions(v8_base_without_compiler PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_base_without_compiler PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+# zlib builds in C90 mode here, so it assumes vsnprintf() is unavailable and
+# emits #warning stubs for gzprintf(); it is available on all supported targets.
+target_compile_definitions(v8_base_without_compiler PRIVATE $<$<COMPILE_LANGUAGE:C>:HAVE_VSNPRINTF>)
+target_compile_options(v8_base_without_compiler PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_base_without_compiler PRIVATE ${enable-fpic})
 endif()
@@ -487,8 +535,6 @@ target_link_libraries(
     v8_torque_generated
   PUBLIC
     v8-bytecodes-builtin-list
-    v8_simdutf
-    absl::raw_hash_set
 )
 
 #
@@ -521,7 +567,7 @@ endif()
 add_library(v8_compiler STATIC)
 target_sources(v8_compiler PRIVATE ${compiler-sources})
 target_compile_definitions(v8_compiler PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_compiler PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_compiler PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_compiler PRIVATE ${enable-fpic})
 endif()
@@ -532,6 +578,7 @@ target_include_directories(v8_compiler
   PRIVATE
     ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf
     ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
     ${PROJECT_SOURCE_DIR}/v8/third_party/highway/src
     ${PROJECT_SOURCE_DIR}/v8/third_party/fp16/src/include
@@ -604,7 +651,7 @@ add_library(
 )
 
 target_compile_definitions(v8_initializers PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_initializers PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_initializers PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_initializers PRIVATE ${enable-fpic})
 endif()
@@ -612,6 +659,7 @@ endif()
 target_include_directories(v8_initializers
   PRIVATE
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf
     ${PROJECT_BINARY_DIR}
 )
 
@@ -631,11 +679,11 @@ add_library(
 )
 
 target_compile_definitions(v8_snapshot PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_snapshot PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_snapshot PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_snapshot PRIVATE ${enable-fpic})
 endif()
-target_include_directories(v8_snapshot PRIVATE ${PROJECT_SOURCE_DIR}/v8)
+target_include_directories(v8_snapshot PRIVATE ${PROJECT_SOURCE_DIR}/v8 ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf)
 
 target_link_libraries(v8_snapshot
   PRIVATE
@@ -718,7 +766,7 @@ add_library(v8_inspector STATIC
 )
 
 target_compile_features(v8_inspector PUBLIC cxx_std_17)
-target_compile_options(v8_inspector PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_inspector PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_inspector PRIVATE ${enable-fpic})
 endif()
@@ -728,6 +776,7 @@ target_include_directories(v8_inspector
   PRIVATE
     ${PROJECT_BINARY_DIR}/inspector
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf
     ${PROJECT_SOURCE_DIR}/v8/include
     ${PROJECT_SOURCE_DIR}/v8/third_party/googletest/src/googlemock/include
     ${PROJECT_SOURCE_DIR}/v8/third_party/googletest/src/googletest/include
@@ -791,7 +840,7 @@ target_sources(v8_libplatform
 )
 
 target_compile_definitions(v8_libplatform PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_libplatform PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_libplatform PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_libplatform PRIVATE ${enable-fpic})
 endif()
@@ -820,7 +869,7 @@ target_include_directories(v8_libsampler
 )
 
 target_compile_definitions(v8_libsampler PRIVATE $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_libsampler PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_libsampler PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_libsampler PRIVATE ${enable-fpic})
 endif()
@@ -831,12 +880,42 @@ target_link_libraries(v8_libsampler PRIVATE v8_libbase)
 # v8_libbase
 #
 
+file(GLOB_RECURSE absl-sources
+  RELATIVE ${PROJECT_SOURCE_DIR}
+  CONFIGURE_DEPENDS
+  v8/third_party/abseil-cpp/absl/base/*.cc
+  v8/third_party/abseil-cpp/absl/container/*.cc
+  v8/third_party/abseil-cpp/absl/crc/*.cc
+  v8/third_party/abseil-cpp/absl/debugging/*.cc
+  v8/third_party/abseil-cpp/absl/hash/*.cc
+  v8/third_party/abseil-cpp/absl/numeric/*.cc
+  v8/third_party/abseil-cpp/absl/profiling/*.cc
+  v8/third_party/abseil-cpp/absl/strings/*.cc
+  v8/third_party/abseil-cpp/absl/synchronization/*.cc
+  v8/third_party/abseil-cpp/absl/time/*.cc
+  v8/third_party/abseil-cpp/absl/types/*.cc
+)
+list(FILTER absl-sources EXCLUDE REGEX ".*(_test|_testing|_benchmark|benchmarks|test_util|test_helper|test_common|test_instance_tracker|test_time_zone_names|simulated_clock|scoped_set_env|stack_consumption|mock_|print_hash_of|mutex_nonprod|scoped_mock_log).*")
+if(NOT WIN32)
+  list(FILTER absl-sources EXCLUDE REGEX ".*time_zone_name_win[.]cc$")
+endif()
+
 add_library(v8_libbase STATIC
+  ${absl-sources}
+  v8/third_party/simdutf/simdutf.cpp
   v8/src/base/abort-mode.cc
   v8/src/base/bits.cc
   v8/src/base/bounded-page-allocator.cc
   v8/src/base/emulated-virtual-address-subspace.cc
-  v8/src/base/cpu.cc
+  v8/src/base/cpu/cpu.cc
+  $<${is-x64}:v8/src/base/cpu/cpu-x86.cc>
+  $<${is-ia32}:v8/src/base/cpu/cpu-x86.cc>
+  $<${is-arm64}:v8/src/base/cpu/cpu-arm.cc>
+  $<${is-arm}:v8/src/base/cpu/cpu-arm.cc>
+  $<${is-ppc}:v8/src/base/cpu/cpu-ppc.cc>
+  $<${is-ppc64}:v8/src/base/cpu/cpu-ppc.cc>
+  $<${is-s390}:v8/src/base/cpu/cpu-s390.cc>
+  $<${is-mips64}:v8/src/base/cpu/cpu-mips64.cc>
   v8/src/base/debug/stack_trace.cc
   v8/src/base/division-by-constant.cc
   v8/src/base/file-utils.cc
@@ -857,6 +936,7 @@ add_library(v8_libbase STATIC
   v8/src/base/utils/random-number-generator.cc
   v8/src/base/vlq-base64.cc
   v8/src/base/virtual-address-space.cc
+  v8/src/base/virtual-address-space-page-allocator.cc
   $<$<NOT:$<OR:${is-win},${is-aix}>>:v8/src/base/platform/platform-posix-time.cc>
   $<${is-win}:v8/src/base/platform/platform-win32.cc>
   $<${is-win}:v8/src/base/debug/stack_trace_win.cc>
@@ -874,12 +954,13 @@ set_property(SOURCE v8/src/base/utils/random-number-generator.cc
 )
 
 target_compile_definitions(v8_libbase PRIVATE $<${is-win}:UNICODE> $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_libbase PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_libbase PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_libbase PRIVATE ${enable-fpic})
 endif()
 target_include_directories(v8_libbase PRIVATE ${PROJECT_SOURCE_DIR}/v8)
-target_include_directories(v8_libbase PRIVATE ${PROJECT_SOURCE_DIR}/v8third_party/abseil-cpp)
+target_include_directories(v8_libbase PUBLIC ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp)
+target_include_directories(v8_libbase PRIVATE ${PROJECT_SOURCE_DIR}/v8/third_party/llvm-libc/src)
 target_link_libraries(v8_libbase
   PRIVATE
     Threads::Threads
@@ -887,9 +968,6 @@ target_link_libraries(v8_libbase
     $<${is-linux}:rt>
     $<${is-win}:winmm>
     $<${is-win}:dbghelp>
-  PUBLIC
-    absl::synchronization
-    absl::str_format
 )
 
 #
@@ -912,6 +990,7 @@ add_executable(
 target_include_directories(bytecode_builtins_list_generator
   PRIVATE
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf
     ${PROJECT_SOURCE_DIR}/v8/include
     ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
 )
@@ -974,6 +1053,7 @@ if(NOT V8_ENABLE_WEBASSEMBLY)
     src/builtins/js-to-js.tq
     src/builtins/js-to-wasm.tq
     src/builtins/wasm.tq
+    src/builtins/wasm-interpreter-wrappers.tq
     src/builtins/wasm-strings.tq
     src/builtins/wasm-to-js.tq
   )
@@ -984,24 +1064,9 @@ list(TRANSFORM torque_files PREPEND v8/ OUTPUT_VARIABLE torque_files_abs)
 # Note: target v8_compiler depends on ${torque_outputs}. Maybe this should be
 # a source-only dependency.
 set(torque_outputs
-  ${PROJECT_BINARY_DIR}/torque-generated/class-debug-readers-tq.cc
   ${PROJECT_BINARY_DIR}/torque-generated/class-debug-readers.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/class-definitions-tq.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/class-definitions.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/class-verifiers-tq.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/class-verifiers.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/exported-macros-assembler-tq.cc
   ${PROJECT_BINARY_DIR}/torque-generated/exported-macros-assembler.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/factory-tq.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/factory-tq.inc
-  ${PROJECT_BINARY_DIR}/torque-generated/factory.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/factory.inc
-  ${PROJECT_BINARY_DIR}/torque-generated/interface-descriptors-tq.inc
   ${PROJECT_BINARY_DIR}/torque-generated/interface-descriptors.inc
-  ${PROJECT_BINARY_DIR}/torque-generated/objects-body-descriptors-inl.inc
-  ${PROJECT_BINARY_DIR}/torque-generated/objects-body-descriptors-tq-inl.inc
-  ${PROJECT_BINARY_DIR}/torque-generated/objects-printer-tq.cc
-  ${PROJECT_BINARY_DIR}/torque-generated/objects-printer.cc
 )
 
 list(TRANSFORM torque_files
@@ -1024,14 +1089,17 @@ endforeach()
 
 list(REMOVE_DUPLICATES torque_dirs)
 
+set(torque_stamp ${PROJECT_BINARY_DIR}/torque-generated.stamp)
+
 add_library(
   v8_torque_generated STATIC
   ${torque-outputs}
   ${torque_outputs}
+  ${torque_stamp}
 )
 
 target_compile_definitions(v8_torque_generated PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(v8_torque_generated PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(v8_torque_generated PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 if(enable-fPIC)
   target_compile_options(v8_torque_generated PRIVATE ${enable-fpic})
 endif()
@@ -1042,40 +1110,31 @@ target_include_directories(v8_torque_generated
     ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}/v8/include
     ${PROJECT_SOURCE_DIR}/v8
+    ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf
     ${PROJECT_SOURCE_DIR}/v8/third_party/abseil-cpp
     ${PROJECT_SOURCE_DIR}/v8/third_party/highway/src
     ${PROJECT_SOURCE_DIR}/v8/third_party/fp16/src/include
 )
 
-# The torque-outputs and torque_outputs variables can have too many characters
-# on Windows to be executed on the command line, so we have to write it to a
-# temporary file and execute that 
-file(WRITE "${PROJECT_BINARY_DIR}/touch_torque_outputs.cmake"
-           "file(TOUCH ${torque-outputs};${torque_outputs})")
-
+# Torque only rewrites files whose content changed, so the generated files are
+# BYPRODUCTS and a stamp is the OUTPUT: unchanged files keep their mtime and
+# are not recompiled, while the stamp keeps torque from rerunning every build.
 add_custom_command(
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${torque_dirs}
   COMMAND
     torque
     -o ${PROJECT_BINARY_DIR}/torque-generated
     -v8-root ${PROJECT_SOURCE_DIR}/v8
     ${torque_files}
-  COMMAND
-    ${CMAKE_COMMAND} -P ${PROJECT_BINARY_DIR}/touch_torque_outputs.cmake
+  COMMAND ${CMAKE_COMMAND} -E touch ${torque_stamp}
   DEPENDS
     torque
-    ${torque_dirs}
     ${torque_files_abs}
   OUTPUT
+    ${torque_stamp}
+  BYPRODUCTS
     ${torque-outputs}
     ${torque_outputs}
-)
-
-
-add_custom_command(
-  COMMAND
-    ${CMAKE_COMMAND} -E make_directory ${torque_dirs}
-  OUTPUT
-    ${torque_dirs}
 )
 
 #
@@ -1116,7 +1175,7 @@ add_executable(mksnapshot
 )
 
 target_compile_definitions(mksnapshot PRIVATE ${v8_defines} $<${is-msvc}:_HAS_EXCEPTIONS=0>)
-target_compile_options(mksnapshot PRIVATE ${disable-exceptions} ${disable-offset-return-warnings})
+target_compile_options(mksnapshot PRIVATE ${disable-exceptions} ${disable-v8-warnings})
 target_include_directories(mksnapshot PRIVATE ${PROJECT_SOURCE_DIR}/v8)
 target_link_libraries(mksnapshot
   PRIVATE
@@ -1135,10 +1194,6 @@ target_include_directories(v8-adler32
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/v8/third_party/zlib>
 )
 
-add_subdirectory(v8/third_party/abseil-cpp EXCLUDE_FROM_ALL)
-add_library(v8_simdutf STATIC v8/third_party/simdutf/simdutf.cpp)
-target_include_directories(v8_simdutf PUBLIC ${PROJECT_SOURCE_DIR}/v8/third_party/simdutf)
-set_property(TARGET v8_simdutf PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 if (is-arm64)
 set_source_files_properties(

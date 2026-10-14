@@ -8,14 +8,12 @@
 #include "src/heap/main-allocator.h"
 // Include the non-inl header before the rest of the headers.
 
-#include "src/flags/flags.h"
-#include "src/heap/heap-inl.h"
 #include "src/heap/marking-state-inl.h"
 
 namespace v8 {
 namespace internal {
 
-AllocationResult MainAllocator::AllocateRaw(int size_in_bytes,
+AllocationResult MainAllocator::AllocateRaw(SafeHeapObjectSize size_in_bytes,
                                             AllocationAlignment alignment,
                                             AllocationOrigin origin,
                                             AllocationHint hint) {
@@ -23,11 +21,6 @@ AllocationResult MainAllocator::AllocateRaw(int size_in_bytes,
 
   DCHECK_EQ(in_gc(), origin == AllocationOrigin::kGC);
   DCHECK_EQ(in_gc(), isolate_heap()->IsInGC());
-
-  // We are not supposed to allocate in fast c calls.
-  DCHECK_IMPLIES(is_main_thread(),
-                 v8_flags.allow_allocation_in_fast_api_call ||
-                     !isolate_heap()->isolate()->InFastCCall());
 
   AllocationResult result;
 
@@ -37,20 +30,22 @@ AllocationResult MainAllocator::AllocateRaw(int size_in_bytes,
     result = AllocateFastUnaligned(size_in_bytes, origin);
   }
 
-  return result.IsFailure() ? AllocateRawSlow(size_in_bytes, alignment, origin)
-                            : result;
+  if (result.IsFailure()) [[unlikely]] {
+    return AllocateRawSlow(size_in_bytes, alignment, origin);
+  }
+  return result;
 }
 
-AllocationResult MainAllocator::AllocateFastUnaligned(int size_in_bytes,
-                                                      AllocationOrigin origin) {
+AllocationResult MainAllocator::AllocateFastUnaligned(
+    SafeHeapObjectSize size_in_bytes, AllocationOrigin origin) {
   size_in_bytes = ALIGN_TO_ALLOCATION_ALIGNMENT(size_in_bytes);
-  if (!allocation_info().CanIncrementTop(size_in_bytes)) {
+  if (!allocation_info().CanIncrementTop(size_in_bytes.value())) {
     return AllocationResult::Failure();
   }
-  Tagged<HeapObject> obj =
-      HeapObject::FromAddress(allocation_info().IncrementTop(size_in_bytes));
+  Tagged<HeapObject> obj = HeapObject::FromAddress(
+      allocation_info().IncrementTop(size_in_bytes.value()));
 
-  MSAN_ALLOCATED_UNINITIALIZED_MEMORY(obj.address(), size_in_bytes);
+  MSAN_ALLOCATED_UNINITIALIZED_MEMORY(obj.address(), size_in_bytes.value());
 
   DCHECK_IMPLIES(black_allocation_ == BlackAllocation::kAlwaysEnabled,
                  space_heap()->marking_state()->IsMarked(obj));
@@ -59,25 +54,28 @@ AllocationResult MainAllocator::AllocateFastUnaligned(int size_in_bytes,
 }
 
 AllocationResult MainAllocator::AllocateFastAligned(
-    int size_in_bytes, int* result_aligned_size_in_bytes,
+    SafeHeapObjectSize size_in_bytes,
+    SafeHeapObjectSize* result_aligned_size_in_bytes,
     AllocationAlignment alignment, AllocationOrigin origin) {
   Address top = allocation_info().top();
-  int filler_size = Heap::GetFillToAlign(top, alignment);
-  int aligned_size_in_bytes = size_in_bytes + filler_size;
+  int filler_size = GetFillToAlign(top, alignment);
+  SafeHeapObjectSize aligned_size_in_bytes = SafeHeapObjectSize(
+      size_in_bytes.value() + static_cast<uint32_t>(filler_size));
 
-  if (!allocation_info().CanIncrementTop(aligned_size_in_bytes)) {
+  if (!allocation_info().CanIncrementTop(aligned_size_in_bytes.value())) {
     return AllocationResult::Failure();
   }
   Tagged<HeapObject> obj = HeapObject::FromAddress(
-      allocation_info().IncrementTop(aligned_size_in_bytes));
-  if (result_aligned_size_in_bytes)
+      allocation_info().IncrementTop(aligned_size_in_bytes.value()));
+  if (result_aligned_size_in_bytes) {
     *result_aligned_size_in_bytes = aligned_size_in_bytes;
+  }
 
   if (filler_size > 0) {
     obj = space_heap()->PrecedeWithFiller(obj, filler_size);
   }
 
-  MSAN_ALLOCATED_UNINITIALIZED_MEMORY(obj.address(), size_in_bytes);
+  MSAN_ALLOCATED_UNINITIALIZED_MEMORY(obj.address(), size_in_bytes.value());
 
   DCHECK_IMPLIES(black_allocation_ == BlackAllocation::kAlwaysEnabled,
                  space_heap()->marking_state()->IsMarked(obj));
@@ -91,6 +89,19 @@ bool MainAllocator::TryFreeLast(Address object_address, int object_size) {
                                                     object_size);
   }
   return false;
+}
+
+// static
+int MainAllocator::GetFillToAlign(Address address,
+                                  AllocationAlignment alignment) {
+  if (V8_COMPRESS_POINTERS_8GB_BOOL) return 0;
+  if (alignment == kDoubleAligned && (address & kDoubleAlignmentMask) != 0) {
+    return kTaggedSize;
+  }
+  if (alignment == kDoubleUnaligned && (address & kDoubleAlignmentMask) == 0) {
+    return kDoubleSize - kTaggedSize;
+  }
+  return 0;
 }
 
 }  // namespace internal

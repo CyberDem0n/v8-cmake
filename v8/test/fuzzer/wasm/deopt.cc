@@ -13,16 +13,15 @@
 #include "src/wasm/fuzzing/random-module-generation.h"
 #include "src/wasm/module-compiler.h"
 #include "src/wasm/wasm-engine.h"
-#include "src/wasm/wasm-feature-flags.h"
 #include "src/wasm/wasm-module.h"
 #include "src/wasm/wasm-objects-inl.h"
 #include "src/wasm/wasm-subtyping.h"
 #include "src/zone/accounting-allocator.h"
 #include "src/zone/zone.h"
 #include "test/common/flag-utils.h"
+#include "test/common/wasm/fuzzer-common.h"
 #include "test/common/wasm/wasm-module-runner.h"
 #include "test/fuzzer/fuzzer-support.h"
-#include "test/fuzzer/wasm/fuzzer-common.h"
 
 // This fuzzer fuzzes deopts.
 // It generates a main function accepting a call target. The call target is then
@@ -135,15 +134,18 @@ std::vector<ExecutionResult> PerformReferenceRun(
   // with the kForDebugging liftoff option.
   EnterDebuggingScope debugging_scope(isolate);
 
-  DirectHandle<WasmModuleObject> module_object =
-      CompileReferenceModule(isolate, wire_bytes.module_bytes(), &max_steps);
+  DirectHandle<WasmModuleObject> module_object;
+  if (!CompileReferenceModule(isolate, wire_bytes.module_bytes(), &max_steps)
+           .ToHandle(&module_object)) {
+    return {};
+  }
 
   thrower.Reset();
   CHECK(!isolate->has_exception());
 
   DirectHandle<WasmInstanceObject> instance;
   if (!GetWasmEngine()
-           ->SyncInstantiate(isolate, &thrower, module_object, {}, {})
+           ->SyncInstantiate(isolate, &thrower, module_object, {})
            .ToHandle(&instance)) {
     CHECK(thrower.error());
     // The only reason to fail the second instantiation should be OOM. This can
@@ -209,7 +211,8 @@ void ConfigureFlags(v8::Isolate* isolate) {
       // background jobs finishing at random times.
       v8_flags.wasm_sync_tier_up = true;
       // Enable the experimental features we want to fuzz. (Note that
-      // EnableExperimentalWasmFeatures only enables staged features.)
+      // EnableExperimentalWasmFeatures only enables pre-staged and staged
+      // features.)
       v8_flags.wasm_deopt = true;
       v8_flags.wasm_inlining_call_indirect = true;
       // Make inlining more aggressive.
@@ -252,7 +255,7 @@ int FuzzIt(base::Vector<const uint8_t> data) {
   // Clear recursive groups: The fuzzer creates random types in every run. These
   // are saved as recursive groups as part of the type canonicalizer, but types
   // from previous runs just waste memory.
-  ResetTypeCanonicalizer(isolate, &zone);
+  ResetTypeCanonicalizer(isolate);
 
   std::vector<std::string> callees;
   std::vector<std::string> inlinees;
@@ -260,7 +263,6 @@ int FuzzIt(base::Vector<const uint8_t> data) {
       GenerateWasmModuleForDeopt(&zone, data, callees, inlinees);
   ModuleWireBytes wire_bytes(buffer.begin(), buffer.end());
 
-  testing::SetupIsolateForWasmModule(i_isolate);
   auto enabled_features = WasmEnabledFeatures::FromIsolate(i_isolate);
   bool valid = GetWasmEngine()->SyncValidate(
       i_isolate, enabled_features, CompileTimeImportsForFuzzing(), buffer);
@@ -272,6 +274,14 @@ int FuzzIt(base::Vector<const uint8_t> data) {
   // parameters and returns with all kinds of types.
   const bool optimize_main_function =
       inlinees.empty() || data.empty() || !(data.last() & 1);
+#if defined(DEBUG) && defined(V8_USE_ADDRESS_SANITIZER)
+  // Disable type assertions on slow builds (Debug + ASan) to avoid timeouts in
+  // TurboFan compilation (see crbug.com/520317061).
+  const bool assert_types = false;
+#else
+  const bool assert_types = !data.empty() && (data.last() & 2);
+#endif
+  FlagScope<bool> assert_types_scope(&v8_flags.wasm_assert_types, assert_types);
 
   if (v8_flags.wasm_fuzzer_gen_test) {
     StdoutStream os;
@@ -329,7 +339,7 @@ int FuzzIt(base::Vector<const uint8_t> data) {
   DirectHandle<WasmModuleObject> module_object = compiled.ToHandleChecked();
   DirectHandle<WasmInstanceObject> instance;
   if (!GetWasmEngine()
-           ->SyncInstantiate(i_isolate, &thrower, module_object, {}, {})
+           ->SyncInstantiate(i_isolate, &thrower, module_object, {})
            .ToHandle(&instance)) {
     DCHECK(thrower.error());
     // The only reason to fail the second instantiation should be OOM. This can
@@ -401,6 +411,17 @@ int FuzzIt(base::Vector<const uint8_t> data) {
 }
 
 }  // anonymous namespace
+
+V8_SYMBOL_USED extern "C" int LLVMFuzzerInitialize(int* argc, char*** argv) {
+  // shared_heap and shared_strings are needed for
+  // shared-everything-threads fuzzing.
+  i::v8_flags.shared_heap = true;
+  i::v8_flags.shared_strings = true;
+  i::v8_flags.wasm_shared = true;
+
+  v8_fuzzer::FuzzerSupport::InitializeFuzzerSupport(argc, argv);
+  return 0;
+}
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
   return FuzzIt({data, size});

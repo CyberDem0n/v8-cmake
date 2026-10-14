@@ -48,7 +48,7 @@ class DictionaryTest : public TestWithHeapInternalsAndContext {
 
     DirectHandle<JSObject> a = factory->NewJSArray(7);
     DirectHandle<JSObject> b = factory->NewJSArray(11);
-    table = HashMap::Put(table, a, b);
+    table = HashMap::Put(isolate(), table, a, b);
     CHECK_EQ(1, table->NumberOfElements());
     CHECK_EQ(table->Lookup(a), *b);
     // When the key does not exist in the map, Lookup returns the hole.
@@ -62,7 +62,7 @@ class DictionaryTest : public TestWithHeapInternalsAndContext {
     CHECK_EQ(table->Lookup(b), roots.the_hole_value());
 
     // Keys that are overwritten should not change number of elements.
-    table = HashMap::Put(table, a, factory->NewJSArray(13));
+    table = HashMap::Put(isolate(), table, a, factory->NewJSArray(13));
     CHECK_EQ(1, table->NumberOfElements());
     CHECK_NE(table->Lookup(a), *b);
 
@@ -78,7 +78,7 @@ class DictionaryTest : public TestWithHeapInternalsAndContext {
     for (int i = 0; i < 100; i++) {
       DirectHandle<JSReceiver> key = factory->NewJSArray(7);
       DirectHandle<JSObject> value = factory->NewJSArray(11);
-      table = HashMap::Put(table, key, value);
+      table = HashMap::Put(isolate(), table, key, value);
       CHECK_EQ(table->NumberOfElements(), i + 1);
       CHECK(table->FindEntry(isolate(), key).is_found());
       CHECK_EQ(table->Lookup(key), *value);
@@ -179,7 +179,7 @@ class DictionaryTest : public TestWithHeapInternalsAndContext {
     SimulateFullSpace(heap()->old_space());
 
     // Calling Contains() should not cause GC ever.
-    int gc_count = heap()->gc_count();
+    GCEpoch gc_count = heap()->gc_count();
     CHECK(!table->Contains(key));
     CHECK(gc_count == heap()->gc_count());
 
@@ -210,11 +210,11 @@ class DictionaryTest : public TestWithHeapInternalsAndContext {
     SimulateFullSpace(heap()->old_space());
 
     // Calling Lookup() should not cause GC ever.
-    CHECK(IsTheHole(table->Lookup(key), isolate()));
+    CHECK(IsTheHole(table->Lookup(key)));
 
     // Calling Put() should request GC by returning a failure.
-    int gc_count = heap()->gc_count();
-    HashMap::Put(table, key, key);
+    GCEpoch gc_count = heap()->gc_count();
+    HashMap::Put(isolate(), table, key, key);
     CHECK(gc_count == heap()->gc_count());
   }
 #endif
@@ -249,7 +249,7 @@ class ObjectHashTableTest {
 
   int capacity() { return table_->Capacity(); }
 
-  void Rehash(Isolate* isolate) { table_->Rehash(isolate); }
+  void Rehash() { table_->Rehash(); }
 
  private:
   Tagged<ObjectHashTable> table_;
@@ -264,7 +264,7 @@ TEST_F(DictionaryTest, HashTableRehash) {
     for (int i = 0; i < capacity - 1; i++) {
       t->insert(InternalIndex(i), i * i, i);
     }
-    t->Rehash(isolate());
+    t->Rehash();
     for (int i = 0; i < capacity - 1; i++) {
       CHECK_EQ(i, t->lookup(i * i, isolate()));
     }
@@ -277,7 +277,7 @@ TEST_F(DictionaryTest, HashTableRehash) {
     for (int i = 0; i < capacity / 2; i++) {
       t->insert(InternalIndex(i), i * i, i);
     }
-    t->Rehash(isolate());
+    t->Rehash();
     for (int i = 0; i < capacity / 2; i++) {
       CHECK_EQ(i, t->lookup(i * i, isolate()));
     }

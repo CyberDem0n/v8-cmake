@@ -7,6 +7,7 @@
 #include "src/codegen/code-factory.h"
 #include "src/logging/counters.h"
 #include "src/numbers/conversions.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/objects-inl.h"
 #ifdef V8_INTL_SUPPORT
 #include "src/objects/intl-objects.h"
@@ -39,7 +40,7 @@ BUILTIN(NumberPrototypeToExponential) {
 
   // Convert the {fraction_digits} to an integer first.
   double fraction_digits_number;
-  MAYBE_ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
       isolate, fraction_digits_number,
       Object::IntegerValue(isolate, fraction_digits));
 
@@ -55,7 +56,7 @@ BUILTIN(NumberPrototypeToExponential) {
                                isolate->factory()->NewStringFromAsciiChecked(
                                    "toExponential()")));
   }
-  int const f = IsUndefined(*args.atOrUndefined(isolate, 1), isolate)
+  int const f = IsUndefined(*args.atOrUndefined(isolate, 1))
                     ? -1
                     : static_cast<int>(fraction_digits_number);
   char chars[kDoubleToExponentialMaxChars];
@@ -87,7 +88,7 @@ BUILTIN(NumberPrototypeToFixed) {
 
   // Convert the {fraction_digits} to an integer first.
   double fraction_digits_number;
-  MAYBE_ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
       isolate, fraction_digits_number,
       Object::IntegerValue(isolate, fraction_digits));
 
@@ -167,14 +168,14 @@ BUILTIN(NumberPrototypeToPrecision) {
   double const value_number = Object::NumberValue(*value);
 
   // If no {precision} was specified, just return ToString of {value}.
-  if (IsUndefined(*precision, isolate)) {
+  if (IsUndefined(*precision)) {
     return *isolate->factory()->NumberToString(value);
   }
 
   // Convert the {precision} to an integer first.
   double precision_number;
-  MAYBE_ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
-      isolate, precision_number, Object::IntegerValue(isolate, precision));
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, precision_number,
+                                     Object::IntegerValue(isolate, precision));
 
   if (std::isnan(value_number)) return ReadOnlyRoots(isolate).NaN_string();
   if (std::isinf(value_number)) {

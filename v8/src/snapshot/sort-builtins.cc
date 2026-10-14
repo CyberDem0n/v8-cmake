@@ -93,8 +93,9 @@ Builtin BuiltinsSorter::FindBestPredecessorOf(Builtin callee) {
     }
 
     if (bestProb < kMinEdgeProbabilityThreshold ||
-        bestPred == Builtin::kNoBuiltinId)
+        bestPred == Builtin::kNoBuiltinId) {
       continue;
+    }
 
     Cluster* predCls = builtin_cluster_map_[bestPred];
     Cluster* succCls = builtin_cluster_map_[callee];
@@ -117,8 +118,9 @@ Builtin BuiltinsSorter::FindBestPredecessorOf(Builtin callee) {
     // Don't merge clusters if the new merged density is lower too many times
     // than current cluster, to avoid a huge dropping in cluster density, it
     // will harm locality of builtins.
-    if (predCls->density_ / kMaxDensityDecreaseThreshold > new_density)
+    if (predCls->density_ / kMaxDensityDecreaseThreshold > new_density) {
       continue;
+    }
   }
 
   return bestPred;
@@ -316,6 +318,23 @@ std::vector<Builtin> BuiltinsSorter::SortBuiltins(
     Cluster* cls = clusters_.at(i);
     for (size_t j = 0; j < cls->targets_.size(); j++) {
       Builtin builtin = cls->targets_[j];
+#if V8_ENABLE_GEARBOX
+      if (Builtins::IsGearboxPlaceholder(builtin)) {
+        // We insert ISX variants into builtin_order instead of the placeholder
+        // if we enable gearbox, which helps us bring best performance for ISX.
+        Builtin isx_variant =
+            Builtins::GetISXVariantFromGearboxPlaceholder(builtin);
+        CHECK(AddBuiltinIfNotProcessed(isx_variant, builtin_order,
+                                       processed_builtins));
+        continue;
+      } else if (Builtins::IsGenericVariant(builtin) ||
+                 Builtins::IsISXVariant(builtin)) {
+        // we didn't insert variants, because we already insert ISX when we
+        // iterate over the placeholder, and we will place Generic close to
+        // placeholder later.
+        continue;
+      }
+#endif  // V8_ENABLE_GEARBOX
       CHECK(
           AddBuiltinIfNotProcessed(builtin, builtin_order, processed_builtins));
     }

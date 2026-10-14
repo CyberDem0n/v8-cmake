@@ -48,7 +48,7 @@
 #endif
 
 #include "src/base/bits.h"
-#include "src/base/cpu.h"
+#include "src/base/cpu/cpu.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/codegen/macro-assembler.h"
 #include "src/deoptimizer/deoptimizer.h"
@@ -114,11 +114,10 @@ bool OSHasAVXSupport() {
 
 }  // namespace
 
-bool CpuFeatures::SupportsWasmSimd128() {
-#if V8_ENABLE_WEBASSEMBLY
+bool CpuFeatures::SupportsSimd128() {
+#if V8_ENABLE_SIMD128
   if (IsSupported(SSE4_1)) return true;
-  if (v8_flags.wasm_simd_ssse3_codegen && IsSupported(SSSE3)) return true;
-#endif  // V8_ENABLE_WEBASSEMBLY
+#endif  // V8_ENABLE_SIMD128
   return false;
 }
 
@@ -166,12 +165,13 @@ void CpuFeatures::ProbeImpl(bool cross_compile) {
   // This variable is only used for certain archs to query SupportWasmSimd128()
   // at runtime in builtins using an extern ref. Other callers should use
   // CpuFeatures::SupportWasmSimd128().
-  CpuFeatures::supports_wasm_simd_128_ = CpuFeatures::SupportsWasmSimd128();
+  CpuFeatures::supports_simd_128_ = CpuFeatures::SupportsSimd128();
 }
 
-void CpuFeatures::PrintTarget() {}
-void CpuFeatures::PrintFeatures() {
+void CpuFeatures::PrintInformation() {
+  CpuFeatures::Probe(false);
   printf(
+      "CPU features: "
       "SSE3=%d SSSE3=%d SSE4_1=%d AVX=%d AVX2=%d FMA3=%d BMI1=%d BMI2=%d "
       "LZCNT=%d "
       "POPCNT=%d ATOM=%d\n",
@@ -285,15 +285,9 @@ Register Operand::reg() const {
 
 bool operator!=(Operand op, XMMRegister r) { return !op.is_reg(r); }
 
-void Assembler::AllocateAndInstallRequestedHeapNumbers(LocalIsolate* isolate) {
-  DCHECK_IMPLIES(isolate == nullptr, heap_number_requests_.empty());
-  for (auto& request : heap_number_requests_) {
-    Handle<HeapObject> object =
-        isolate->factory()->NewHeapNumber<AllocationType::kOld>(
-            request.heap_number());
-    Address pc = reinterpret_cast<Address>(buffer_start_) + request.offset();
-    WriteUnalignedValue(pc, object);
-  }
+void Assembler::PatchInHeapNumberRequest(Address pc,
+                                         Handle<HeapNumber> object) {
+  WriteUnalignedValue(pc, object);
 }
 
 // -----------------------------------------------------------------------------
@@ -1629,8 +1623,8 @@ bool Assembler::is_optimizable_farjmp(int idx) {
   CHECK(jump_opt->is_optimizing());
 
   auto& dict = jump_opt->may_optimizable_farjmp;
-  if (dict.find(idx) != dict.end()) {
-    auto record_jmp_info = dict[idx];
+  if (auto it = dict.find(idx); it != dict.end()) {
+    auto record_jmp_info = it->second;
 
     int record_pos = record_jmp_info.pos;
 
@@ -3316,13 +3310,7 @@ void Assembler::GrowBuffer() {
 
   // Compute new buffer size.
   int old_size = buffer_->size();
-  int new_size = 2 * old_size;
-
-  // Some internal data structures overflow for very large buffers,
-  // they must ensure that kMaximalBufferSize is not too large.
-  if (new_size > kMaximalBufferSize) {
-    V8::FatalProcessOutOfMemory(nullptr, "Assembler::GrowBuffer");
-  }
+  int new_size = ComputeNewBufferSize(BufferGrowthStrategy::kDouble);
 
   // Set up new buffer.
   std::unique_ptr<AssemblerBuffer> new_buffer = buffer_->Grow(new_size);

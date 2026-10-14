@@ -2,18 +2,22 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+# LINT.IfChange
+
 import("//build/config/android/config.gni")
 import("//build/config/arm.gni")
+import("//build/config/c++/c++.gni")
+import("//build/config/clang/clang.gni")
 import("//build/config/coverage/coverage.gni")
 import("//build/config/dcheck_always_on.gni")
 import("//build/config/host_byteorder.gni")
 import("//build/config/mips.gni")
 import("//build/config/riscv.gni")
-import("//build/config/rust.gni")
 import("//build/config/sanitizers/sanitizers.gni")
 import("//build_overrides/build.gni")
 import("//third_party/icu/config.gni")
 
+import("gni/cluster_build.gni")
 import("gni/snapshot_toolchain.gni")
 import("gni/v8.gni")
 
@@ -21,8 +25,21 @@ if (is_clang) {
   import("//build/config/clang/clang.gni")
 }
 
+if (is_win && v8_use_metagen_instance_types) {
+  # For the SDK include flags, see `metagen_instance_types_h`.
+  import("//build/toolchain/win/win_toolchain_data.gni")
+}
+
+if (v8_enable_temporal_support) {
+  import("//build/config/rust.gni")
+}
+
 if (is_ios) {
   import("//build/config/apple/mobile_config.gni")  # For `target_platform`.
+}
+
+if (!build_with_v8_embedder && !(defined(build_with_node) && build_with_node)) {
+  import("//third_party/partition_alloc/partition_alloc.gni")
 }
 
 # For faster Windows builds. See https://crbug.com/v8/8475.
@@ -31,6 +48,16 @@ emit_builtins_as_inline_asm = is_win && is_clang
 declare_args() {
   # Print to stdout on Android.
   v8_android_log_stdout = false
+
+  # Native libclang for the metagen instance-type harvest, for platforms
+  # that have no prebuilt llvm-libclang package (currently ppc64 and s390x).
+  # Both are absolute paths, and both must be set or both left empty.
+  #   v8_metagen_libclang_so:           the native libclang shared library.
+  #   v8_metagen_libclang_bindings_dir: the directory holding the matching
+  #                                     clang/cindex.py bindings (i.e. the
+  #                                     dir that contains the clang/ package).
+  v8_metagen_libclang_so = ""
+  v8_metagen_libclang_bindings_dir = ""
 
   # Dynamically set an additional dependency from v8/custom_deps.
   v8_custom_deps = ""
@@ -47,11 +74,25 @@ declare_args() {
   # Sets -DVERIFY_HEAP.
   v8_enable_verify_heap = ""
 
+  # Sets -DVERIFY_WRITE_BARRIERS.
+  v8_enable_verify_write_barriers = ""
+
   # Sets -DVERIFY_PREDICTABLE
   v8_enable_verify_predictable = false
 
+  # Enable DWARF line info for Torque files.
+  # TODO(olivf): Find out how this works on other platforms.
+  v8_enable_torque_dwarf = is_debug && is_linux
+
   # Enable compiler warnings when using V8_DEPRECATED apis.
   v8_deprecation_warnings = true
+
+  # Check that executing JavaScript inside API interrupt callbacks is
+  # disallowed.
+  # TODO(40067940): Ensure this does not break DevTools.
+  # TODO(node): Upstream issue https://github.com/nodejs/node/pull/65028
+  v8_disallow_js_in_api_interrupts_is_checked =
+      !(defined(build_with_node) && build_with_node)
 
   # Enable compiler warnings when using V8_DEPRECATE_SOON apis.
   v8_imminent_deprecation_warnings = true
@@ -65,6 +106,9 @@ declare_args() {
   # Sets -DENABLE_DISASSEMBLER.
   v8_enable_disassembler = ""
 
+  # Sets -DV8_ENABLE_REGEXP_DIAGNOSTICS.
+  v8_enable_regexp_diagnostics = ""
+
   # Sets the number of internal fields on promise objects.
   v8_promise_internal_field_count = 0
 
@@ -74,14 +118,17 @@ declare_args() {
   # Sets the number of internal fields on array buffer view objects.
   v8_array_buffer_view_internal_field_count = 0
 
-  # Sets -DENABLE_GDB_JIT_INTERFACE.
-  v8_enable_gdbjit = ""
-
   # Sets -DENABLE_VTUNE_JIT_INTERFACE.
   v8_enable_vtunejit = false
 
   # Sets -DENABLE_VTUNE_TRACEMARK.
   v8_enable_vtunetracemark = false
+
+  # Sets -DV8_ENABLE_APX_F.
+  v8_enable_apx_f = false
+
+  # Sets -DV8_ENABLE_AVX10_1.
+  v8_enable_avx10_1 = false
 
   # Sets -DENABLE_HUGEPAGE
   v8_enable_hugepage = false
@@ -114,7 +161,9 @@ declare_args() {
   v8_enable_slow_dchecks = false
 
   # Enable fast mksnapshot runs.
-  v8_enable_fast_mksnapshot = false
+  v8_enable_fast_mksnapshot =
+      build_with_chromium && (is_debug || dcheck_always_on) &&
+      !is_official_build
 
   # Enable using multiple threads to build builtins in mksnapshot.
   v8_enable_concurrent_mksnapshot = true
@@ -139,6 +188,9 @@ declare_args() {
   # Sets -DV8_ENABLE_DEBUG_CODE
   v8_enable_debug_code = ""
 
+  # Enable generated code verifier.
+  v8_enable_generated_code_validator = ""
+
   # Enable native counters from the snapshot (impacts performance, sets
   # -DV8_SNAPSHOT_NATIVE_CODE_COUNTERS).
   # This option will generate extra code in the snapshot to increment counters,
@@ -157,6 +209,9 @@ declare_args() {
 
   # Sets -DOBJECT_PRINT.
   v8_enable_object_print = ""
+
+  # Sets -DALWAYS_MAGLEV_GRAPH_LABELLER.
+  v8_always_enable_maglev_graph_labeller = ""
 
   # Sets -DV8_TRACE_MAPS.
   v8_enable_trace_maps = ""
@@ -183,15 +238,6 @@ declare_args() {
   # default setting code below.
   v8_enable_concurrent_marking = true
 
-  # Sets -DV8_IGNITION_DISPATCH_COUNTING.
-  # Enables counting frequencies of bytecode dispatches. After building in this
-  # configuration, subsequent runs of d8 can output frequencies for each pair
-  # of (current, next) bytecode instructions executed if you specify
-  # --trace-ignition-dispatches-output-file, or can generate a JS object with
-  # those frequencies if you run with --expose-ignition-statistics and call the
-  # extension function getIgnitionDispatchCounters().
-  v8_enable_ignition_dispatch_counting = false
-
   # Enable frame elision for builtins.
   v8_enable_builtins_frame_elision = true
 
@@ -210,6 +256,11 @@ declare_args() {
   # execution counts (as opposed to branch hints), which are embedded into
   # the `--trace-turbo` .json file from `mksnapshot`.
   v8_log_builtins_block_count_input = ""
+
+  # This build flag is used to enable block positioning in profile-guided
+  # optimization of builtins based on raw execution counts (as opposed to
+  # branch hints).
+  v8_enable_builtins_block_position = true
 
   # This build flag is used to control whether reorder builtins according to
   # the call graph with C3 algorithm based builtin PGO profiling.
@@ -234,8 +285,17 @@ declare_args() {
   #    in step 3 or 4.
   v8_builtins_profiling_log_file = "default"
 
+  # Enable gearbox (instruction set extension) for builtins, the gearbox
+  # feature only supports x64 arch yet.
+  # Sets -DV8_BUILTINS_GEARBOX
+  v8_enable_builtins_gearbox = false
+
   # Enables various testing features.
   v8_enable_test_features = ""
+
+  # Enables testing-only synchronization points via the
+  # `SYNCHRONIZATION_POINT_TEST_ONLY` macro.
+  v8_enable_test_only_sync_points = ""
 
   # Enable short builtins call instruction sequences by un-embedding builtins.
   # Sets -DV8_SHORT_BUILTIN_CALLS
@@ -269,9 +329,11 @@ declare_args() {
   # Controls the threshold for on-heap/off-heap Typed Arrays.
   v8_typed_array_max_size_in_heap = 64
 
-  v8_enable_gdbjit = ((v8_current_cpu == "x86" || v8_current_cpu == "x64") &&
-                      (is_linux || is_chromeos || is_mac)) ||
-                     (v8_current_cpu == "ppc64" && (is_linux || is_chromeos))
+  # Sets -DENABLE_GDB_JIT_INTERFACE.
+  v8_enable_gdbjit =
+      is_debug && (((v8_current_cpu == "x86" || v8_current_cpu == "x64") &&
+                    (is_linux || is_chromeos || is_mac)) ||
+                   (v8_current_cpu == "ppc64" && (is_linux || is_chromeos)))
 
   # Check that each header can be included in isolation (requires also
   # setting the "check_v8_header_includes" gclient variable to run a
@@ -334,10 +396,6 @@ declare_args() {
   # Enable allocations during prefinalizer invocations.
   cppgc_allow_allocations_in_prefinalizers = false
 
-  # Enable V8 zone compression experimental feature.
-  # Sets -DV8_COMPRESS_ZONES.
-  v8_enable_zone_compression = ""
-
   # Enable the V8 sandbox.
   # Sets -DV8_ENABLE_SANDBOX.
   v8_enable_sandbox = ""
@@ -345,9 +403,6 @@ declare_args() {
   # Enable experimental hardware support for the V8 sandbox if available.
   # Sets -DV8_ENABLE_SANDBOX_HARDWARE_SUPPORT
   v8_enable_sandbox_hardware_support = false
-
-  # Enable leaptiering
-  v8_enable_leaptiering = true
 
   # Enable the memory corruption API. Useful for testing the sandbox.
   # The memory corruption API is only exposed to JavaScript if sandbox testing
@@ -389,8 +444,8 @@ declare_args() {
   # The flag enables disabling the feature, to test this data's overhead.
   v8_enable_continuation_preserved_embedder_data = true
 
-  # Enable allocation folding globally (sets -DV8_ALLOCATION_FOLDING).
-  # When it's disabled, the --turbo-allocation-folding runtime flag will be ignored.
+  # Enable allocation folding globally (sets -DV8_ALLOCATION_FOLDING). When it's
+  # disabled, the --turbo-allocation-folding runtime flag will be ignored.
   v8_enable_allocation_folding = true
 
   # Enable runtime verification of heap snapshots produced for devtools.
@@ -404,32 +459,6 @@ declare_args() {
   # temporary object, if enabled it will be kept alive by the parent Script.
   # This is only used by nodejs.
   v8_scriptormodule_legacy_lifetime = false
-
-  # WebAssembly interpreter (DrumBrake)  build flag.
-  v8_enable_drumbrake = false
-
-  # Enable Wasm interpreter tracing.
-  v8_enable_drumbrake_tracing = false
-
-  # On non-Desktop platforms, enable explicit bounds checks in the Wasm
-  # interpreter, where the bounds checking is done in the instruction handler,
-  # not using an unhandled exception filter (which also doesn't work with
-  # Win-ASAN).
-  # Also enables explicit bounds checks on component builds in platforms other
-  # than Windows because of a problem with function name mangling for vectorcall
-  # ABI on ELF (The vectorcall calling convention requires a mangling that
-  # includes @@, but on ELF an @ indicates that the part after it is the version
-  # of the symbol, with @@ indicating the default symbol version to link against
-  # when none is specified by the caller and this causes linker errors). As a
-  # workaround, we need to disable the vectorcall calling convention for
-  # component builds on Linux and Mac, which means that we cannot use DrumBrake
-  # builtins for Load/Store instruction handlers, because of the different
-  # calling convention.
-  # Windows component builds are also enabled to support cross-compilation.
-  v8_drumbrake_bounds_checks =
-      (is_win && (is_asan || is_ubsan || is_msan || is_tsan)) ||
-      !(is_win || is_linux || is_mac) || v8_current_cpu != "x64" || !is_clang ||
-      is_component_build
 
   # Enables pointer compression for 8GB heaps.
   # Sets -DV8_COMPRESS_POINTERS_8GB.
@@ -470,9 +499,6 @@ declare_args() {
   # ReadOnlySpace.
   v8_enable_extensible_ro_snapshot = true
 
-  # Enable Turboshaft CSA pipeline.
-  v8_enable_turboshaft_csa = false
-
   # Black allocate objects on separate pages.
   v8_enable_black_allocated_pages = ""
 
@@ -482,8 +508,11 @@ declare_args() {
   # Use the experimental TSA-based definition for some builtins.
   v8_enable_experimental_tsa_builtins = false
 
-  # Use the experimental encoding of undefined in double values.
-  v8_enable_experimental_undefined_double = false
+  # Use the experimental TSA backend for Torque.
+  v8_enable_experimental_tq_to_tsa = false
+
+  # Use the encoding of undefined in double values.
+  v8_enable_undefined_double = true
 
   v8_dcheck_always_on = dcheck_always_on
 
@@ -493,66 +522,101 @@ declare_args() {
   # the explicit dependency and allows the build to complete.
   v8_depend_on_icu_data_file = icu_use_data_file
 
-  # Some fuzzers depend on fuzzing functionality linked into the v8 library.
-  # For binary size reasons this functionality is not always available.
-  v8_wasm_random_fuzzers = ""
-
   # Experimental testing mode where various limits are artificially set lower.
   v8_lower_limits_mode = false
 
-  # Enables the use of partition_alloc as the default allocator for standalone
-  # V8. This should be used for benchmarking and testing purposes to more
+  # Enables the use of PartitionAlloc as the default allocator for standalone
+  # d8. This should be used for benchmarking and testing purposes to more
   # closely mimic in-browser behavior.
   #
-  # Currently used in d8.
-  # TODO(399144247,400141120,392817524): Temporarily disabled again because of
-  # performance regressions in multi-threaded, Zone-allocation heavy workloads,
-  # e.g., JetStream startup or Wasm eager compilation.
-  v8_enable_partition_alloc =
-      false && !build_with_v8_embedder &&
-      !(defined(build_with_node) && build_with_node) &&
-      (v8_target_cpu != "ppc64" && v8_target_cpu != "s390x")
+  # Note that this has no effect on V8 when it is embedded elsewhere
+  v8_enable_partition_alloc = ""
 
   # V8 uses Chrome's blink-gc clang plugin for checking V8's internal cppgc
   # usages. The plugin is not exhaustive but covers most common known pitfalls.
   use_cppgc_clang_plugin = true
 
-  # Deinterleaving load support.
-  v8_enable_wasm_deinterleaved_mem_ops = false
-
   # Expose F.p.caller and .arguments as own properties.
   v8_function_arguments_caller_are_own_props = false
+
+  # Use a hard-coded secret value when hashing.
+  v8_use_default_hasher_secret = true
+
+  # Enable seeded array index hash.
+  v8_enable_seeded_array_index_hash = false
+
+  # add instrumentation for Dumpling differential fuzzing
+  v8_dumpling = false
+
+  # Enable compilation of riscv32.
+  v8_riscv_enable_deprecated_riscv32 = false
+
+  # Sets the level of logging detail in V8_Fatal.
+  # 0: No file and line and message only if args are provided (for official
+  #    release builds).
+  # 1: Message but no file or line.
+  # 2: Everything (file, line, message).
+  v8_logging_level = ""
 }
 
+# The native-libclang args are a matched pair: a .so with no bindings (or
+# vice versa) is always a misconfiguration, so fail early rather than at the
+# metagen action. Both being empty is the normal, bundled-package case.
+assert(v8_metagen_libclang_so == "" == (v8_metagen_libclang_bindings_dir == ""),
+       "v8_metagen_libclang_so and v8_metagen_libclang_bindings_dir must be " +
+           "set together or left empty together.")
+
 # Derived defaults.
+if (v8_logging_level == "") {
+  if (v8_enable_verification_features || v8_dcheck_always_on) {
+    v8_logging_level = 2
+  } else if (is_official_build) {
+    v8_logging_level = 0
+  } else {
+    v8_logging_level = 1
+  }
+}
 if (cppgc_enable_verify_heap == "") {
-  cppgc_enable_verify_heap = v8_enable_debugging_features || v8_dcheck_always_on
+  cppgc_enable_verify_heap =
+      v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_verify_heap == "") {
-  v8_enable_verify_heap = v8_enable_debugging_features
+  v8_enable_verify_heap = v8_enable_verification_features
+}
+if (v8_enable_verify_write_barriers == "") {
+  v8_enable_verify_write_barriers =
+      (v8_enable_verification_features || v8_dcheck_always_on) &&
+      !v8_disable_write_barriers
 }
 if (v8_enable_object_print == "") {
   v8_enable_object_print = v8_enable_debugging_features
 }
-if (v8_enable_disassembler == "") {
-  v8_enable_disassembler = v8_enable_debugging_features
+if (v8_always_enable_maglev_graph_labeller == "") {
+  v8_always_enable_maglev_graph_labeller = v8_enable_debugging_features
 }
 if (v8_enable_trace_maps == "") {
   v8_enable_trace_maps = v8_enable_debugging_features
 }
+if (v8_enable_regexp_diagnostics == "") {
+  v8_enable_regexp_diagnostics = v8_enable_debugging_features
+}
 if (v8_enable_test_features == "") {
-  v8_enable_test_features = v8_enable_debugging_features || v8_dcheck_always_on
+  v8_enable_test_features =
+      v8_enable_verification_features || v8_dcheck_always_on
+}
+if (v8_enable_test_only_sync_points == "") {
+  v8_enable_test_only_sync_points = v8_enable_test_features
 }
 if (v8_enable_v8_checks == "") {
-  v8_enable_v8_checks = v8_enable_debugging_features
+  v8_enable_v8_checks = v8_enable_verification_features
 }
 if (v8_enable_memory_accounting_checks == "") {
   v8_enable_memory_accounting_checks =
-      v8_enable_debugging_features || v8_dcheck_always_on
+      v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_heap_snapshot_verify == "") {
   v8_enable_heap_snapshot_verify =
-      v8_enable_debugging_features || v8_dcheck_always_on
+      v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_snapshot_code_comments) {
   assert(v8_code_comments == true || v8_code_comments == "",
@@ -562,8 +626,9 @@ if (v8_enable_snapshot_code_comments) {
   v8_code_comments = v8_enable_debugging_features
 }
 if (v8_enable_debug_code == "") {
-  v8_enable_debug_code = v8_enable_debugging_features || v8_dcheck_always_on
+  v8_enable_debug_code = v8_enable_verification_features || v8_dcheck_always_on
 }
+
 if (v8_enable_snapshot_native_code_counters == "") {
   v8_enable_snapshot_native_code_counters = v8_enable_debugging_features
 }
@@ -610,9 +675,6 @@ if (v8_enable_fast_torque == "") {
 if (v8_enable_concurrent_mksnapshot == "") {
   v8_enable_concurrent_mksnapshot = v8_enable_fast_mksnapshot
 }
-if (v8_enable_zone_compression == "") {
-  v8_enable_zone_compression = false
-}
 if (v8_enable_short_builtin_calls == "") {
   v8_enable_short_builtin_calls =
       v8_current_cpu == "x64" || v8_current_cpu == "arm64" ||
@@ -623,23 +685,44 @@ if (v8_enable_external_code_space == "") {
       v8_enable_pointer_compression &&
       v8_enable_pointer_compression_shared_cage &&
       (v8_current_cpu == "x64" || v8_current_cpu == "arm64" ||
-       v8_current_cpu == "loong64")
+       v8_current_cpu == "loong64" || v8_current_cpu == "riscv64")
 }
 if (v8_enable_sparkplug == "") {
   v8_enable_sparkplug = !v8_jitless
 }
+v8_enable_sparkplug_plus = v8_enable_sparkplug && (v8_current_cpu == "x64" ||
+                                                   v8_current_cpu == "arm64" ||
+                                                   v8_current_cpu == "loong64")
 if (v8_enable_maglev == "") {
-  v8_enable_maglev = v8_enable_turbofan &&
-                     (v8_current_cpu == "arm" || v8_current_cpu == "x64" ||
-                      v8_current_cpu == "arm64" || v8_current_cpu == "s390x" ||
-                      v8_current_cpu == "riscv64")
+  v8_enable_maglev =
+      v8_enable_turbofan &&
+      (v8_current_cpu == "arm" || v8_current_cpu == "x64" ||
+       v8_current_cpu == "arm64" || v8_current_cpu == "s390x" ||
+       v8_current_cpu == "ppc64" || v8_current_cpu == "riscv64" ||
+       v8_current_cpu == "loong64")
 }
 assert(v8_enable_turbofan || !v8_enable_maglev,
        "Maglev is not available when Turbofan is disabled.")
 
-assert(!v8_jitless || (!v8_enable_sparkplug && !v8_enable_maglev &&
-                           !v8_enable_turbofan && !v8_enable_webassembly),
-       "Sparkplug, Maglev, Turbofan and Wasm are not available in jitless mode")
+if (v8_enable_partition_alloc == "") {
+  v8_enable_partition_alloc =
+      !build_with_v8_embedder &&
+      !(defined(build_with_node) && build_with_node) &&
+      (v8_target_cpu != "ppc64" && v8_target_cpu != "s390x") &&
+      v8_enable_pointer_compression_shared_cage
+}
+
+assert(!v8_enable_partition_alloc || v8_enable_pointer_compression_shared_cage,
+       "partition_alloc is not available for multi-cage mode.")
+
+is_wasm_interpreter_mode_enabled =
+    !v8_enable_sparkplug && !v8_enable_maglev && !v8_enable_turbofan &&
+    v8_enable_webassembly && v8_enable_drumbrake
+assert(
+    !v8_jitless || (!v8_enable_sparkplug && !v8_enable_maglev &&
+                        !v8_enable_turbofan && !v8_enable_webassembly) ||
+        is_wasm_interpreter_mode_enabled,
+    "Sparkplug, Maglev, Turbofan and Wasm are not available in jitless mode. But, if the Wasm interpreter mode is on, Wasm can work in jitless mode")
 
 if (v8_enable_single_generation == "") {
   v8_enable_single_generation = v8_disable_write_barriers
@@ -661,9 +744,9 @@ assert(!v8_enable_trace_ignition || v8_enable_trace_unoptimized,
 assert(!v8_enable_trace_baseline_exec || v8_enable_trace_unoptimized,
        "Baseline tracing requires unoptimized tracing to be enabled.")
 assert(
-    v8_enable_debugging_features == true || v8_dcheck_always_on ||
+    v8_enable_verification_features == true || v8_dcheck_always_on ||
         !v8_enable_slow_dchecks,
-    "v8_enable_slow_dchecks requires v8_enable_debugging_features or dcheck_always_on.")
+    "v8_enable_slow_dchecks requires v8_enable_verification_features or dcheck_always_on.")
 
 if (v8_enable_short_builtin_calls &&
     (!v8_enable_pointer_compression && v8_current_cpu != "x64")) {
@@ -682,22 +765,31 @@ if (v8_enable_sandbox == "") {
                       v8_enable_external_code_space && target_os != "fuchsia"
 }
 
+if (v8_enable_generated_code_validator == "") {
+  v8_enable_generated_code_validator =
+      v8_enable_verification_features && v8_enable_sandbox &&
+      (v8_current_cpu == "x64" || v8_current_cpu == "arm64")
+}
+assert(!v8_enable_generated_code_validator || v8_current_cpu == "x64" ||
+           v8_current_cpu == "arm64",
+       "Generated code validator is only supported on x64 and arm64")
+assert(!v8_enable_generated_code_validator || v8_enable_sandbox,
+       "Generated code validator is only supported on sandbox builds")
+
+if (v8_enable_disassembler == "") {
+  v8_enable_disassembler =
+      v8_enable_debugging_features || v8_enable_generated_code_validator
+}
+
 if (v8_enable_static_roots == "") {
   # Static roots are only valid for builds with pointer compression and a
   # shared read-only heap.
-  # TODO(olivf, v8:13466) Some configurations could be supported if we
-  # introduce different static root files for different build configurations:
-  # Non-wasm and non-i18n builds have fewer read only roots. Configurations
-  # without external code space allocate read only roots at a further
-  # location relative to the cage base.
   v8_enable_static_roots =
-      v8_enable_pointer_compression && v8_enable_external_code_space &&
-      v8_enable_webassembly && v8_enable_i18n_support
+      v8_enable_pointer_compression && v8_enable_external_code_space
 }
 
 assert(!v8_enable_static_roots ||
-           (v8_enable_pointer_compression && v8_enable_external_code_space &&
-                v8_enable_webassembly && v8_enable_i18n_support),
+           (v8_enable_pointer_compression && v8_enable_external_code_space),
        "Trying to enable static roots in a configuration that is not supported")
 
 assert(
@@ -755,8 +847,15 @@ if (v8_enable_webassembly && v8_current_cpu == "arm64") {
   v8_enable_wasm_deinterleaved_mem_ops = true
 }
 
+if (v8_enable_experimental_tq_to_tsa) {
+  v8_enable_experimental_tsa_builtins = true
+}
+
 assert(!v8_disable_write_barriers || v8_enable_single_generation,
        "Disabling write barriers works only with single generation")
+
+assert(!v8_enable_verify_write_barriers || !v8_disable_write_barriers,
+       "Write barriers need to be enabled for verification")
 
 assert(v8_current_cpu == "arm64" || !v8_control_flow_integrity,
        "Control-flow integrity is only supported on arm64")
@@ -776,12 +875,15 @@ assert(!v8_enable_pointer_compression_8gb || v8_enable_pointer_compression,
 assert(!v8_enable_sandbox || v8_enable_external_code_space,
        "The sandbox requires the external code space")
 
-assert(
-    v8_enable_leaptiering,
-    "non-leaptiering is deprecated (see https://groups.google.com/g/v8-dev/c/PYk2_GGP2Wk)")
+assert(!v8_enable_sandbox || use_safe_libcxx,
+       "The sandbox requires libc++ hardening")
 
 assert(!v8_enable_memory_corruption_api || v8_enable_sandbox,
        "The Memory Corruption API requires the sandbox")
+
+assert(
+    !v8_enable_memory_corruption_api || !is_lsan,
+    "The Memory Corruption API cannot be enabled together with LSan as both attach to the d8 process via ptrace")
 
 assert(!v8_enable_sandbox_hardware_support || v8_enable_sandbox,
        "The sandbox must be enabled to enable sandbox hardware support")
@@ -836,14 +938,6 @@ if (v8_expose_public_symbols == "") {
   v8_expose_public_symbols = v8_expose_symbols
 }
 
-# Some fuzzers depend on fuzzing functionality linked into the v8 library.
-# For binary size reasons this functionality is not available for official
-# builds, therefore these fuzzers do not function there and should be skipped
-# instead.
-if (v8_wasm_random_fuzzers == "") {
-  v8_wasm_random_fuzzers = !is_official_build
-}
-
 assert(
     !build_with_chromium || !v8_enable_partition_alloc,
     "V8 using partition_alloc from Chromium is not implemented at the moment")
@@ -851,7 +945,7 @@ assert(
 v8_random_seed = "314159265"
 v8_toolset_for_shell = "host"
 
-is_DEBUG_defined = v8_enable_debugging_features || v8_dcheck_always_on
+is_DEBUG_defined = v8_enable_verification_features || v8_dcheck_always_on
 
 ###############################################################################
 # Configurations
@@ -992,6 +1086,7 @@ external_v8_defines = [
   "V8_ARRAY_BUFFER_INTERNAL_FIELD_COUNT=${v8_array_buffer_internal_field_count}",
   "V8_ARRAY_BUFFER_VIEW_INTERNAL_FIELD_COUNT=${v8_array_buffer_view_internal_field_count}",
   "V8_PROMISE_INTERNAL_FIELD_COUNT=${v8_promise_internal_field_count}",
+  "V8_USE_DEFAULT_HASHER_SECRET=${v8_use_default_hasher_secret}",
   "V8_ENABLE_CHECKS",
   "V8_ENABLE_MEMORY_ACCOUNTING_CHECKS",
   "V8_COMPRESS_POINTERS",
@@ -1000,8 +1095,11 @@ external_v8_defines = [
   "V8_COMPRESS_ZONES",
   "V8_ENABLE_SANDBOX",
   "V8_DEPRECATION_WARNINGS",
+  "V8_DISALLOW_JS_IN_API_INTERRUPTS_IS_CHECKED",
   "V8_IMMINENT_DEPRECATION_WARNINGS",
   "V8_USE_PERFETTO",
+  "V8_USE_PERFETTO_JSON_EXPORT",
+  "V8_USE_PERFETTO_SDK",
   "V8_MAP_PACKING",
   "V8_IS_TSAN",
   "V8_ENABLE_DIRECT_HANDLE",
@@ -1014,12 +1112,17 @@ external_v8_defines = [
   "V8_TARGET_OS_MACOS",
   "V8_TARGET_OS_WIN",
   "V8_TARGET_OS_CHROMEOS",
+  "V8_TARGET_ARCH_ARM64",
+  "V8_TARGET_ARCH_PPC64",
+  "V8_TARGET_ARCH_MIPS64",
+  "V8_TARGET_ARCH_LOONG64",
 ]
 
 enabled_external_v8_defines = [
   "V8_ARRAY_BUFFER_INTERNAL_FIELD_COUNT=${v8_array_buffer_internal_field_count}",
   "V8_ARRAY_BUFFER_VIEW_INTERNAL_FIELD_COUNT=${v8_array_buffer_view_internal_field_count}",
   "V8_PROMISE_INTERNAL_FIELD_COUNT=${v8_promise_internal_field_count}",
+  "V8_USE_DEFAULT_HASHER_SECRET=${v8_use_default_hasher_secret}",
 ]
 
 if (v8_enable_v8_checks) {
@@ -1037,14 +1140,15 @@ if (v8_enable_pointer_compression) {
 if (v8_enable_pointer_compression || v8_enable_31bit_smis_on_64bit_arch) {
   enabled_external_v8_defines += [ "V8_31BIT_SMIS_ON_64BIT_ARCH" ]
 }
-if (v8_enable_zone_compression) {
-  enabled_external_v8_defines += [ "V8_COMPRESS_ZONES" ]
-}
 if (v8_enable_sandbox) {
   enabled_external_v8_defines += [ "V8_ENABLE_SANDBOX" ]
 }
 if (v8_deprecation_warnings) {
   enabled_external_v8_defines += [ "V8_DEPRECATION_WARNINGS" ]
+}
+if (v8_disallow_js_in_api_interrupts_is_checked) {
+  enabled_external_v8_defines +=
+      [ "V8_DISALLOW_JS_IN_API_INTERRUPTS_IS_CHECKED" ]
 }
 if (v8_imminent_deprecation_warnings) {
   enabled_external_v8_defines += [ "V8_IMMINENT_DEPRECATION_WARNINGS" ]
@@ -1052,6 +1156,13 @@ if (v8_imminent_deprecation_warnings) {
 if (v8_use_perfetto) {
   enabled_external_v8_defines += [ "V8_USE_PERFETTO" ]
 }
+if (v8_use_perfetto_json_export) {
+  enabled_external_v8_defines += [ "V8_USE_PERFETTO_JSON_EXPORT" ]
+}
+if (v8_use_perfetto_sdk) {
+  enabled_external_v8_defines += [ "V8_USE_PERFETTO_SDK" ]
+}
+
 if (v8_enable_map_packing) {
   enabled_external_v8_defines += [ "V8_MAP_PACKING" ]
 }
@@ -1092,6 +1203,22 @@ if (target_os == "android") {
   enabled_external_v8_defines += [ "V8_TARGET_OS_CHROMEOS" ]
 }
 
+# Some V8_TARGET_ARCH_ defines that affect Api constants (see usages of
+# V8_TARGET_ARCH_* in v8-internal.h).
+# The target architecture may differ from host one e.g. in mksnapshot or in
+# msan builds.
+# TODO(ishell): support all target archs and add V8_HAVE_TARGET_ARCH similar
+# to V8_TARGET_OS_* and V8_HAVE_TARGET_OS defines.
+if (v8_current_cpu == "arm64") {
+  enabled_external_v8_defines += [ "V8_TARGET_ARCH_ARM64" ]
+} else if (v8_current_cpu == "ppc64") {
+  enabled_external_v8_defines += [ "V8_TARGET_ARCH_PPC64" ]
+} else if (v8_current_cpu == "mips64el") {
+  enabled_external_v8_defines += [ "V8_TARGET_ARCH_MIPS64" ]
+} else if (v8_current_cpu == "loong64") {
+  enabled_external_v8_defines += [ "V8_TARGET_ARCH_LOONG64" ]
+}
+
 disabled_external_v8_defines = external_v8_defines - enabled_external_v8_defines
 
 # Put defines that are used in public headers here; public headers are
@@ -1112,6 +1239,7 @@ external_cppgc_defines = [
   "CPPGC_CAGED_HEAP",
   "CPPGC_ENABLE_API_CHECKS",
   "CPPGC_ENABLE_LARGER_CAGE",
+  "CPPGC_ENABLE_OBJECT_SECTION_GCINFO",
   "CPPGC_ENABLE_SLOW_API_CHECKS",
   "CPPGC_POINTER_COMPRESSION",
   "CPPGC_SLIM_WRITE_BARRIER",
@@ -1151,6 +1279,9 @@ if (cppgc_enable_pointer_compression) {
 if (cppgc_enable_larger_cage) {
   enabled_external_cppgc_defines += [ "CPPGC_ENABLE_LARGER_CAGE" ]
 }
+if (cppgc_enable_object_section_gcinfo) {
+  enabled_external_cppgc_defines += [ "CPPGC_ENABLE_OBJECT_SECTION_GCINFO" ]
+}
 if (cppgc_enable_slim_write_barrier) {
   enabled_external_cppgc_defines += [ "CPPGC_SLIM_WRITE_BARRIER" ]
 }
@@ -1179,8 +1310,17 @@ config("features") {
   # Only targets in this file and its subdirs can depend on this.
   visibility = [ "./*" ]
 
-  defines =
-      [ "V8_TYPED_ARRAY_MAX_SIZE_IN_HEAP=${v8_typed_array_max_size_in_heap}" ]
+  defines = [
+    "V8_TYPED_ARRAY_MAX_SIZE_IN_HEAP=${v8_typed_array_max_size_in_heap}",
+    "V8_LOGGING_LEVEL=${v8_logging_level}",
+  ]
+
+  # Selects metagen vs Torque instance-type output (see
+  # src/objects/instance-types-gen.h). The header defaults to metagen
+  # when this is undefined, so only the off case needs a define.
+  if (!v8_use_metagen_instance_types) {
+    defines += [ "V8_USE_METAGEN_INSTANCE_TYPES=0" ]
+  }
 
   configs = [
     ":v8_header_features",
@@ -1199,9 +1339,14 @@ config("features") {
     defines += [ "V8_TLS_USED_IN_LIBRARY" ]
   }
 
-  if (v8_enable_pointer_compression &&
-      !v8_enable_pointer_compression_shared_cage) {
-    defines += [ "V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES" ]
+  if (v8_enable_pointer_compression) {
+    defines += [
+      "V8_CONTIGUOUS_COMPRESSED_RO_SPACE",
+      "V8_CONTIGUOUS_COMPRESSED_RO_SPACE_SIZE_MB=${v8_contiguous_compressed_ro_space_size_mb}",
+    ]
+    if (!v8_enable_pointer_compression_shared_cage) {
+      defines += [ "V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES" ]
+    }
   }
 
   if (v8_embedder_string != "") {
@@ -1213,11 +1358,20 @@ config("features") {
   if (v8_log_builtins_block_count_input != "") {
     defines += [ "LOG_BUILTIN_BLOCK_COUNT" ]
   }
+  if (v8_enable_builtins_block_position) {
+    defines += [ "BUILTIN_BLOCK_POSITION" ]
+  }
   if (v8_enable_future) {
     defines += [ "V8_ENABLE_FUTURE" ]
   }
   if (v8_enable_lite_mode) {
     defines += [ "V8_LITE_MODE" ]
+  }
+  if (v8_use_host_cpu_arm_features) {
+    defines += [ "V8_USE_HOST_CPU_ARM_FEATURES" ]
+  }
+  if (v8_enable_seeded_array_index_hash) {
+    defines += [ "V8_ENABLE_SEEDED_ARRAY_INDEX_HASH" ]
   }
   if (v8_enable_gdbjit) {
     defines += [ "ENABLE_GDB_JIT_INTERFACE" ]
@@ -1228,6 +1382,12 @@ config("features") {
   if (v8_enable_vtunetracemark) {
     defines += [ "ENABLE_VTUNE_TRACEMARK" ]
   }
+  if (v8_enable_apx_f) {
+    defines += [ "V8_ENABLE_APX_F" ]
+  }
+  if (v8_enable_avx10_1) {
+    defines += [ "V8_ENABLE_AVX10_1" ]
+  }
   if (v8_enable_hugepage) {
     defines += [ "ENABLE_HUGEPAGE" ]
   }
@@ -1237,8 +1397,14 @@ config("features") {
   if (v8_enable_object_print) {
     defines += [ "OBJECT_PRINT" ]
   }
+  if (v8_always_enable_maglev_graph_labeller) {
+    defines += [ "ALWAYS_MAGLEV_GRAPH_LABELLER" ]
+  }
   if (v8_enable_verify_heap) {
     defines += [ "VERIFY_HEAP" ]
+  }
+  if (v8_enable_verify_write_barriers) {
+    defines += [ "V8_VERIFY_WRITE_BARRIERS" ]
   }
   if (v8_enable_verify_predictable) {
     defines += [ "VERIFY_PREDICTABLE" ]
@@ -1252,10 +1418,20 @@ config("features") {
   if (v8_enable_trace_feedback_updates) {
     defines += [ "V8_TRACE_FEEDBACK_UPDATES" ]
   }
+  if (v8_enable_regexp_diagnostics) {
+    defines += [ "V8_ENABLE_REGEXP_DIAGNOSTICS" ]
+  }
   if (v8_enable_test_features) {
     defines += [ "V8_ENABLE_ALLOCATION_TIMEOUT" ]
     defines += [ "V8_ENABLE_FORCE_SLOW_PATH" ]
     defines += [ "V8_ENABLE_DOUBLE_CONST_STORE_CHECK" ]
+
+    # Expose the runtime flag --hashes-collide for fuzzing purposes (to create
+    # hash collisions all the time).
+    defines += [ "V8_HASHES_COLLIDE" ]
+  }
+  if (v8_enable_test_only_sync_points) {
+    defines += [ "V8_ENABLE_TEST_ONLY_SYNC_POINTS" ]
   }
   if (v8_enable_i18n_support) {
     defines += [ "V8_INTL_SUPPORT" ]
@@ -1274,7 +1450,7 @@ config("features") {
   }
   if (v8_enable_debug_code) {
     defines += [ "V8_ENABLE_DEBUG_CODE" ]
-    if (v8_enable_debugging_features) {
+    if (v8_enable_verification_features) {
       defines += [ "V8_ENABLE_SLOW_DEBUG_CODE_BY_DEFAULT" ]
     }
   }
@@ -1295,9 +1471,6 @@ config("features") {
   }
   if (v8_enable_atomic_object_field_writes) {
     defines += [ "V8_ATOMIC_OBJECT_FIELD_WRITES" ]
-  }
-  if (v8_enable_ignition_dispatch_counting) {
-    defines += [ "V8_IGNITION_DISPATCH_COUNTING" ]
   }
   if (v8_enable_lazy_source_positions) {
     defines += [ "V8_ENABLE_LAZY_SOURCE_POSITIONS" ]
@@ -1335,8 +1508,32 @@ config("features") {
   if (v8_fuzzilli) {
     defines += [ "V8_FUZZILLI" ]
   }
+  if (v8_enable_builtins_profiling) {
+    defines += [ "V8_ENABLE_BUILTINS_PROFILING" ]
+  }
+  if (use_chromium_fuzzilli) {
+    defines += [ "USE_CHROMIUM_FUZZILLI" ]
+  }
+  if (v8_dumpling) {
+    defines += [ "V8_DUMPLING" ]
+  }
+  if (v8_riscv_enable_deprecated_riscv32) {
+    defines += [ "V8_RISCV_ENABLE_DEPRECATED_RISCV32" ]
+  }
   if (v8_enable_fuzztest) {
     defines += [ "V8_ENABLE_FUZZTEST" ]
+  }
+
+  # TODO(Wenqin): Gearbox didn't work when didn't enable pointer compression,
+  # it's related to the deserializer, when pointer compression is disable, it
+  # will not call PostProcessCode method, which is the bottleneck for Gearbox
+  # try to fix it later.
+  if (v8_enable_pointer_compression && v8_enable_builtins_gearbox &&
+      v8_current_cpu == "x64") {
+    defines += [ "V8_BUILTINS_GEARBOX" ]
+  }
+  if (v8_enable_builtins_optimization) {
+    defines += [ "V8_ENABLE_BUILTINS_OPTIMIZATION" ]
   }
   if (v8_enable_short_builtin_calls) {
     defines += [ "V8_SHORT_BUILTIN_CALLS" ]
@@ -1347,11 +1544,17 @@ config("features") {
   if (v8_enable_sparkplug) {
     defines += [ "V8_ENABLE_SPARKPLUG" ]
   }
+  if (v8_enable_sparkplug_plus) {
+    defines += [ "V8_ENABLE_SPARKPLUG_PLUS" ]
+  }
   if (v8_enable_maglev) {
     defines += [ "V8_ENABLE_MAGLEV" ]
   }
   if (v8_enable_turbofan) {
     defines += [ "V8_ENABLE_TURBOFAN" ]
+  }
+  if (v8_enable_generated_code_validator) {
+    defines += [ "V8_ENABLE_GENERATED_CODE_VALIDATOR" ]
   }
   if (v8_jitless) {
     defines += [ "V8_JITLESS" ]
@@ -1420,17 +1623,11 @@ config("features") {
   if (v8_use_zlib) {
     defines += [ "V8_USE_ZLIB" ]
   }
-  if (v8_use_libm_trig_functions) {
-    defines += [ "V8_USE_LIBM_TRIG_FUNCTIONS" ]
-  }
   if (v8_value_deserializer_hard_fail) {
     defines += [ "V8_VALUE_DESERIALIZER_HARD_FAIL" ]
   }
   if (v8_enable_wasm_simd256_revec) {
     defines += [ "V8_ENABLE_WASM_SIMD256_REVEC" ]
-  }
-  if (v8_enable_wasm_deinterleaved_mem_ops) {
-    defines += [ "V8_ENABLE_WASM_DEINTERLEAVED_MEM_OPS" ]
   }
   if (v8_enable_maglev_graph_printer) {
     defines += [ "V8_ENABLE_MAGLEV_GRAPH_PRINTER" ]
@@ -1456,11 +1653,14 @@ config("features") {
   if (v8_enable_experimental_tsa_builtins) {
     defines += [ "V8_ENABLE_EXPERIMENTAL_TSA_BUILTINS" ]
   }
-  if (v8_enable_experimental_undefined_double) {
-    defines += [ "V8_ENABLE_EXPERIMENTAL_UNDEFINED_DOUBLE" ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    defines += [ "V8_ENABLE_EXPERIMENTAL_TQ_TO_TSA" ]
   }
-  if (v8_enable_leaptiering) {
-    defines += [ "V8_ENABLE_LEAPTIERING" ]
+  if (v8_enable_undefined_double) {
+    defines += [ "V8_ENABLE_UNDEFINED_DOUBLE" ]
+  }
+  if (v8_enable_partition_alloc) {
+    defines += [ "V8_ENABLE_PARTITION_ALLOC" ]
   }
   if (v8_wasm_random_fuzzers) {
     defines += [ "V8_WASM_RANDOM_FUZZERS" ]
@@ -1474,6 +1674,12 @@ config("features") {
   if (v8_function_arguments_caller_are_own_props) {
     defines += [ "V8_FUNCTION_ARGUMENTS_CALLER_ARE_OWN_PROPS" ]
   }
+  if (!build_with_v8_embedder &&
+      !(defined(build_with_node) && build_with_node)) {
+    if (enable_user_space_zero_segment) {
+      defines += [ "PA_ENABLE_USER_SPACE_ZERO_SEGMENT" ]
+    }
+  }
 }
 
 config("toolchain") {
@@ -1485,24 +1691,16 @@ config("toolchain") {
   ldflags = []
 
   if (v8_current_cpu == "arm") {
-    defines += [ "V8_TARGET_ARCH_ARM" ]
-    if (arm_version >= 7) {
-      defines += [ "CAN_USE_ARMV7_INSTRUCTIONS" ]
-    }
-    if (arm_fpu == "vfpv3-d16") {
-      defines += [ "CAN_USE_VFP3_INSTRUCTIONS" ]
-    } else if (arm_fpu == "vfpv3") {
-      defines += [
-        "CAN_USE_VFP3_INSTRUCTIONS",
-        "CAN_USE_VFP32DREGS",
-      ]
-    } else if (arm_fpu == "neon") {
-      defines += [
-        "CAN_USE_VFP3_INSTRUCTIONS",
-        "CAN_USE_VFP32DREGS",
-        "CAN_USE_NEON",
-      ]
-    }
+    defines += [
+      "V8_TARGET_ARCH_ARM",
+
+      # TODO(arm): Now that we always require v7+ and neon, we can simplify the
+      #            code and then stop defining these.
+      "CAN_USE_ARMV7_INSTRUCTIONS",
+      "CAN_USE_VFP3_INSTRUCTIONS",
+      "CAN_USE_VFP32DREGS",
+      "CAN_USE_NEON",
+    ]
 
     # TODO(infra): Add support for arm_test_noprobe.
 
@@ -1528,7 +1726,10 @@ config("toolchain") {
     defines += [ "_MIPS_TARGET_SIMULATOR" ]
   }
 
-  if (v8_current_cpu == "mips64el" || v8_current_cpu == "mips64") {
+  assert(v8_current_cpu != "mips64",
+         "Fatal: MIPS64 Big-Endian ('mips64')  has been explicitly disabled.")
+
+  if (v8_current_cpu == "mips64el") {
     defines += [ "V8_TARGET_ARCH_MIPS64" ]
     if (v8_can_use_fpu_instructions) {
       defines += [ "CAN_USE_FPU_INSTRUCTIONS" ]
@@ -1538,8 +1739,6 @@ config("toolchain") {
     }
     if (host_byteorder == "little") {
       defines += [ "V8_TARGET_ARCH_MIPS64_LE" ]
-    } else if (host_byteorder == "big") {
-      defines += [ "V8_TARGET_ARCH_MIPS64_BE" ]
     }
     if (v8_use_mips_abi_hardfloat) {
       defines += [
@@ -1549,9 +1748,9 @@ config("toolchain") {
     } else {
       defines += [ "__mips_soft_float=1" ]
     }
-    if (mips_arch_variant == "r6") {
-      defines += [ "_MIPS_ARCH_MIPS64R6" ]
-    } else if (mips_arch_variant == "r2") {
+    assert(mips_arch_variant != "r6",
+           "Fatal: mips_arch_variant='r6' has been explicitly disabled.")
+    if (mips_arch_variant == "r2") {
       defines += [ "_MIPS_ARCH_MIPS64R2" ]
     }
   }
@@ -1569,33 +1768,34 @@ config("toolchain") {
     defines += [ "V8_TARGET_ARCH_S390X" ]
     if (host_byteorder == "little") {
       defines += [ "V8_TARGET_ARCH_S390X_LE_SIM" ]
-    } else if (current_os != "zos") {
-      cflags += [ "-march=z196" ]
+    } else if (!v8_target_is_simulator && current_os != "zos") {
+      cflags += [ "-march=z14" ]
     }
   }
   if (v8_current_cpu == "ppc64") {
     defines += [ "V8_TARGET_ARCH_PPC64" ]
     cflags += [ "-ffp-contract=off" ]
-    if (current_os == "aix") {
-      cflags += [
-        # Work around AIX ceil, trunc and round oddities.
-        "-mcpu=power5+",
-        "-mfprnd",
-
-        # Work around AIX assembler popcntb bug.
-        "-mno-popcntb",
-      ]
+    if (!v8_target_is_simulator) {
+      cflags += [ "-mcpu=pwr9" ]
     }
   }
 
-  # Under simulator build, compiler will not provide __riscv_xlen. Define here
   if (v8_current_cpu == "riscv64" || v8_current_cpu == "riscv32") {
     if (v8_target_is_simulator) {
-      defines += [ "_RISCV_TARGET_SIMULATOR" ]
+      defines += [ "RISCV_TARGET_SIMULATOR" ]
     }
     if (riscv_use_rvv || v8_target_is_simulator) {
       defines += [ "CAN_USE_RVV_INSTRUCTIONS" ]
       defines += [ "RVV_VLEN=${riscv_rvv_vlen}" ]
+    }
+    if (riscv_use_zicfiss) {
+      defines += [ "V8_ENABLE_RISCV_SHADOW_STACK" ]
+    }
+    if (riscv_profile == "rva23u64") {
+      defines += [ "CAN_USE_RVA23U64_INSTRUCTIONS" ]
+    }
+    if (riscv_use_zicond) {
+      defines += [ "__riscv_zicond" ]
     }
     if (riscv_use_zba) {
       defines += [ "__riscv_zba" ]
@@ -1606,10 +1806,19 @@ config("toolchain") {
     if (riscv_use_zbs) {
       defines += [ "__riscv_zbs" ]
     }
+    defines += [ "RISCV_CODE_ALIGNMENT=${riscv_code_alignment}" ]
+    defines +=
+        [ "RISCV_CONSTANT_POOL_ALIGNMENT=${riscv_constant_pool_alignment}" ]
   }
+
   if (v8_current_cpu == "riscv64") {
     defines += [ "V8_TARGET_ARCH_RISCV64" ]
-    defines += [ "__riscv_xlen=64" ]
+
+    # When building the simulator, the compiler does not provide __riscv_xlen,
+    # so we explicitly define it here.
+    if (v8_target_is_simulator) {
+      defines += [ "__riscv_xlen=64" ]
+    }
     if (!is_clang) {
       cflags += [ "-ffp-contract=off" ]
     }
@@ -1620,7 +1829,12 @@ config("toolchain") {
 
   if (v8_current_cpu == "riscv32") {
     defines += [ "V8_TARGET_ARCH_RISCV32" ]
-    defines += [ "__riscv_xlen=32" ]
+
+    # When building the simulator, the compiler does not provide __riscv_xlen,
+    # so we explicitly define it here.
+    if (v8_target_is_simulator) {
+      defines += [ "__riscv_xlen=32" ]
+    }
   }
 
   if (v8_current_cpu == "x86") {
@@ -1646,7 +1860,7 @@ config("toolchain") {
   # TODO(infra): Support v8_enable_prof on Windows.
   # TODO(infra): Add support for compiling with simulators.
 
-  if (v8_enable_debugging_features || v8_dcheck_always_on) {
+  if (v8_enable_verification_features || v8_dcheck_always_on) {
     defines += [ "DEBUG" ]
     if (v8_enable_slow_dchecks) {
       defines += [ "ENABLE_SLOW_DCHECKS" ]
@@ -1676,6 +1890,16 @@ config("toolchain") {
 
   if (is_clang) {
     cflags += [ "-Wunreachable-code" ]
+
+    # Lifetime safety warnings are still under active development upstream
+    # and become stricter fairly frequently. Enable these warnings only when
+    # not building as part of Chromium, so that the warnings becoming stricter
+    # don't block compiler updates in Chromium. We'll resolve these when
+    # rolling the compiler update into V8 instead.
+    if (!build_with_chromium && v8_current_cpu != "ppc64" &&
+        v8_current_cpu != "s390x") {
+      cflags += [ "-Wlifetime-safety-permissive" ]
+    }
 
     if ((v8_current_cpu != "x64" && v8_current_cpu != "ia32") ||
         target_os == "chromeos") {
@@ -1775,7 +1999,10 @@ config("strict_warnings") {
         v8_current_cpu == "mips64el" || v8_current_cpu == "riscv64") {
       cflags += [ "-Wshorten-64-to-32" ]
     }
-    cflags += [ "-Wmissing-field-initializers" ]
+    cflags += [
+      "-Wmissing-field-initializers",
+      "-Wunnecessary-virtual-specifier",
+    ]
   }
 }
 
@@ -1831,9 +2058,17 @@ if (v8_postmortem_support) {
 
     script = "tools/gen-postmortem-metadata.py"
 
+    if (v8_use_metagen_instance_types) {
+      _instance_types_header = "$target_gen_dir/metagen/instance-types.h"
+    } else {
+      _instance_types_header =
+          "$target_gen_dir/torque-generated/instance-types.h"
+    }
+
     # NOSORT
     inputs = [
-      "$target_gen_dir/torque-generated/instance-types.h",
+      _instance_types_header,
+      "$target_gen_dir/torque-generated/debug-reader-classes-list.h",
       "src/objects/allocation-site.h",
       "src/objects/allocation-site-inl.h",
       "src/objects/cell.h",
@@ -1851,7 +2086,6 @@ if (v8_postmortem_support) {
       "src/objects/code.h",
       "src/objects/code-inl.h",
       "src/objects/cpp-heap-external-object.h",
-      "src/objects/cpp-heap-external-object-inl.h",
       "src/objects/cpp-heap-object-wrapper.h",
       "src/objects/cpp-heap-object-wrapper-inl.h",
       "src/objects/data-handler.h",
@@ -1862,12 +2096,20 @@ if (v8_postmortem_support) {
       "src/objects/descriptor-array-inl.h",
       "src/objects/feedback-cell.h",
       "src/objects/feedback-cell-inl.h",
+      "src/objects/fixed-array-base.h",
+      "src/objects/fixed-array-base-inl.h",
       "src/objects/fixed-array.h",
       "src/objects/fixed-array-inl.h",
+      "src/objects/fixed-primitive-array.h",
+      "src/objects/fixed-primitive-array-inl.h",
+      "src/objects/hash-seed-wrapper.h",
+      "src/objects/hash-seed-wrapper-inl.h",
       "src/objects/heap-number.h",
       "src/objects/heap-number-inl.h",
       "src/objects/heap-object.h",
       "src/objects/heap-object-inl.h",
+      "src/objects/heap-object-field-inl.h",
+      "src/objects/heap-object-set-map-inl.h",
       "src/objects/instance-type.h",
       "src/objects/instance-type-checker.h",
       "src/objects/instance-type-inl.h",
@@ -1904,10 +2146,12 @@ if (v8_postmortem_support) {
       "src/objects/objects-inl.h",
       "src/objects/oddball.h",
       "src/objects/oddball-inl.h",
+      "src/objects/pod-array.h",
+      "src/objects/pod-array-inl.h",
       "src/objects/primitive-heap-object.h",
-      "src/objects/primitive-heap-object-inl.h",
       "src/objects/scope-info.h",
       "src/objects/scope-info-inl.h",
+      "src/objects/script.cc",
       "src/objects/script.h",
       "src/objects/script-inl.h",
       "src/objects/shared-function-info.cc",
@@ -1930,6 +2174,9 @@ if (v8_postmortem_support) {
            rebase_path(inputs, root_build_dir)
 
     deps = [ ":run_torque" ]
+    if (v8_use_metagen_instance_types) {
+      deps += [ ":metagen_instance_types_h" ]
+    }
   }
 }
 
@@ -1982,6 +2229,7 @@ torque_files = [
   "src/builtins/frames.tq",
   "src/builtins/frame-arguments.tq",
   "src/builtins/function.tq",
+  "src/builtins/generator.tq",
   "src/builtins/growable-fixed-array.tq",
   "src/builtins/ic-callable.tq",
   "src/builtins/ic.tq",
@@ -2101,7 +2349,9 @@ torque_files = [
   "src/objects/embedder-data-array.tq",
   "src/objects/feedback-cell.tq",
   "src/objects/feedback-vector.tq",
+  "src/objects/fixed-array-base.tq",
   "src/objects/fixed-array.tq",
+  "src/objects/fixed-primitive-array.tq",
   "src/objects/foreign.tq",
   "src/objects/free-space.tq",
   "src/objects/heap-number.tq",
@@ -2114,6 +2364,7 @@ torque_files = [
   "src/objects/js-disposable-stack.tq",
   "src/objects/js-function.tq",
   "src/objects/js-generator.tq",
+  "src/objects/js-interceptor-map.tq",
   "src/objects/js-iterator-helpers.tq",
   "src/objects/js-objects.tq",
   "src/objects/js-promise.tq",
@@ -2126,6 +2377,7 @@ torque_files = [
   "src/objects/js-struct.tq",
   "src/objects/js-weak-refs.tq",
   "src/objects/literal-objects.tq",
+  "src/objects/managed.tq",
   "src/objects/map.tq",
   "src/objects/megadom-handler.tq",
   "src/objects/microtask.tq",
@@ -2185,7 +2437,6 @@ if (v8_enable_temporal_support) {
 
 if (v8_enable_webassembly) {
   torque_files += [
-    "src/builtins/js-to-js.tq",
     "src/builtins/js-to-wasm.tq",
     "src/builtins/wasm.tq",
     "src/builtins/wasm-strings.tq",
@@ -2193,6 +2444,250 @@ if (v8_enable_webassembly) {
     "src/debug/debug-wasm-objects.tq",
     "src/wasm/wasm-objects.tq",
   ]
+  if (v8_enable_drumbrake) {
+    torque_files += [ "src/builtins/wasm-interpreter-wrappers.tq" ]
+  }
+}
+
+if (v8_use_metagen_instance_types) {
+  # The checked-in translation unit metagen parses. It includes
+  # src/objects/all-objects.h, whose feature-specific groups use the same
+  # defines as their V8 sources.
+  _metagen_driver_file = "tools/metagen/harvest-driver.cc"
+  _metagen_out_dir = "$target_gen_dir/metagen"
+
+  # metagen's libclang Python bindings and native library, declared as
+  # inputs so a package roll re-runs the harvest.
+  #
+  # The `//` prefix is load-bearing: llvm-libclang lives in the checkout
+  # root's third_party in both layouts (v8/ standalone, src/ under
+  # Chromium), whereas a relative path would anchor at //v8/ in Chromium.
+  if (v8_metagen_libclang_so != "") {
+    # System libclang + separately-staged bindings: the bundled package files
+    # do not exist on this platform, so declare none of them as inputs.
+    _metagen_libclang_files = []
+  } else {
+    _metagen_libclang_files = [
+      "//third_party/llvm-libclang/bindings/python/clang/cindex.py",
+      "//third_party/llvm-libclang/bindings/python/clang/__init__.py",
+    ]
+    if (host_os == "mac") {
+      _metagen_libclang_files +=
+          [ "//third_party/llvm-libclang/lib/libclang.dylib" ]
+    } else if (host_os == "win") {
+      _metagen_libclang_files +=
+          [ "//third_party/llvm-libclang/bin/libclang.dll" ]
+    } else {
+      _metagen_libclang_files +=
+          [ "//third_party/llvm-libclang/lib/libclang.so" ]
+    }
+  }
+
+  # The clang toolchain's resource dir contains builting headers
+  # include/{stddef.h,stdarg.h,...}.
+  _metagen_clang_resource_dir = "$clang_base_path/lib/clang/$clang_version"
+  _metagen_flags_target = ":v8_base_without_compiler"
+  _metagen_flags_target_ninja =
+      get_label_info(_metagen_flags_target, "target_out_dir") +
+      "/v8_base_without_compiler.ninja"
+
+  action("metagen_instance_types_h") {
+    visibility = [
+      ":*",
+      "tools/debug_helper/:*",
+    ]
+
+    script = "tools/metagen/metagen.py"
+
+    # The script obtains the parse flags through `gn desc`, so make the build
+    # configuration an explicit input. In particular, changing a feature define
+    # must re-run the driver even though the action command is unchanged.
+    deps = [ ":v8_dump_build_config" ]
+
+    if (v8_generate_external_defines_header) {
+      # v8config.h includes the generated v8-gn.h in this configuration.
+      deps += [ ":gen_v8_gn" ]
+    }
+
+    # No deps on V8's own generators: every generated header the harvested set
+    # reaches short-circuits to empty under V8_METAGEN_GENERATION_PASS
+    # (see builtins-definitions.h and factory-base.h), so the harvest runs
+    # independently of Torque and the bytecode-builtins-list generator.
+    # Perfetto's generated headers are kept out of the parse the same way, by
+    # undefining V8_USE_PERFETTO for it (see metagen.py).
+
+    # `inputs`, not `sources`: these headers belong to the V8 targets that
+    # compile them; this action only reads them.
+    inputs = [
+               "tools/metagen/clang_bootstrap.py",
+               "tools/metagen/compile_flags.py",
+               "tools/metagen/cpp_hier.py",
+               "tools/metagen/extract.py",
+               "tools/metagen/instance_types.py",
+               "tools/metagen/metagen.py",
+               _metagen_driver_file,
+               "$root_out_dir/v8_build_config.json",
+
+               # Proxy for the whole builtin-header directory, which has no
+               # GN glob: a toolchain roll rewrites stddef.h along with the
+               # rest, and the harvest cannot parse without it.
+               "$_metagen_clang_resource_dir/include/stddef.h",
+             ] + _metagen_libclang_files
+
+    outputs = [ "$_metagen_out_dir/instance-types.h" ]
+
+    # The files the harvest read a fact out of, reported by the script.
+    # `inputs` above declares only the driver, so this is what re-runs the
+    # harvest when a class declaration or a marker changes.
+    #
+    # Binds to the first output, so output order matters if one is added.
+    depfile = "$_metagen_out_dir/instance-types.h.d"
+
+    args = [
+      "--depfile",
+      rebase_path(depfile, root_build_dir),
+      "--driver",
+      rebase_path(_metagen_driver_file, root_build_dir),
+      "--v8-root",
+      rebase_path(".", root_build_dir),
+      "--build-dir",
+      ".",  # The action runs with cwd=root_build_dir.
+
+      # metagen cannot find this by walking up from the build dir: on
+      # ChromeOS the build dir sits outside the checkout entirely.
+      "--source-root",
+      rebase_path("//", root_build_dir),
+      "--out",
+      rebase_path(_metagen_out_dir, root_build_dir),
+
+      # Representative compiled target whose flags metagen harvests via
+      # `gn desc`: its TUs include the headers metagen parses, so its
+      # config is the right one. Passed as a string, not a dep, to avoid a
+      # cycle with the targets that consume instance-types.h.
+      # Pass the current_toolchain so cross-compiles are handled correctly.
+      # It travels in its own argument because GN would not quote the
+      # parentheses of a qualified label on a Windows command line.
+      "--flags-from-target",
+      get_label_info(_metagen_flags_target, "label_no_toolchain"),
+      "--flags-toolchain",
+      current_toolchain,
+
+      # GN does not allow its generated ninja files as explicit action inputs.
+      # Have metagen add the file containing the queried flags to its depfile.
+      "--flags-dependency",
+      rebase_path(_metagen_flags_target_ninja, root_build_dir),
+
+      # We pass a resource dir, not an include dir, so the driver decides where
+      # the builtin headers sit: behind libc++, ahead of the Windows SDK's
+      # copies of stddef.h and the intrinsics. See tools/metagen/metagen.py.
+      "--clang-resource-dir",
+      rebase_path(_metagen_clang_resource_dir, root_build_dir),
+    ]
+
+    if (v8_metagen_libclang_so != "") {
+      # No prebuilt llvm-libclang for this platform: point metagen at the
+      # system libclang and the separately-staged cindex bindings. The two
+      # args are validated as a pair at the top of this file.
+      args += [
+        "--libclang-so",
+        v8_metagen_libclang_so,
+        "--libclang-bindings-dir",
+        v8_metagen_libclang_bindings_dir,
+
+        # The toolchain major, so metagen can warn if the loaded libclang is
+        # out of step with the clang whose builtin headers it parses against.
+        "--expect-libclang-major",
+        clang_version,
+      ]
+    } else {
+      # Package root, so metagen need not guess the checkout layout.
+      args += [
+        "--libclang-dir",
+        rebase_path("//third_party/llvm-libclang", root_build_dir),
+      ]
+    }
+
+    if (is_win) {
+      # The SDK/UCRT include dirs never show up in `gn desc`: the toolchain
+      # interpolates them into its tool command template instead of into
+      # cflags. Pass the build's own resolved flags, the way
+      # build/modules/BUILD.gn does, so an SDK roll reruns the harvest.
+      # `--extra-flag=` attaches the value because the flags start with a
+      # dash (-imsvc<dir>) and argparse would take them for options.
+      foreach(flag, current_win_toolchain_data.include_flags_imsvc_list) {
+        args += [ "--extra-flag=$flag" ]
+      }
+    }
+  }
+}
+
+if (v8_enable_experimental_tq_to_tsa) {
+  template("run_torque_to_tsa") {
+    if (target_name == "") {
+      suffix = ""
+    } else {
+      suffix = "_$target_name"
+    }
+
+    toolchain = invoker.toolchain
+
+    action("run_torque_to_tsa" + suffix) {
+      visibility = [
+        ":*",
+        "test/cctest/:*",
+        "tools/debug_helper/:*",
+        "tools/gcmole/:*",
+      ]
+
+      deps = [ ":torque($toolchain)" ]
+
+      if (is_msan) {
+        configs = [
+          "//third_party/instrumented_libs:msan_runtime_libs($host_toolchain)",
+        ]
+        deps += [ "//third_party/instrumented_libs:ld-linux($host_toolchain)" ]
+      }
+
+      script = "tools/run.py"
+
+      sources = torque_files
+
+      destination_folder = "$target_gen_dir/torque-generated$suffix"
+
+      outputs = []
+
+      foreach(file, torque_files) {
+        filetq = string_replace(file, ".tq", "-tq")
+        outputs += [
+          "$destination_folder/$filetq-tsa.cc",
+          "$destination_folder/$filetq-tsa.h",
+        ]
+      }
+
+      args = [
+        "./" + rebase_path(get_label_info(":torque($toolchain)",
+                                          "root_out_dir") + "/torque",
+                           root_build_dir),
+        "-o",
+        rebase_path("$destination_folder", root_build_dir),
+        "-v8-root",
+        rebase_path(".", root_build_dir),
+        "-output-tsa",
+      ]
+      if (v8_annotate_torque_ir) {
+        args += [ "-annotate-ir" ]
+      }
+      if (defined(invoker.args)) {
+        args += invoker.args
+      }
+      args += torque_files
+    }
+  }
+
+  # Default run_torque_to_tsa action
+  run_torque_to_tsa("") {
+    toolchain = v8_generator_toolchain
+  }
 }
 
 # Template for running torque
@@ -2231,26 +2726,21 @@ template("run_torque") {
     destination_folder = "$target_gen_dir/torque-generated$suffix"
 
     outputs = [
-      "$destination_folder/bit-fields.h",
+      "$destination_folder/bit-field-asserts.cc",
       "$destination_folder/builtin-definitions.h",
       "$destination_folder/class-debug-readers.cc",
       "$destination_folder/class-debug-readers.h",
       "$destination_folder/class-forward-declarations.h",
-      "$destination_folder/class-verifiers.cc",
-      "$destination_folder/class-verifiers.h",
       "$destination_folder/csa-types.h",
       "$destination_folder/debug-macros.cc",
       "$destination_folder/debug-macros.h",
+      "$destination_folder/debug-reader-classes-list.h",
       "$destination_folder/enum-verifiers.cc",
       "$destination_folder/exported-macros-assembler.cc",
       "$destination_folder/exported-macros-assembler.h",
-      "$destination_folder/factory.cc",
-      "$destination_folder/factory.inc",
+      "$destination_folder/instance-type-checker-lists.h",
       "$destination_folder/instance-types.h",
       "$destination_folder/interface-descriptors.inc",
-      "$destination_folder/objects-body-descriptors-inl.inc",
-      "$destination_folder/objects-printer.cc",
-      "$destination_folder/visitor-lists.h",
     ]
 
     foreach(file, torque_files) {
@@ -2258,9 +2748,7 @@ template("run_torque") {
       outputs += [
         "$destination_folder/$filetq-csa.cc",
         "$destination_folder/$filetq-csa.h",
-        "$destination_folder/$filetq-inl.inc",
         "$destination_folder/$filetq.cc",
-        "$destination_folder/$filetq.inc",
       ]
     }
 
@@ -2275,6 +2763,9 @@ template("run_torque") {
     ]
     if (v8_annotate_torque_ir) {
       args += [ "-annotate-ir" ]
+    }
+    if (v8_enable_torque_dwarf) {
+      args += [ "-torque-dwarf" ]
     }
     if (defined(invoker.args)) {
       args += invoker.args
@@ -2322,11 +2813,7 @@ group("v8_maybe_icu") {
 
 group("v8_maybe_temporal") {
   if (v8_enable_temporal_support) {
-    deps = [ "//third_party/rust/temporal_capi/v0_0:lib" ]
-
-    # Only needs to be depended on by targets that wish to use TEMPORAL_CAPI_VERSION_*
-    public_configs =
-        [ "//third_party/rust/temporal_capi:temporal_capi_versioning_defines" ]
+    public_deps = [ "//third_party/rust/temporal_capi" ]
   }
 }
 
@@ -2337,12 +2824,27 @@ group("v8_abseil") {
     "//third_party/abseil-cpp:absl_define_config",
     "//third_party/abseil-cpp:absl_include_config",
   ]
+
+  visibility = [ "./*" ]
+}
+
+group("v8_simdutf") {
+  public_deps = [ "//third_party/simdutf" ]
+  public_configs = [ ":simdutf_include_config" ]
+
+  visibility = [ "./*" ]
+}
+
+config("simdutf_include_config") {
+  include_dirs = [ "//third_party/simdutf" ]
 }
 
 group("zoslib") {
   if (current_os == "zos") {
     deps = [ "//third_party/zoslib" ]
   }
+
+  visibility = [ "./*" ]
 }
 
 v8_header_set("torque_runtime_support") {
@@ -2353,8 +2855,27 @@ v8_header_set("torque_runtime_support") {
   configs = [ ":internal_config" ]
 }
 
-v8_source_set("torque_generated_initializers") {
+# Build lists of torque-generated .cc and .h files for clustering
+torque_csa_cc_files = []
+torque_csa_h_files = []
+torque_tsa_cc_files = []
+torque_tsa_h_files = []
+foreach(file, torque_files) {
+  filetq = string_replace(file, ".tq", "-tq")
+  torque_csa_cc_files += [ "$target_gen_dir/torque-generated/$filetq-csa.cc" ]
+  torque_csa_h_files += [ "$target_gen_dir/torque-generated/$filetq-csa.h" ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    torque_tsa_cc_files += [ "$target_gen_dir/torque-generated/$filetq-tsa.cc" ]
+    torque_tsa_h_files += [ "$target_gen_dir/torque-generated/$filetq-tsa.h" ]
+  }
+}
+
+v8_cluster_source_set("torque_generated_initializers") {
   visibility = [ ":*" ]  # Only targets in this file can depend on this.
+
+  cluster_prefix = "torque-csa"
+  cluster_output_dir = "$target_gen_dir/torque-generated"
+  generated_sources = true
 
   deps = [
     ":generate_bytecode_builtins_list",
@@ -2363,6 +2884,9 @@ v8_source_set("torque_generated_initializers") {
     ":v8_maybe_temporal",
     ":v8_tracing",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    deps += [ ":run_torque_to_tsa" ]
+  }
 
   public_deps = [
     ":torque_runtime_support",
@@ -2370,18 +2894,22 @@ v8_source_set("torque_generated_initializers") {
     ":v8_maybe_icu",
   ]
 
-  sources = [
-    "$target_gen_dir/torque-generated/csa-types.h",
-    "$target_gen_dir/torque-generated/enum-verifiers.cc",
-    "$target_gen_dir/torque-generated/exported-macros-assembler.cc",
-    "$target_gen_dir/torque-generated/exported-macros-assembler.h",
-  ]
-  foreach(file, torque_files) {
-    filetq = string_replace(file, ".tq", "-tq")
-    sources += [
-      "$target_gen_dir/torque-generated/$filetq-csa.cc",
-      "$target_gen_dir/torque-generated/$filetq-csa.h",
-    ]
+  sources = torque_csa_cc_files + [
+              "$target_gen_dir/torque-generated/bit-field-asserts.cc",
+              "$target_gen_dir/torque-generated/csa-types.h",
+              "$target_gen_dir/torque-generated/enum-verifiers.cc",
+              "$target_gen_dir/torque-generated/exported-macros-assembler.cc",
+              "$target_gen_dir/torque-generated/exported-macros-assembler.h",
+            ]
+
+  # Add headers (always included)
+  sources += torque_csa_h_files
+  if (v8_enable_experimental_tq_to_tsa) {
+    sources += torque_tsa_h_files
+
+    # TSA cc files are not clustered yet
+    sources += torque_tsa_cc_files
+    exclude_from_cluster = torque_tsa_cc_files
   }
 
   configs = [ ":internal_config" ]
@@ -2399,8 +2927,19 @@ v8_source_set("torque_generated_initializers") {
   }
 }
 
-v8_source_set("torque_generated_definitions") {
+# Build lists of torque-generated definition files for clustering
+torque_def_cc_files = []
+foreach(file, torque_files) {
+  filetq = string_replace(file, ".tq", "-tq")
+  torque_def_cc_files += [ "$target_gen_dir/torque-generated/$filetq.cc" ]
+}
+
+v8_cluster_source_set("torque_generated_definitions") {
   visibility = [ ":*" ]  # Only targets in this file can depend on this.
+
+  cluster_prefix = "torque-def"
+  cluster_output_dir = "$target_gen_dir/torque-generated"
+  generated_sources = true
 
   deps = [
     ":generate_bytecode_builtins_list",
@@ -2410,27 +2949,17 @@ v8_source_set("torque_generated_definitions") {
     ":v8_maybe_temporal",
     ":v8_tracing",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    deps += [ ":run_torque_to_tsa" ]
+  }
 
   public_deps = [
     ":v8_abseil",
     ":v8_maybe_icu",
   ]
 
-  sources = [
-    "$target_gen_dir/torque-generated/class-forward-declarations.h",
-    "$target_gen_dir/torque-generated/class-verifiers.cc",
-    "$target_gen_dir/torque-generated/class-verifiers.h",
-    "$target_gen_dir/torque-generated/factory.cc",
-    "$target_gen_dir/torque-generated/objects-printer.cc",
-  ]
-  foreach(file, torque_files) {
-    filetq = string_replace(file, ".tq", "-tq")
-    sources += [
-      "$target_gen_dir/torque-generated/$filetq-inl.inc",
-      "$target_gen_dir/torque-generated/$filetq.cc",
-      "$target_gen_dir/torque-generated/$filetq.inc",
-    ]
-  }
+  sources = torque_def_cc_files +
+            [ "$target_gen_dir/torque-generated/class-forward-declarations.h" ]
 
   configs = [ ":internal_config" ]
 }
@@ -2467,6 +2996,7 @@ template("run_mksnapshot") {
   } else {
     suffix = "_$name"
   }
+
   action("run_mksnapshot_" + name) {
     deps = [ ":mksnapshot($v8_snapshot_toolchain)" ]
     if (v8_verify_deterministic_mksnapshot) {
@@ -2527,7 +3057,7 @@ template("run_mksnapshot") {
                                         "root_out_dir") + "/mksnapshot",
                          root_build_dir),
       "--turbo_instruction_scheduling",
-      "--stress-turbo-late-spilling",
+      "--turbo-always-optimize-spills",
 
       # In cross builds, the snapshot may be generated for both the host and
       # target toolchains.  The same host binary is used to generate both, so
@@ -2600,10 +3130,6 @@ template("run_mksnapshot") {
       }
     }
 
-    if (v8_enable_turboshaft_csa) {
-      args += [ "--turboshaft-csa" ]
-    }
-
     # This is needed to distinguish between generating code for the simulator
     # and cross-compiling. The latter may need to run code on the host with the
     # simulator but cannot use simulator-specific instructions.
@@ -2659,6 +3185,10 @@ template("run_mksnapshot") {
       args += [ "--code-comments" ]
     }
 
+    if (v8_enable_torque_dwarf) {
+      args += [ "--torque-dwarf" ]
+    }
+
     if (v8_enable_snapshot_native_code_counters) {
       args += [ "--native-code-counters" ]
     } else {
@@ -2674,13 +3204,16 @@ template("run_mksnapshot") {
         args += [ "--no-turbo-rewrite-far-jumps" ]
       }
 
-      if (v8_enable_debugging_features && v8_enable_slow_dchecks) {
+      if (v8_enable_verification_features && v8_enable_slow_dchecks) {
         # mksnapshot only accepts this flag if ENABLE_SLOW_DCHECKS is defined.
         args += [ "--no-enable-slow-asserts" ]
       }
     }
 
-    if (v8_enable_concurrent_mksnapshot) {
+    # TODO(Wenqin): We have to set the CPU feature when we are compiling ISX
+    # builtins, therefore it may make TSAN failed when we enable concurrent
+    # mksnapshot, try to make the CPU feature as thread local later.
+    if (v8_enable_concurrent_mksnapshot && !v8_enable_builtins_gearbox) {
       args += [
         "--concurrent-builtin-generation",
 
@@ -2748,6 +3281,7 @@ if (v8_verify_builtins_compatibility) {
   # This specifies a separate mksnapshot target for each of:
   # x86, x64, arm, arm64.
   hashes = "builtins_hashes_$v8_current_cpu"
+
   run_mksnapshot("dump_$v8_current_cpu") {
     args = [
       "--dump-builtins-hashes-to-file",
@@ -2768,6 +3302,7 @@ if (v8_verify_builtins_compatibility) {
     profile_toolchain = "//build/toolchain/linux:clang_${profile_arch}"
     target_toolchain =
         "//build/toolchain/linux:clang_${profile_arch}_v8_${target_arch}"
+
     action("compare_builtins_$target_name") {
       deps = [
         ":run_mksnapshot_dump_${profile_arch}($profile_toolchain)",
@@ -2805,7 +3340,7 @@ if (v8_verify_builtins_compatibility) {
 action("v8_dump_build_config") {
   script = "tools/testrunner/utils/dump_build_config.py"
   outputs = [ "$root_out_dir/v8_build_config.json" ]
-  is_full_debug = v8_enable_debugging_features && !v8_optimized_debug
+  is_full_debug = v8_enable_verification_features && !v8_optimized_debug
 
   arch = v8_target_cpu
   if (v8_target_cpu == "x86") {
@@ -2823,6 +3358,10 @@ action("v8_dump_build_config") {
   simd_mips = mips_arch_variant_var == "r6" && mips_use_msa
   simulator_run = target_cpu != v8_target_cpu
   use_sanitizer = is_asan || is_cfi || is_msan || is_tsan || is_ubsan
+
+  # Close the ITTT block, because stacked blocks are not allowed.
+  # LINT.ThenChange(BUILD.bazel)
+  # LINT.IfChange
 
   # This lists all build-time switches consumed by the test framework. All
   # switches can be used automatically in the status files as is - no
@@ -2856,9 +3395,11 @@ action("v8_dump_build_config") {
     "dict_property_const_tracking=$v8_dict_property_const_tracking",
     "direct_handle=$v8_enable_direct_handle",
     "disassembler=$v8_enable_disassembler",
+    "dumpling=$v8_dumpling",
     "full_debug=$is_full_debug",
     "gdbjit=$v8_enable_gdbjit",
     "has_jitless=$v8_jitless",
+    "sparkplug_plus=$v8_enable_sparkplug_plus",
     "has_maglev=$v8_enable_maglev",
     "has_turbofan=$v8_enable_turbofan",
     "has_webassembly=$v8_enable_webassembly",
@@ -2867,6 +3408,7 @@ action("v8_dump_build_config") {
     "temporal=$v8_enable_temporal_support",
     "is_android=$is_android",
     "is_ios=$is_ios",
+    "is_linux=$is_linux",
     "js_shared_memory=$js_shared_memory",
     "lite_mode=$v8_enable_lite_mode",
     "local_off_stack_check=$v8_enable_local_off_stack_check",
@@ -2878,6 +3420,7 @@ action("v8_dump_build_config") {
     "pointer_compression_shared_cage=$v8_enable_pointer_compression_shared_cage",
     "runtime_call_stats=$v8_enable_runtime_call_stats",
     "sandbox=$v8_enable_sandbox",
+    "sandbox_hardware_support=$v8_enable_sandbox_hardware_support",
     "simd_mips=$simd_mips",
     "simulator_run=$simulator_run",
     "single_generation=$v8_enable_single_generation",
@@ -2889,17 +3432,21 @@ action("v8_dump_build_config") {
     "v8_cfi=$v8_control_flow_integrity",
     "v8_current_cpu=\"$v8_current_cpu\"",
     "v8_target_cpu=\"$v8_target_cpu\"",
+    "verification_features=$v8_enable_verification_features",
     "verify_csa=$v8_enable_verify_csa",
     "verify_heap=$v8_enable_verify_heap",
     "verify_predictable=$v8_enable_verify_predictable",
     "wasm_random_fuzzers=$v8_wasm_random_fuzzers",
     "memory_corruption_api=$v8_enable_memory_corruption_api",
-    "leaptiering=$v8_enable_leaptiering",
     "lower_limits_mode=$v8_lower_limits_mode",
+    "test_only_sync_points=$v8_enable_test_only_sync_points",
 
     # Please add new switches also in `build_config_content` in `bazel/defs.bzl`
     # so that the switches also work for tests triggered by bazel.
   ]
+
+  # LINT.ThenChange(bazel/defs.bzl)
+  # LINT.IfChange
 }
 
 # Generate a json file containing essential V8 build flags.
@@ -2913,6 +3460,8 @@ generated_file("v8_generate_features_json") {
   output_conversion = "json"
   contents = {
     v8_deprecation_warnings = v8_deprecation_warnings
+    v8_disallow_js_in_api_interrupts_is_checked =
+        v8_disallow_js_in_api_interrupts_is_checked
     v8_enable_31bit_smis_on_64bit_arch = v8_enable_31bit_smis_on_64bit_arch
     v8_enable_direct_handle = v8_enable_direct_handle
     v8_enable_extensible_ro_snapshot = v8_enable_extensible_ro_snapshot
@@ -2932,12 +3481,12 @@ generated_file("v8_generate_features_json") {
     v8_enable_v8_checks = v8_enable_v8_checks
     v8_enable_memory_accounting_checks = v8_enable_memory_accounting_checks
     v8_enable_webassembly = v8_enable_webassembly
-    v8_enable_zone_compression = v8_enable_zone_compression
     v8_imminent_deprecation_warnings = v8_imminent_deprecation_warnings
     v8_optimized_debug = v8_optimized_debug
     v8_random_seed = v8_random_seed
     v8_use_perfetto = v8_use_perfetto
     v8_use_siphash = v8_use_siphash
+    v8_use_default_hasher_secret = v8_use_default_hasher_secret
   }
 }
 
@@ -2983,6 +3532,10 @@ v8_source_set("v8_snapshot") {
 
   configs = [ ":internal_config" ]
 
+  if (is_debug) {
+    asmflags = [ "-g" ]
+  }
+
   if (v8_use_external_startup_data) {
     deps += [ ":v8_base" ]
 
@@ -2997,7 +3550,7 @@ v8_source_set("v8_snapshot") {
   }
 }
 
-v8_source_set("v8_initializers") {
+v8_cluster_source_set("v8_initializers") {
   visibility = [
     ":*",
     "test/cctest:*",
@@ -3042,8 +3595,6 @@ v8_source_set("v8_initializers") {
     "src/builtins/builtins-intl-gen.cc",
     "src/builtins/builtins-iterator-gen.cc",
     "src/builtins/builtins-iterator-gen.h",
-    "src/builtins/builtins-lazy-gen.cc",
-    "src/builtins/builtins-lazy-gen.h",
     "src/builtins/builtins-microtask-queue-gen.cc",
     "src/builtins/builtins-number-gen.cc",
     "src/builtins/builtins-number-tsa.cc",
@@ -3059,12 +3610,15 @@ v8_source_set("v8_initializers") {
     "src/builtins/builtins-sharedarraybuffer-gen.cc",
     "src/builtins/builtins-string-gen.cc",
     "src/builtins/builtins-string-gen.h",
+    "src/builtins/builtins-string-tsa-inl.h",
     "src/builtins/builtins-string-tsa.cc",
     "src/builtins/builtins-typed-array-gen.cc",
     "src/builtins/builtins-typed-array-gen.h",
     "src/builtins/builtins-utils-gen.h",
     "src/builtins/growable-fixed-array-gen.cc",
     "src/builtins/growable-fixed-array-gen.h",
+    "src/builtins/js-trampoline-assembler.cc",
+    "src/builtins/js-trampoline-assembler.h",
     "src/builtins/number-builtins-reducer-inl.h",
     "src/builtins/profile-data-reader.cc",
     "src/builtins/profile-data-reader.h",
@@ -3113,12 +3667,11 @@ v8_source_set("v8_initializers") {
       } else if (v8_current_cpu == "arm64") {
         sources +=
             [ "src/wasm/interpreter/arm64/interpreter-builtins-arm64.cc" ]
+      } else if (v8_current_cpu == "riscv64") {
+        sources +=
+            [ "src/wasm/interpreter/riscv/interpreter-builtins-riscv.cc" ]
       }
     }
-  }
-
-  if (v8_enable_temporal_support) {
-    sources += [ "src/builtins/builtins-temporal-gen.cc" ]
   }
 
   if (v8_current_cpu == "x86") {
@@ -3369,6 +3922,7 @@ v8_header_set("v8_flags") {
   configs = [ ":internal_config" ]
 
   sources = [
+    "src/flags/feature-flags.h",
     "src/flags/flag-definitions.h",
     "src/flags/flags-impl.h",
     "src/flags/flags.h",
@@ -3378,6 +3932,23 @@ v8_header_set("v8_flags") {
     ":v8_libbase",
     ":v8_shared_internal_headers",
   ]
+}
+
+if (v8_enable_temporal_support) {
+  # In cases where we aren't using ICU4C (e.g. v8_enable_i18n_support=false),
+  # we "bake" in a zoneinfo64.res binary for Temporal
+  action("make_temporal_zoneinfo_cpp") {
+    script = "tools/include-file-as-bytes.py"
+    inputs = [ get_label_info("//third_party/icu/", "dir") +
+               "/tzres/zoneinfo64.res" ]
+    outputs =
+        [ "$target_gen_dir/src/builtins/builtins-temporal-zoneinfo64-data.cc" ]
+    args = [
+      rebase_path(inputs[0], root_build_dir),
+      rebase_path(outputs[0], root_build_dir),
+      "zoneinfo64_static_data",
+    ]
+  }
 }
 
 v8_header_set("v8_internal_headers") {
@@ -3417,6 +3988,9 @@ v8_header_set("v8_internal_headers") {
     "src/builtins/builtins-descriptors.h",
     "src/builtins/builtins-effects-analyzer.h",
     "src/builtins/builtins-inl.h",
+    "src/builtins/builtins-iterator-inl.h",
+    "src/builtins/builtins-iterator.h",
+    "src/builtins/builtins-math-xsum.h",
     "src/builtins/builtins-promise.h",
     "src/builtins/builtins-utils-inl.h",
     "src/builtins/builtins-utils.h",
@@ -3424,6 +3998,7 @@ v8_header_set("v8_internal_headers") {
     "src/builtins/constants-table-builder.h",
     "src/builtins/data-view-ops.h",
     "src/builtins/profile-data-reader.h",
+    "src/builtins/superspread.h",
     "src/codegen/aligned-slot-allocator.h",
     "src/codegen/assembler-arch.h",
     "src/codegen/assembler-inl.h",
@@ -3438,6 +4013,7 @@ v8_header_set("v8_internal_headers") {
     "src/codegen/code-reference.h",
     "src/codegen/compilation-cache.h",
     "src/codegen/compiler.h",
+    "src/codegen/constant-pool-entry.h",
     "src/codegen/constant-pool.h",
     "src/codegen/constants-arch.h",
     "src/codegen/cpu-features.h",
@@ -3484,9 +4060,9 @@ v8_header_set("v8_internal_headers") {
     "src/common/operation.h",
     "src/common/ptr-compr-inl.h",
     "src/common/ptr-compr.h",
-    "src/common/segmented-table-inl.h",
-    "src/common/segmented-table.h",
+    "src/common/scoped-modification.h",
     "src/common/simd128.h",
+    "src/common/synchronization-point-support.h",
     "src/common/thread-local-storage.h",
     "src/compiler-dispatcher/lazy-compile-dispatcher.h",
     "src/compiler-dispatcher/optimizing-compile-dispatcher.h",
@@ -3503,7 +4079,6 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/backend/gap-resolver.h",
     "src/compiler/backend/instruction-codes.h",
     "src/compiler/backend/instruction-scheduler.h",
-    "src/compiler/backend/instruction-selector-adapter.h",
     "src/compiler/backend/instruction-selector-impl.h",
     "src/compiler/backend/instruction-selector.h",
     "src/compiler/backend/instruction.h",
@@ -3512,9 +4087,10 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/backend/register-allocation.h",
     "src/compiler/backend/register-allocator-verifier.h",
     "src/compiler/backend/register-allocator.h",
+    "src/compiler/backend/simd-shuffle.h",
     "src/compiler/backend/spill-placer.h",
     "src/compiler/backend/unwinding-info-writer.h",
-    "src/compiler/basic-block-instrumentor.h",
+    "src/compiler/basic-block-call-graph-profiler.h",
     "src/compiler/branch-elimination.h",
     "src/compiler/bytecode-analysis.h",
     "src/compiler/bytecode-graph-builder.h",
@@ -3525,6 +4101,7 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/common-node-cache.h",
     "src/compiler/common-operator-reducer.h",
     "src/compiler/common-operator.h",
+    "src/compiler/common-utils.h",
     "src/compiler/compilation-dependencies.h",
     "src/compiler/compiler-source-position-table.h",
     "src/compiler/constant-folding-reducer.h",
@@ -3587,7 +4164,6 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/operator-properties.h",
     "src/compiler/operator.h",
     "src/compiler/osr.h",
-    "src/compiler/pair-load-store-reducer.h",
     "src/compiler/per-isolate-compiler-cache.h",
     "src/compiler/persistent-map.h",
     "src/compiler/phase.h",
@@ -3608,7 +4184,6 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/simplified-operator-reducer.h",
     "src/compiler/simplified-operator.h",
     "src/compiler/state-values-utils.h",
-    "src/compiler/string-builder-optimizer.h",
     "src/compiler/turbofan-graph-visualizer.h",
     "src/compiler/turbofan-graph.h",
     "src/compiler/turbofan-typer.h",
@@ -3623,11 +4198,12 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/branch-elimination-reducer.h",
     "src/compiler/turboshaft/build-graph-phase.h",
     "src/compiler/turboshaft/builtin-call-descriptors.h",
+    "src/compiler/turboshaft/call-descriptors-util.h",
     "src/compiler/turboshaft/code-elimination-and-simplification-phase.h",
     "src/compiler/turboshaft/copying-phase.h",
     "src/compiler/turboshaft/csa-branch-elimination-phase.h",
     "src/compiler/turboshaft/csa-early-machine-optimization-phase.h",
-    "src/compiler/turboshaft/csa-effects-computation-phase.h",
+    "src/compiler/turboshaft/csa-effects-computation.h",
     "src/compiler/turboshaft/csa-late-escape-analysis-phase.h",
     "src/compiler/turboshaft/csa-load-elimination-phase.h",
     "src/compiler/turboshaft/csa-memory-optimization-phase.h",
@@ -3647,6 +4223,7 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/graph-builder.h",
     "src/compiler/turboshaft/graph-visualizer.h",
     "src/compiler/turboshaft/graph.h",
+    "src/compiler/turboshaft/if-else-cascade-to-switch-reducer.h",
     "src/compiler/turboshaft/index.h",
     "src/compiler/turboshaft/instruction-selection-normalization-reducer.h",
     "src/compiler/turboshaft/instruction-selection-phase.h",
@@ -3654,8 +4231,12 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/late-escape-analysis-reducer.h",
     "src/compiler/turboshaft/late-load-elimination-reducer.h",
     "src/compiler/turboshaft/layered-hash-map.h",
+    "src/compiler/turboshaft/load-elimination-phase.h",
     "src/compiler/turboshaft/load-store-simplification-reducer.h",
+    "src/compiler/turboshaft/load-store-verification-reducer.h",
     "src/compiler/turboshaft/loop-finder.h",
+    "src/compiler/turboshaft/loop-optimization-phase.h",
+    "src/compiler/turboshaft/loop-optimization-reducer.h",
     "src/compiler/turboshaft/loop-peeling-phase.h",
     "src/compiler/turboshaft/loop-peeling-reducer.h",
     "src/compiler/turboshaft/loop-unrolling-phase.h",
@@ -3663,14 +4244,16 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/machine-lowering-phase.h",
     "src/compiler/turboshaft/machine-lowering-reducer-inl.h",
     "src/compiler/turboshaft/machine-optimization-reducer.h",
+    "src/compiler/turboshaft/maglev-assert-types-reducer.h",
+    "src/compiler/turboshaft/memory-optimization-phase.h",
     "src/compiler/turboshaft/memory-optimization-reducer.h",
     "src/compiler/turboshaft/operation-matcher.h",
     "src/compiler/turboshaft/operations.h",
     "src/compiler/turboshaft/opmasks.h",
-    "src/compiler/turboshaft/optimize-phase.h",
     "src/compiler/turboshaft/phase.h",
     "src/compiler/turboshaft/pipelines.h",
     "src/compiler/turboshaft/pretenuring-propagation-reducer.h",
+    "src/compiler/turboshaft/random-rescheduling-phase.h",
     "src/compiler/turboshaft/reducer-traits.h",
     "src/compiler/turboshaft/register-allocation-phase.h",
     "src/compiler/turboshaft/representations.h",
@@ -3678,17 +4261,17 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/runtime-call-descriptors.h",
     "src/compiler/turboshaft/select-lowering-reducer.h",
     "src/compiler/turboshaft/sidetable.h",
+    "src/compiler/turboshaft/simplified-optimization-reducer.h",
     "src/compiler/turboshaft/simplify-tf-loops.h",
     "src/compiler/turboshaft/snapshot-table-opindex.h",
     "src/compiler/turboshaft/snapshot-table.h",
     "src/compiler/turboshaft/stack-check-lowering-reducer.h",
-    "src/compiler/turboshaft/store-store-elimination-phase.h",
     "src/compiler/turboshaft/store-store-elimination-reducer-inl.h",
     "src/compiler/turboshaft/string-escape-analysis-reducer.h",
     "src/compiler/turboshaft/string-view.h",
-    "src/compiler/turboshaft/structural-optimization-reducer.h",
     "src/compiler/turboshaft/tracing.h",
     "src/compiler/turboshaft/turbolev-early-lowering-reducer-inl.h",
+    "src/compiler/turboshaft/turbolev-frontend-pipeline.h",
     "src/compiler/turboshaft/turbolev-graph-builder.h",
     "src/compiler/turboshaft/type-assertions-phase.h",
     "src/compiler/turboshaft/type-inference-analysis.h",
@@ -3698,12 +4281,14 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/typed-optimizations-reducer.h",
     "src/compiler/turboshaft/typer.h",
     "src/compiler/turboshaft/types.h",
+    "src/compiler/turboshaft/typeswitch.h",
     "src/compiler/turboshaft/undef-assembler-macros.inc",
     "src/compiler/turboshaft/uniform-reducer-adapter.h",
     "src/compiler/turboshaft/use-map.h",
     "src/compiler/turboshaft/utils.h",
     "src/compiler/turboshaft/value-numbering-reducer.h",
     "src/compiler/turboshaft/variable-reducer.h",
+    "src/compiler/turboshaft/wasm-code-coverage-reducer.h",
     "src/compiler/turboshaft/wasm-dead-code-elimination-phase.h",
     "src/compiler/turboshaft/zone-with-name.h",
     "src/compiler/type-cache.h",
@@ -3722,13 +4307,12 @@ v8_header_set("v8_internal_headers") {
     "src/debug/debug-frames.h",
     "src/debug/debug-interface.h",
     "src/debug/debug-property-iterator.h",
+    "src/debug/debug-scope-info.h",
     "src/debug/debug-scope-iterator.h",
     "src/debug/debug-scopes.h",
     "src/debug/debug-stack-trace-iterator.h",
     "src/debug/debug.h",
     "src/debug/interface-types.h",
-    "src/debug/liveedit-diff.h",
-    "src/debug/liveedit.h",
     "src/deoptimizer/deoptimize-reason.h",
     "src/deoptimizer/deoptimized-frame-info.h",
     "src/deoptimizer/deoptimizer.h",
@@ -3757,6 +4341,7 @@ v8_header_set("v8_internal_headers") {
     "src/execution/frames.h",
     "src/execution/futex-emulation.h",
     "src/execution/interrupts-scope.h",
+    "src/execution/isolate-data-fields.h",
     "src/execution/isolate-data.h",
     "src/execution/isolate-inl.h",
     "src/execution/isolate-utils-inl.h",
@@ -3782,11 +4367,13 @@ v8_header_set("v8_internal_headers") {
     "src/extensions/cputracemark-extension.h",
     "src/extensions/externalize-string-extension.h",
     "src/extensions/gc-extension.h",
-    "src/extensions/ignition-statistics-extension.h",
     "src/extensions/statistics-extension.h",
     "src/extensions/trigger-failure-extension.h",
+    "src/flags/save-flags.h",
     "src/handles/global-handles-inl.h",
     "src/handles/global-handles.h",
+    "src/handles/handle-scope-implementer-inl.h",
+    "src/handles/handle-scope-implementer.h",
     "src/handles/handles-inl.h",
     "src/handles/handles.h",
     "src/handles/local-handles-inl.h",
@@ -3801,6 +4388,8 @@ v8_header_set("v8_internal_headers") {
     "src/heap/allocation-result.h",
     "src/heap/allocation-stats.h",
     "src/heap/array-buffer-sweeper.h",
+    "src/heap/base-page-inl.h",
+    "src/heap/base-page.h",
     "src/heap/base-space.h",
     "src/heap/code-range.h",
     "src/heap/code-stats.h",
@@ -3810,7 +4399,6 @@ v8_header_set("v8_internal_headers") {
     "src/heap/conservative-stack-visitor-inl.h",
     "src/heap/conservative-stack-visitor.h",
     "src/heap/cppgc-js/cpp-heap.h",
-    "src/heap/cppgc-js/cpp-marking-state-inl.h",
     "src/heap/cppgc-js/cpp-marking-state.h",
     "src/heap/cppgc-js/cpp-snapshot.h",
     "src/heap/cppgc-js/cross-heap-remembered-set.h",
@@ -3821,7 +4409,6 @@ v8_header_set("v8_internal_headers") {
     "src/heap/ephemeron-remembered-set.h",
     "src/heap/evacuation-allocator-inl.h",
     "src/heap/evacuation-allocator.h",
-    "src/heap/evacuation-verifier-inl.h",
     "src/heap/evacuation-verifier.h",
     "src/heap/factory-base-inl.h",
     "src/heap/factory-base.h",
@@ -3851,8 +4438,8 @@ v8_header_set("v8_internal_headers") {
     "src/heap/incremental-marking-job.h",
     "src/heap/incremental-marking.h",
     "src/heap/index-generator.h",
-    "src/heap/large-page-metadata-inl.h",
-    "src/heap/large-page-metadata.h",
+    "src/heap/large-page-inl.h",
+    "src/heap/large-page.h",
     "src/heap/large-spaces.h",
     "src/heap/linear-allocation-area.h",
     "src/heap/list.h",
@@ -3883,29 +4470,29 @@ v8_header_set("v8_internal_headers") {
     "src/heap/memory-chunk-constants.h",
     "src/heap/memory-chunk-inl.h",
     "src/heap/memory-chunk-layout.h",
-    "src/heap/memory-chunk-metadata-inl.h",
-    "src/heap/memory-chunk-metadata.h",
     "src/heap/memory-chunk.h",
     "src/heap/memory-measurement-inl.h",
     "src/heap/memory-measurement.h",
+    "src/heap/memory-pool.h",
     "src/heap/memory-reducer.h",
     "src/heap/minor-gc-job.h",
     "src/heap/minor-mark-sweep-inl.h",
     "src/heap/minor-mark-sweep.h",
-    "src/heap/mutable-page-metadata-inl.h",
-    "src/heap/mutable-page-metadata.h",
+    "src/heap/mutable-page-inl.h",
+    "src/heap/mutable-page.h",
     "src/heap/new-spaces-inl.h",
     "src/heap/new-spaces.h",
+    "src/heap/normal-page-inl.h",
+    "src/heap/normal-page.h",
     "src/heap/object-lock-inl.h",
     "src/heap/object-lock.h",
     "src/heap/object-stats.h",
-    "src/heap/page-metadata.h",
-    "src/heap/page-pool.h",
     "src/heap/paged-spaces-inl.h",
     "src/heap/paged-spaces.h",
     "src/heap/parallel-work-item.h",
     "src/heap/parked-scope-inl.h",
     "src/heap/parked-scope.h",
+    "src/heap/pending-allocations.h",
     "src/heap/pretenuring-handler-inl.h",
     "src/heap/pretenuring-handler.h",
     "src/heap/read-only-heap-inl.h",
@@ -3915,7 +4502,6 @@ v8_header_set("v8_internal_headers") {
     "src/heap/remembered-set-inl.h",
     "src/heap/remembered-set.h",
     "src/heap/safepoint.h",
-    "src/heap/scavenger-inl.h",
     "src/heap/scavenger.h",
     "src/heap/slot-set.h",
     "src/heap/spaces-inl.h",
@@ -3966,6 +4552,7 @@ v8_header_set("v8_internal_headers") {
     "src/interpreter/interpreter-generator.h",
     "src/interpreter/interpreter-intrinsics.h",
     "src/interpreter/interpreter.h",
+    "src/interpreter/prototype-assignment-sequence-builder.h",
     "src/json/json-parser.h",
     "src/json/json-stringifier.h",
     "src/libsampler/sampler.h",
@@ -3984,9 +4571,11 @@ v8_header_set("v8_internal_headers") {
     "src/numbers/conversions-inl.h",
     "src/numbers/conversions.h",
     "src/numbers/hash-seed-inl.h",
+    "src/numbers/hash-seed.h",
     "src/numbers/ieee754.h",
     "src/numbers/math-random.h",
     "src/objects/all-objects-inl.h",
+    "src/objects/all-objects.h",
     "src/objects/allocation-site-inl.h",
     "src/objects/allocation-site-scopes-inl.h",
     "src/objects/allocation-site-scopes.h",
@@ -4011,7 +4600,6 @@ v8_header_set("v8_internal_headers") {
     "src/objects/compressed-slots.h",
     "src/objects/contexts-inl.h",
     "src/objects/contexts.h",
-    "src/objects/cpp-heap-external-object-inl.h",
     "src/objects/cpp-heap-external-object.h",
     "src/objects/cpp-heap-object-wrapper-inl.h",
     "src/objects/cpp-heap-object-wrapper.h",
@@ -4037,21 +4625,28 @@ v8_header_set("v8_internal_headers") {
     "src/objects/field-index-inl.h",
     "src/objects/field-index.h",
     "src/objects/field-type.h",
+    "src/objects/fixed-array-base-inl.h",
+    "src/objects/fixed-array-base.h",
     "src/objects/fixed-array-inl.h",
     "src/objects/fixed-array.h",
+    "src/objects/fixed-primitive-array-inl.h",
+    "src/objects/fixed-primitive-array.h",
     "src/objects/foreign-inl.h",
     "src/objects/foreign.h",
     "src/objects/free-space-inl.h",
     "src/objects/free-space.h",
     "src/objects/function-kind.h",
     "src/objects/function-syntax-kind.h",
+    "src/objects/hash-seed-wrapper-inl.h",
+    "src/objects/hash-seed-wrapper.h",
     "src/objects/hash-table-inl.h",
     "src/objects/hash-table.h",
     "src/objects/heap-number-inl.h",
     "src/objects/heap-number.h",
+    "src/objects/heap-object-field-inl.h",
     "src/objects/heap-object-inl.h",
+    "src/objects/heap-object-set-map-inl.h",
     "src/objects/heap-object.h",
-    "src/objects/hole-inl.h",
     "src/objects/hole.h",
     "src/objects/instance-type-checker.h",
     "src/objects/instance-type-inl.h",
@@ -4067,12 +4662,16 @@ v8_header_set("v8_internal_headers") {
     "src/objects/js-collection-iterator-inl.h",
     "src/objects/js-collection-iterator.h",
     "src/objects/js-collection.h",
+    "src/objects/js-data-object-builder-inl.h",
+    "src/objects/js-data-object-builder.h",
     "src/objects/js-disposable-stack-inl.h",
     "src/objects/js-disposable-stack.h",
     "src/objects/js-function-inl.h",
     "src/objects/js-function.h",
     "src/objects/js-generator-inl.h",
     "src/objects/js-generator.h",
+    "src/objects/js-interceptor-map-inl.h",
+    "src/objects/js-interceptor-map.h",
     "src/objects/js-iterator-helpers-inl.h",
     "src/objects/js-iterator-helpers.h",
     "src/objects/js-objects-inl.h",
@@ -4091,9 +4690,7 @@ v8_header_set("v8_internal_headers") {
     "src/objects/js-segments.h",
     "src/objects/js-shadow-realm-inl.h",
     "src/objects/js-shadow-realm.h",
-    "src/objects/js-shared-array-inl.h",
     "src/objects/js-shared-array.h",
-    "src/objects/js-struct-inl.h",
     "src/objects/js-struct.h",
     "src/objects/js-temporal-helpers.h",
     "src/objects/js-weak-refs-inl.h",
@@ -4106,9 +4703,12 @@ v8_header_set("v8_internal_headers") {
     "src/objects/lookup-inl.h",
     "src/objects/lookup.h",
     "src/objects/managed-inl.h",
+    "src/objects/managed-type-id.h",
     "src/objects/managed.h",
     "src/objects/map-inl.h",
     "src/objects/map-updater.h",
+    "src/objects/map-word-inl.h",
+    "src/objects/map-word.h",
     "src/objects/map.h",
     "src/objects/maybe-object-inl.h",
     "src/objects/maybe-object.h",
@@ -4120,9 +4720,12 @@ v8_header_set("v8_internal_headers") {
     "src/objects/module.h",
     "src/objects/name-inl.h",
     "src/objects/name.h",
+    "src/objects/object-conversions-inl.h",
     "src/objects/object-list-macros.h",
     "src/objects/object-macros-undef.h",
     "src/objects/object-macros.h",
+    "src/objects/object-predicates-inl.h",
+    "src/objects/object-predicates.h",
     "src/objects/object-type.h",
     "src/objects/objects-body-descriptors-inl.h",
     "src/objects/objects-body-descriptors.h",
@@ -4130,13 +4733,16 @@ v8_header_set("v8_internal_headers") {
     "src/objects/objects-inl.h",
     "src/objects/objects.h",
     "src/objects/oddball-inl.h",
+    "src/objects/oddball-predicates-inl.h",
+    "src/objects/oddball-predicates.h",
     "src/objects/oddball.h",
     "src/objects/off-heap-hash-table-inl.h",
     "src/objects/off-heap-hash-table.h",
     "src/objects/option-utils.h",
     "src/objects/ordered-hash-table-inl.h",
     "src/objects/ordered-hash-table.h",
-    "src/objects/primitive-heap-object-inl.h",
+    "src/objects/pod-array-inl.h",
+    "src/objects/pod-array.h",
     "src/objects/primitive-heap-object.h",
     "src/objects/promise-inl.h",
     "src/objects/promise.h",
@@ -4147,6 +4753,7 @@ v8_header_set("v8_internal_headers") {
     "src/objects/property-descriptor-object-inl.h",
     "src/objects/property-descriptor-object.h",
     "src/objects/property-descriptor.h",
+    "src/objects/property-details-inl.h",
     "src/objects/property-details.h",
     "src/objects/property.h",
     "src/objects/prototype-info-inl.h",
@@ -4166,6 +4773,7 @@ v8_header_set("v8_internal_headers") {
     "src/objects/slots.h",
     "src/objects/smi-inl.h",
     "src/objects/smi.h",
+    "src/objects/sort-state.h",
     "src/objects/source-text-module-inl.h",
     "src/objects/source-text-module.h",
     "src/objects/string-comparator.h",
@@ -4196,12 +4804,12 @@ v8_header_set("v8_internal_headers") {
     "src/objects/template-objects.h",
     "src/objects/templates-inl.h",
     "src/objects/templates.h",
-    "src/objects/torque-defined-classes-inl.h",
-    "src/objects/torque-defined-classes.h",
     "src/objects/transitions-inl.h",
     "src/objects/transitions.h",
     "src/objects/trusted-object-inl.h",
     "src/objects/trusted-object.h",
+    "src/objects/trusted-pointer-inl.h",
+    "src/objects/trusted-pointer.h",
     "src/objects/turbofan-types-inl.h",
     "src/objects/turbofan-types.h",
     "src/objects/turboshaft-types-inl.h",
@@ -4238,7 +4846,6 @@ v8_header_set("v8_internal_headers") {
     "src/profiler/cpu-profiler.h",
     "src/profiler/heap-profiler.h",
     "src/profiler/heap-snapshot-common.h",
-    "src/profiler/heap-snapshot-generator-inl.h",
     "src/profiler/heap-snapshot-generator.h",
     "src/profiler/output-stream-writer.h",
     "src/profiler/profile-generator-inl.h",
@@ -4258,15 +4865,17 @@ v8_header_set("v8_internal_headers") {
     "src/regexp/regexp-ast.h",
     "src/regexp/regexp-bytecode-generator-inl.h",
     "src/regexp/regexp-bytecode-generator.h",
+    "src/regexp/regexp-bytecode-iterator-inl.h",
+    "src/regexp/regexp-bytecode-iterator.h",
     "src/regexp/regexp-bytecode-peephole.h",
+    "src/regexp/regexp-bytecodes-inl.h",
     "src/regexp/regexp-bytecodes.h",
+    "src/regexp/regexp-code-generator.h",
     "src/regexp/regexp-compiler.h",
-    "src/regexp/regexp-dotprinter.h",
     "src/regexp/regexp-error.h",
     "src/regexp/regexp-flags.h",
     "src/regexp/regexp-interpreter.h",
     "src/regexp/regexp-macro-assembler-arch.h",
-    "src/regexp/regexp-macro-assembler-tracer.h",
     "src/regexp/regexp-macro-assembler.h",
     "src/regexp/regexp-nodes.h",
     "src/regexp/regexp-parser.h",
@@ -4277,17 +4886,19 @@ v8_header_set("v8_internal_headers") {
     "src/regexp/special-case.h",
     "src/roots/roots-inl.h",
     "src/roots/roots.h",
+    "src/roots/static-roots-intl-nowasm.h",
+    "src/roots/static-roots-intl-wasm.h",
+    "src/roots/static-roots-nointl-nowasm.h",
+    "src/roots/static-roots-nointl-wasm.h",
     "src/roots/static-roots.h",
     "src/runtime/runtime-utils.h",
     "src/runtime/runtime.h",
     "src/sandbox/bounded-size-inl.h",
     "src/sandbox/bounded-size.h",
+    "src/sandbox/bytecode-verifier.h",
     "src/sandbox/check.h",
     "src/sandbox/code-entrypoint-tag.h",
-    "src/sandbox/code-pointer-inl.h",
-    "src/sandbox/code-pointer-table-inl.h",
-    "src/sandbox/code-pointer-table.h",
-    "src/sandbox/code-pointer.h",
+    "src/sandbox/code-sandboxing-mode.h",
     "src/sandbox/compactible-external-entity-table-inl.h",
     "src/sandbox/compactible-external-entity-table.h",
     "src/sandbox/cppheap-pointer-inl.h",
@@ -4300,6 +4911,7 @@ v8_header_set("v8_internal_headers") {
     "src/sandbox/external-pointer-table-inl.h",
     "src/sandbox/external-pointer-table.h",
     "src/sandbox/external-pointer.h",
+    "src/sandbox/external-strings-cage.h",
     "src/sandbox/hardware-support.h",
     "src/sandbox/indirect-pointer-inl.h",
     "src/sandbox/indirect-pointer-tag.h",
@@ -4308,9 +4920,13 @@ v8_header_set("v8_internal_headers") {
     "src/sandbox/isolate.h",
     "src/sandbox/js-dispatch-table-inl.h",
     "src/sandbox/js-dispatch-table.h",
+    "src/sandbox/sandbox-malloc.h",
     "src/sandbox/sandbox.h",
+    "src/sandbox/sandboxable-thread.h",
     "src/sandbox/sandboxed-pointer-inl.h",
     "src/sandbox/sandboxed-pointer.h",
+    "src/sandbox/segmented-table-inl.h",
+    "src/sandbox/segmented-table.h",
     "src/sandbox/tagged-payload.h",
     "src/sandbox/testing.h",
     "src/sandbox/trusted-pointer-scope.h",
@@ -4343,6 +4959,7 @@ v8_header_set("v8_internal_headers") {
     "src/snapshot/startup-serializer.h",
     "src/strings/char-predicates-inl.h",
     "src/strings/char-predicates.h",
+    "src/strings/owning-external-string-resource.h",
     "src/strings/string-builder-inl.h",
     "src/strings/string-builder.h",
     "src/strings/string-case.h",
@@ -4357,8 +4974,6 @@ v8_header_set("v8_internal_headers") {
     "src/tasks/cancelable-task.h",
     "src/tasks/operations-barrier.h",
     "src/tasks/task-utils.h",
-    "src/temporal/temporal-parser.h",
-    "src/third_party/rapidhash-v8/rapidhash.h",
     "src/torque/runtime-macro-shims.h",
     "src/tracing/trace-event-no-perfetto.h",
     "src/tracing/trace-event.h",
@@ -4384,12 +4999,10 @@ v8_header_set("v8_internal_headers") {
     "src/utils/utils.h",
     "src/utils/version.h",
     "src/zone/accounting-allocator.h",
-    "src/zone/compressed-zone-ptr.h",
     "src/zone/type-stats.h",
     "src/zone/zone-allocator.h",
     "src/zone/zone-chunk-list.h",
     "src/zone/zone-compact-set.h",
-    "src/zone/zone-compression.h",
     "src/zone/zone-containers.h",
     "src/zone/zone-hashmap.h",
     "src/zone/zone-list-inl.h",
@@ -4398,6 +5011,8 @@ v8_header_set("v8_internal_headers") {
     "src/zone/zone-type-traits.h",
     "src/zone/zone-utils.h",
     "src/zone/zone.h",
+    "third_party/rapidhash-v8/rapidhash.h",
+    "third_party/rapidhash-v8/secret.h",
     "third_party/siphash/halfsiphash.h",
     "third_party/utf8-decoder/utf8-decoder.h",
   ]
@@ -4406,10 +5021,22 @@ v8_header_set("v8_internal_headers") {
     sources += [ "src/snapshot/snapshot-compression.h" ]
   }
 
+  if (v8_enable_regexp_diagnostics) {
+    sources += [
+      "src/regexp/regexp-ast-printer.h",
+      "src/regexp/regexp-dotprinter.h",
+      "src/regexp/regexp-graph-printer.h",
+      "src/regexp/regexp-macro-assembler-tracer.h",
+      "src/regexp/regexp-node-printer.h",
+      "src/regexp/regexp-printer.h",
+    ]
+  }
+
   if (v8_enable_temporal_support) {
     sources += [
       "src/objects/js-temporal-objects-inl.h",
       "src/objects/js-temporal-objects.h",
+      "src/objects/js-temporal-zoneinfo64.h",
     ]
   }
 
@@ -4419,6 +5046,7 @@ v8_header_set("v8_internal_headers") {
       "src/tracing/code-data-source.h",
       "src/tracing/code-trace-context.h",
       "src/tracing/perfetto-logger.h",
+      "src/tracing/perfetto-sdk.h",
       "src/tracing/perfetto-utils.h",
     ]
   }
@@ -4434,6 +5062,7 @@ v8_header_set("v8_internal_headers") {
 
   if (v8_enable_maglev) {
     sources += [
+      "src/maglev/hamt.h",
       "src/maglev/maglev-assembler-inl.h",
       "src/maglev/maglev-assembler.h",
       "src/maglev/maglev-basic-block.h",
@@ -4444,25 +5073,42 @@ v8_header_set("v8_internal_headers") {
       "src/maglev/maglev-compilation-unit.h",
       "src/maglev/maglev-compiler.h",
       "src/maglev/maglev-concurrent-dispatcher.h",
+      "src/maglev/maglev-cse.h",
       "src/maglev/maglev-deopt-frame-visitor.h",
       "src/maglev/maglev-graph-builder.h",
       "src/maglev/maglev-graph-labeller.h",
+      "src/maglev/maglev-graph-optimizer.h",
       "src/maglev/maglev-graph-printer.h",
       "src/maglev/maglev-graph-processor.h",
+      "src/maglev/maglev-graph-serializer.h",
       "src/maglev/maglev-graph-verifier.h",
       "src/maglev/maglev-graph.h",
       "src/maglev/maglev-inlining.h",
       "src/maglev/maglev-interpreter-frame-state.h",
       "src/maglev/maglev-ir-inl.h",
       "src/maglev/maglev-ir.h",
+      "src/maglev/maglev-kna-processor.h",
+      "src/maglev/maglev-known-node-aspects.h",
+      "src/maglev/maglev-loop-peeler.h",
+      "src/maglev/maglev-map-inference.h",
+      "src/maglev/maglev-node-type.h",
+      "src/maglev/maglev-phase.h",
       "src/maglev/maglev-phi-representation-selector.h",
       "src/maglev/maglev-pipeline-statistics.h",
       "src/maglev/maglev-post-hoc-optimizations-processors.h",
       "src/maglev/maglev-pre-regalloc-codegen-processors.h",
+      "src/maglev/maglev-range-analysis.h",
+      "src/maglev/maglev-range-verification.h",
+      "src/maglev/maglev-range.h",
+      "src/maglev/maglev-reducer-inl.h",
+      "src/maglev/maglev-reducer.h",
       "src/maglev/maglev-regalloc-data.h",
       "src/maglev/maglev-regalloc.h",
       "src/maglev/maglev-register-frame-array.h",
+      "src/maglev/maglev-tracer.h",
+      "src/maglev/maglev-truncation.h",
       "src/maglev/maglev.h",
+      "src/maglev/turbolev-escape-analysis.h",
     ]
     if (v8_current_cpu == "arm") {
       sources += [ "src/maglev/arm/maglev-assembler-arm-inl.h" ]
@@ -4474,16 +5120,15 @@ v8_header_set("v8_internal_headers") {
       sources += [ "src/maglev/x64/maglev-assembler-x64-inl.h" ]
     } else if (v8_current_cpu == "s390x") {
       sources += [ "src/maglev/s390/maglev-assembler-s390-inl.h" ]
+    } else if (v8_current_cpu == "ppc64") {
+      sources += [ "src/maglev/ppc/maglev-assembler-ppc-inl.h" ]
+    } else if (v8_current_cpu == "loong64") {
+      sources += [ "src/maglev/loong64/maglev-assembler-loong64-inl.h" ]
     }
   }
 
   if (v8_enable_webassembly) {
     sources += [
-      "src/asmjs/asm-js.h",
-      "src/asmjs/asm-names.h",
-      "src/asmjs/asm-parser.h",
-      "src/asmjs/asm-scanner.h",
-      "src/asmjs/asm-types.h",
       "src/compiler/int64-lowering.h",
       "src/compiler/turboshaft/growable-stacks-reducer.h",
       "src/compiler/turboshaft/int64-lowering-phase.h",
@@ -4502,6 +5147,8 @@ v8_header_set("v8_internal_headers") {
       "src/compiler/turboshaft/wasm-shuffle-reducer.h",
       "src/compiler/turboshaft/wasm-simd-phase.h",
       "src/compiler/turboshaft/wasm-turboshaft-compiler.h",
+      "src/compiler/turboshaft/wasm-wrappers-inl.h",
+      "src/compiler/turboshaft/wasm-wrappers.h",
       "src/compiler/wasm-address-reassociation.h",
       "src/compiler/wasm-call-descriptors.h",
       "src/compiler/wasm-compiler-definitions.h",
@@ -4520,6 +5167,7 @@ v8_header_set("v8_internal_headers") {
       "src/wasm/baseline/liftoff-assembler-defs.h",
       "src/wasm/baseline/liftoff-assembler-inl.h",
       "src/wasm/baseline/liftoff-assembler.h",
+      "src/wasm/baseline/liftoff-bailout-reasons.h",
       "src/wasm/baseline/liftoff-compiler.h",
       "src/wasm/baseline/liftoff-register.h",
       "src/wasm/baseline/liftoff-varstate.h",
@@ -4530,10 +5178,11 @@ v8_header_set("v8_internal_headers") {
       "src/wasm/code-space-access.h",
       "src/wasm/compilation-environment-inl.h",
       "src/wasm/compilation-environment.h",
+      "src/wasm/compilation-hints-generation.h",
       "src/wasm/constant-expression-interface.h",
       "src/wasm/constant-expression.h",
       "src/wasm/decoder.h",
-      "src/wasm/float16.h",
+      "src/wasm/effect-handler.h",
       "src/wasm/function-body-decoder-impl.h",
       "src/wasm/function-body-decoder.h",
       "src/wasm/function-compiler.h",
@@ -4542,22 +5191,20 @@ v8_header_set("v8_internal_headers") {
       "src/wasm/jump-table-assembler.h",
       "src/wasm/leb-helper.h",
       "src/wasm/local-decl-encoder.h",
-      "src/wasm/memory-tracing.h",
       "src/wasm/module-compiler.h",
       "src/wasm/module-decoder-impl.h",
       "src/wasm/module-decoder.h",
       "src/wasm/module-instantiate.h",
       "src/wasm/names-provider.h",
-      "src/wasm/object-access.h",
       "src/wasm/pgo.h",
       "src/wasm/signature-hashing.h",
-      "src/wasm/simd-shuffle.h",
       "src/wasm/stacks.h",
       "src/wasm/std-object-sizes.h",
       "src/wasm/streaming-decoder.h",
       "src/wasm/string-builder-multiline.h",
       "src/wasm/string-builder.h",
       "src/wasm/struct-types.h",
+      "src/wasm/turboshaft-graph-interface-inl.h",
       "src/wasm/turboshaft-graph-interface.h",
       "src/wasm/value-type.h",
       "src/wasm/wasm-arguments.h",
@@ -4570,15 +5217,16 @@ v8_header_set("v8_internal_headers") {
       "src/wasm/wasm-deopt-data.h",
       "src/wasm/wasm-disassembler-impl.h",
       "src/wasm/wasm-disassembler.h",
+      "src/wasm/wasm-engine-globals.h",
       "src/wasm/wasm-engine.h",
       "src/wasm/wasm-export-wrapper-cache.h",
       "src/wasm/wasm-external-refs.h",
-      "src/wasm/wasm-feature-flags.h",
       "src/wasm/wasm-features.h",
       "src/wasm/wasm-import-wrapper-cache.h",
       "src/wasm/wasm-init-expr.h",
       "src/wasm/wasm-js.h",
       "src/wasm/wasm-linkage.h",
+      "src/wasm/wasm-memory-map-descriptor.h",
       "src/wasm/wasm-module-builder.h",
       "src/wasm/wasm-module-sourcemap.h",
       "src/wasm/wasm-module.h",
@@ -4588,9 +5236,13 @@ v8_header_set("v8_internal_headers") {
       "src/wasm/wasm-opcodes.h",
       "src/wasm/wasm-result.h",
       "src/wasm/wasm-serialization.h",
+      "src/wasm/wasm-stack-wrapper-cache.h",
       "src/wasm/wasm-subtyping.h",
       "src/wasm/wasm-tier.h",
+      "src/wasm/wasm-tracing.h",
       "src/wasm/wasm-value.h",
+      "src/wasm/wasm-wrapper-cache-inl.h",
+      "src/wasm/wasm-wrapper-cache.h",
       "src/wasm/well-known-imports.h",
       "third_party/utf8-decoder/generalized-utf8-decoder.h",
     ]
@@ -4599,7 +5251,6 @@ v8_header_set("v8_internal_headers") {
       sources += [
         "src/wasm/interpreter/instruction-handlers.h",
         "src/wasm/interpreter/wasm-interpreter-inl.h",
-        "src/wasm/interpreter/wasm-interpreter-objects-inl.h",
         "src/wasm/interpreter/wasm-interpreter-objects.h",
         "src/wasm/interpreter/wasm-interpreter-runtime-inl.h",
         "src/wasm/interpreter/wasm-interpreter-runtime.h",
@@ -4610,11 +5261,13 @@ v8_header_set("v8_internal_headers") {
 
   if (v8_enable_wasm_simd256_revec) {
     sources += [
-      "src/compiler/linear-scheduler.h",
-      "src/compiler/revectorizer.h",
       "src/compiler/turboshaft/wasm-revec-phase.h",
       "src/compiler/turboshaft/wasm-revec-reducer.h",
     ]
+  }
+
+  if (v8_enable_builtins_block_position) {
+    sources += [ "src/compiler/backend/block-position.h" ]
   }
 
   if (v8_enable_i18n_support) {
@@ -4764,6 +5417,7 @@ v8_header_set("v8_internal_headers") {
       ### gcmole(arm64) ###
       "src/codegen/arm64/assembler-arm64-inl.h",
       "src/codegen/arm64/assembler-arm64.h",
+      "src/codegen/arm64/constant-pool-arm64.h",
       "src/codegen/arm64/constants-arm64.h",
       "src/codegen/arm64/decoder-arm64-inl.h",
       "src/codegen/arm64/decoder-arm64.h",
@@ -4867,6 +5521,7 @@ v8_header_set("v8_internal_headers") {
       ### gcmole(ppc64) ###
       "src/codegen/ppc/assembler-ppc-inl.h",
       "src/codegen/ppc/assembler-ppc.h",
+      "src/codegen/ppc/constant-pool-ppc.h",
       "src/codegen/ppc/constants-ppc.h",
       "src/codegen/ppc/interface-descriptors-ppc-inl.h",
       "src/codegen/ppc/macro-assembler-ppc.h",
@@ -4918,6 +5573,7 @@ v8_header_set("v8_internal_headers") {
       "src/codegen/riscv/base-assembler-riscv.h",
       "src/codegen/riscv/base-constants-riscv.h",
       "src/codegen/riscv/base-riscv-i.h",
+      "src/codegen/riscv/constant-pool-riscv.h",
       "src/codegen/riscv/constant-riscv-a.h",
       "src/codegen/riscv/constant-riscv-b.h",
       "src/codegen/riscv/constant-riscv-c.h",
@@ -4925,6 +5581,7 @@ v8_header_set("v8_internal_headers") {
       "src/codegen/riscv/constant-riscv-f.h",
       "src/codegen/riscv/constant-riscv-m.h",
       "src/codegen/riscv/constant-riscv-v.h",
+      "src/codegen/riscv/constant-riscv-zfa.h",
       "src/codegen/riscv/constant-riscv-zicond.h",
       "src/codegen/riscv/constant-riscv-zicsr.h",
       "src/codegen/riscv/constant-riscv-zifencei.h",
@@ -4937,9 +5594,11 @@ v8_header_set("v8_internal_headers") {
       "src/codegen/riscv/extension-riscv-inl.h",
       "src/codegen/riscv/extension-riscv-m.h",
       "src/codegen/riscv/extension-riscv-v.h",
+      "src/codegen/riscv/extension-riscv-zfa.h",
       "src/codegen/riscv/extension-riscv-zicond.h",
       "src/codegen/riscv/extension-riscv-zicsr.h",
       "src/codegen/riscv/extension-riscv-zifencei.h",
+      "src/codegen/riscv/extension-riscv-zimop.h",
       "src/codegen/riscv/interface-descriptors-riscv-inl.h",
       "src/codegen/riscv/macro-assembler-riscv.h",
       "src/codegen/riscv/register-riscv.h",
@@ -4956,6 +5615,11 @@ v8_header_set("v8_internal_headers") {
         "src/baseline/riscv/baseline-compiler-riscv-inl.h",
       ]
     }
+
+    if (riscv_use_zicfiss) {
+      sources += [ "src/execution/riscv/shadow-stack-riscv.h" ]
+    }
+
     if (v8_enable_webassembly) {
       # Trap handling is enabled on riscv64 Linux and in simulators on
       # x64 on Linux.
@@ -4983,6 +5647,8 @@ v8_header_set("v8_internal_headers") {
       "src/codegen/riscv/constant-riscv-i.h",
       "src/codegen/riscv/constant-riscv-m.h",
       "src/codegen/riscv/constant-riscv-v.h",
+      "src/codegen/riscv/constant-riscv-zfa.h",
+      "src/codegen/riscv/constant-riscv-zicond.h",
       "src/codegen/riscv/constant-riscv-zicsr.h",
       "src/codegen/riscv/constant-riscv-zifencei.h",
       "src/codegen/riscv/constants-riscv.h",
@@ -4994,8 +5660,10 @@ v8_header_set("v8_internal_headers") {
       "src/codegen/riscv/extension-riscv-inl.h",
       "src/codegen/riscv/extension-riscv-m.h",
       "src/codegen/riscv/extension-riscv-v.h",
+      "src/codegen/riscv/extension-riscv-zfa.h",
       "src/codegen/riscv/extension-riscv-zicsr.h",
       "src/codegen/riscv/extension-riscv-zifencei.h",
+      "src/codegen/riscv/extension-riscv-zimop.h",
       "src/codegen/riscv/interface-descriptors-riscv-inl.h",
       "src/codegen/riscv/macro-assembler-riscv.h",
       "src/codegen/riscv/register-riscv.h",
@@ -5028,8 +5696,13 @@ v8_header_set("v8_internal_headers") {
     ":v8_headers",
     ":v8_maybe_icu",
     ":v8_shared_internal_headers",
+    ":v8_simdutf",
     "//third_party/fp16",
   ]
+
+  if (v8_enable_partition_alloc) {
+    public_deps += [ "//third_party/partition_alloc" ]
+  }
 
   deps = [
     ":cppgc_headers",
@@ -5039,8 +5712,13 @@ v8_header_set("v8_internal_headers") {
     ":v8_heap_base_headers",
     ":v8_libbase",
     ":v8_maybe_temporal",
-    "//third_party/simdutf:simdutf",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    deps += [ ":run_torque_to_tsa" ]
+  }
+  if (v8_use_metagen_instance_types) {
+    deps += [ ":metagen_instance_types_h" ]
+  }
 }
 
 v8_compiler_sources = [
@@ -5060,8 +5738,9 @@ v8_compiler_sources = [
   "src/compiler/backend/move-optimizer.cc",
   "src/compiler/backend/register-allocator-verifier.cc",
   "src/compiler/backend/register-allocator.cc",
+  "src/compiler/backend/simd-shuffle.cc",
   "src/compiler/backend/spill-placer.cc",
-  "src/compiler/basic-block-instrumentor.cc",
+  "src/compiler/basic-block-call-graph-profiler.cc",
   "src/compiler/branch-elimination.cc",
   "src/compiler/bytecode-analysis.cc",
   "src/compiler/bytecode-graph-builder.cc",
@@ -5072,6 +5751,7 @@ v8_compiler_sources = [
   "src/compiler/common-node-cache.cc",
   "src/compiler/common-operator-reducer.cc",
   "src/compiler/common-operator.cc",
+  "src/compiler/common-utils.cc",
   "src/compiler/compilation-dependencies.cc",
   "src/compiler/compiler-source-position-table.cc",
   "src/compiler/constant-folding-reducer.cc",
@@ -5102,7 +5782,6 @@ v8_compiler_sources = [
   "src/compiler/js-type-hint-lowering.cc",
   "src/compiler/js-typed-lowering.cc",
   "src/compiler/late-escape-analysis.cc",
-  "src/compiler/linkage.cc",
   "src/compiler/load-elimination.cc",
   "src/compiler/loop-analysis.cc",
   "src/compiler/loop-peeling.cc",
@@ -5126,7 +5805,6 @@ v8_compiler_sources = [
   "src/compiler/operator-properties.cc",
   "src/compiler/operator.cc",
   "src/compiler/osr.cc",
-  "src/compiler/pair-load-store-reducer.cc",
   "src/compiler/pipeline-statistics.cc",
   "src/compiler/pipeline.cc",
   "src/compiler/property-access-builder.cc",
@@ -5142,7 +5820,6 @@ v8_compiler_sources = [
   "src/compiler/simplified-operator-reducer.cc",
   "src/compiler/simplified-operator.cc",
   "src/compiler/state-values-utils.cc",
-  "src/compiler/string-builder-optimizer.cc",
   "src/compiler/turbofan-enabled.cc",
   "src/compiler/turbofan-graph-visualizer.cc",
   "src/compiler/turbofan-graph.cc",
@@ -5170,22 +5847,25 @@ v8_compiler_sources = [
   "src/compiler/turboshaft/instruction-selection-phase.cc",
   "src/compiler/turboshaft/late-escape-analysis-reducer.cc",
   "src/compiler/turboshaft/late-load-elimination-reducer.cc",
+  "src/compiler/turboshaft/load-elimination-phase.cc",
   "src/compiler/turboshaft/loop-finder.cc",
+  "src/compiler/turboshaft/loop-optimization-phase.cc",
   "src/compiler/turboshaft/loop-peeling-phase.cc",
   "src/compiler/turboshaft/loop-unrolling-phase.cc",
   "src/compiler/turboshaft/loop-unrolling-reducer.cc",
   "src/compiler/turboshaft/machine-lowering-phase.cc",
+  "src/compiler/turboshaft/memory-optimization-phase.cc",
   "src/compiler/turboshaft/memory-optimization-reducer.cc",
   "src/compiler/turboshaft/operations.cc",
-  "src/compiler/turboshaft/optimize-phase.cc",
   "src/compiler/turboshaft/phase.cc",
   "src/compiler/turboshaft/pipelines.cc",
   "src/compiler/turboshaft/pretenuring-propagation-reducer.cc",
+  "src/compiler/turboshaft/random-rescheduling-phase.cc",
   "src/compiler/turboshaft/representations.cc",
   "src/compiler/turboshaft/sidetable.cc",
   "src/compiler/turboshaft/simplify-tf-loops.cc",
-  "src/compiler/turboshaft/store-store-elimination-phase.cc",
   "src/compiler/turboshaft/string-escape-analysis-reducer.cc",
+  "src/compiler/turboshaft/turbolev-frontend-pipeline.cc",
   "src/compiler/turboshaft/turbolev-graph-builder.cc",
   "src/compiler/turboshaft/type-assertions-phase.cc",
   "src/compiler/turboshaft/type-parser.cc",
@@ -5208,10 +5888,23 @@ if (!v8_enable_maglev) {
     "src/maglev/maglev-compilation-info.cc",
     "src/maglev/maglev-compilation-unit.cc",
     "src/maglev/maglev-graph-builder.cc",
+    "src/maglev/maglev-graph-labeller.cc",
+    "src/maglev/maglev-graph-optimizer.cc",
     "src/maglev/maglev-graph-printer.cc",
+    "src/maglev/maglev-graph-serializer.cc",
+    "src/maglev/maglev-graph.cc",
+    "src/maglev/maglev-inlining.cc",
     "src/maglev/maglev-interpreter-frame-state.cc",
     "src/maglev/maglev-ir.cc",
+    "src/maglev/maglev-kna-processor.cc",
+    "src/maglev/maglev-known-node-aspects.cc",
+    "src/maglev/maglev-loop-peeler.cc",
+    "src/maglev/maglev-node-type.cc",
     "src/maglev/maglev-phi-representation-selector.cc",
+    "src/maglev/maglev-range-verification.cc",
+    "src/maglev/maglev-truncation.cc",
+    "src/maglev/turbolev-escape-analysis.cc",
+    "src/maglev/turbolev-escape-analysis.h",
   ]
 }
 
@@ -5296,18 +5989,20 @@ if (v8_enable_webassembly) {
   v8_compiler_sources += [
     "src/compiler/int64-lowering.cc",
     "src/compiler/turboshaft/int64-lowering-phase.cc",
+    "src/compiler/turboshaft/wasm-dead-code-elimination-phase.cc",
     "src/compiler/turboshaft/wasm-debug-memory-lowering-phase.cc",
     "src/compiler/turboshaft/wasm-gc-optimize-phase.cc",
     "src/compiler/turboshaft/wasm-gc-typed-optimization-reducer.cc",
     "src/compiler/turboshaft/wasm-in-js-inlining-phase.cc",
+    "src/compiler/turboshaft/wasm-load-elimination-reducer.cc",
     "src/compiler/turboshaft/wasm-lowering-phase.cc",
     "src/compiler/turboshaft/wasm-optimize-phase.cc",
     "src/compiler/turboshaft/wasm-shuffle-reducer.cc",
     "src/compiler/turboshaft/wasm-simd-phase.cc",
     "src/compiler/turboshaft/wasm-turboshaft-compiler.cc",
+    "src/compiler/turboshaft/wasm-wrappers.cc",
     "src/compiler/wasm-address-reassociation.cc",
     "src/compiler/wasm-call-descriptors.cc",
-    "src/compiler/wasm-compiler-definitions.cc",
     "src/compiler/wasm-compiler.cc",
     "src/compiler/wasm-escape-analysis.cc",
     "src/compiler/wasm-gc-lowering.cc",
@@ -5316,16 +6011,28 @@ if (v8_enable_webassembly) {
     "src/compiler/wasm-inlining-into-js.cc",
     "src/compiler/wasm-load-elimination.cc",
     "src/compiler/wasm-typer.cc",
+    "src/wasm/turboshaft-graph-interface.cc",
   ]
 }
 
 if (v8_enable_wasm_simd256_revec) {
   v8_compiler_sources += [
-    "src/compiler/linear-scheduler.cc",
-    "src/compiler/revectorizer.cc",
     "src/compiler/turboshaft/wasm-revec-phase.cc",
     "src/compiler/turboshaft/wasm-revec-reducer.cc",
   ]
+}
+
+exclude_from_compiler_cluster = [
+  "src/compiler/turboshaft/turbolev-graph-builder.cc",  # Slow.
+  "src/compiler/turboshaft/wasm-turboshaft-compiler.cc",  # Pipeline::GenerateWasmCode.
+  "src/compiler/bytecode-analysis.cc",  # Top-level 'using incl.
+                                        # 'interpreter::Register'.
+  "src/compiler/heap-refs.cc",  # Is64() function.
+  "src/compiler/wasm-load-elimination.cc",  # MayAlias.
+]
+
+if (v8_enable_builtins_block_position) {
+  v8_compiler_sources += [ "src/compiler/backend/block-position.cc" ]
 }
 
 # The src/compiler files for use in mksnapshot.
@@ -5333,10 +6040,12 @@ if (v8_enable_wasm_simd256_revec) {
 #   v8_enable_fast_mksnapshot is set.
 # - We always include Turbofan even if v8_enable_turbofan is unset s.t.
 #   builtins can be generated by mksnapshot.
-v8_source_set("v8_compiler_for_mksnapshot_source_set") {
+v8_cluster_source_set("v8_compiler_for_mksnapshot_source_set") {
   visibility = [ ":*" ]  # Only targets in this file can depend on this.
 
   sources = v8_compiler_sources
+
+  exclude_from_cluster = exclude_from_compiler_cluster
 
   public_deps = [
     ":generate_bytecode_builtins_list",
@@ -5345,6 +6054,9 @@ v8_source_set("v8_compiler_for_mksnapshot_source_set") {
     ":v8_maybe_icu",
     ":v8_tracing",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    public_deps += [ ":run_torque_to_tsa" ]
+  }
 
   deps = [
     ":v8_base_without_compiler",
@@ -5367,7 +6079,7 @@ v8_source_set("v8_compiler_for_mksnapshot_source_set") {
 }
 
 # The src/compiler files with default behavior.
-v8_source_set("v8_compiler") {
+v8_cluster_source_set("v8_compiler") {
   visibility = [ ":*" ]  # Only targets in this file can depend on this.
 
   if (v8_enable_turbofan) {
@@ -5377,6 +6089,8 @@ v8_source_set("v8_compiler") {
     sources = [ "src/compiler/turbofan-disabled.cc" ]
   }
 
+  exclude_from_cluster = exclude_from_compiler_cluster
+
   public_deps = [
     ":generate_bytecode_builtins_list",
     ":run_torque",
@@ -5385,6 +6099,9 @@ v8_source_set("v8_compiler") {
     ":v8_maybe_icu",
     ":v8_tracing",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    public_deps += [ ":run_torque_to_tsa" ]
+  }
 
   deps = [
     ":v8_base_without_compiler",
@@ -5422,7 +6139,7 @@ group("v8_tracing") {
   }
 }
 
-v8_source_set("v8_base_without_compiler") {
+v8_cluster_source_set("v8_base_without_compiler") {
   # Only targets in this file and gcmole can depend on this.
   visibility = [
     ":*",
@@ -5431,6 +6148,24 @@ v8_source_set("v8_base_without_compiler") {
 
   # Split static libraries on windows into two.
   split_count = 2
+
+  # Files excluded from clustering due to template instantiation order issues
+  # or because they are too large.
+  exclude_from_cluster = [
+    "src/maglev/maglev-graph-builder.cc",
+    "src/maglev/maglev-ir.cc",
+    "src/snapshot/deserializer.cc",
+    "src/wasm/wasm-module.cc",
+    "src/heap/mark-compact.cc",  # ShouldMovePage, also big.
+    "src/objects/intl-objects.cc",  # CheckCalendar.
+    "src/objects/js-collator.cc",  # CreateDataPropertyForOptions, also big.
+    "src/objects/js-display-names.cc",  # CheckCalendar.
+    "src/objects/js-list-format.cc",
+    "src/objects/js-number-format.cc",  # Style, also big.
+    "src/objects/js-temporal-objects.cc",  # Unit, also big.
+    "src/runtime/runtime-test-wasm.cc",  # WasmStackSize.
+    "src/sandbox/external-pointer-table.cc",  # entry_spacer.
+  ]
 
   sources = [
     ### gcmole(all) ###
@@ -5469,6 +6204,8 @@ v8_source_set("v8_base_without_compiler") {
     "src/builtins/builtins-internal.cc",
     "src/builtins/builtins-intl.cc",
     "src/builtins/builtins-json.cc",
+    "src/builtins/builtins-math-xsum.cc",
+    "src/builtins/builtins-math.cc",
     "src/builtins/builtins-number.cc",
     "src/builtins/builtins-object.cc",
     "src/builtins/builtins-reflect.cc",
@@ -5493,7 +6230,6 @@ v8_source_set("v8_base_without_compiler") {
     "src/codegen/code-reference.cc",
     "src/codegen/compilation-cache.cc",
     "src/codegen/compiler.cc",
-    "src/codegen/constant-pool.cc",
     "src/codegen/external-reference-encoder.cc",
     "src/codegen/external-reference-table.cc",
     "src/codegen/external-reference.cc",
@@ -5517,8 +6253,10 @@ v8_source_set("v8_base_without_compiler") {
     "src/common/assert-scope.cc",
     "src/common/code-memory-access.cc",
     "src/common/ptr-compr.cc",
+    "src/common/synchronization-point-support.cc",
     "src/compiler-dispatcher/lazy-compile-dispatcher.cc",
     "src/compiler-dispatcher/optimizing-compile-dispatcher.cc",
+    "src/compiler/linkage.cc",
     "src/date/date.cc",
     "src/date/dateparser.cc",
     "src/debug/debug-coverage.cc",
@@ -5526,12 +6264,11 @@ v8_source_set("v8_base_without_compiler") {
     "src/debug/debug-frames.cc",
     "src/debug/debug-interface.cc",
     "src/debug/debug-property-iterator.cc",
+    "src/debug/debug-scope-info.cc",
     "src/debug/debug-scope-iterator.cc",
     "src/debug/debug-scopes.cc",
     "src/debug/debug-stack-trace-iterator.cc",
     "src/debug/debug.cc",
-    "src/debug/liveedit-diff.cc",
-    "src/debug/liveedit.cc",
     "src/deoptimizer/deoptimize-reason.cc",
     "src/deoptimizer/deoptimized-frame-info.cc",
     "src/deoptimizer/deoptimizer.cc",
@@ -5569,11 +6306,12 @@ v8_source_set("v8_base_without_compiler") {
     "src/extensions/cputracemark-extension.cc",
     "src/extensions/externalize-string-extension.cc",
     "src/extensions/gc-extension.cc",
-    "src/extensions/ignition-statistics-extension.cc",
     "src/extensions/statistics-extension.cc",
     "src/extensions/trigger-failure-extension.cc",
     "src/flags/flags.cc",
+    "src/flags/save-flags.cc",
     "src/handles/global-handles.cc",
+    "src/handles/handle-scope-implementer.cc",
     "src/handles/handles.cc",
     "src/handles/local-handles.cc",
     "src/handles/persistent-handles.cc",
@@ -5581,6 +6319,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/handles/traced-handles.cc",
     "src/heap/allocation-observer.cc",
     "src/heap/array-buffer-sweeper.cc",
+    "src/heap/base-page.cc",
     "src/heap/code-range.cc",
     "src/heap/code-stats.cc",
     "src/heap/collection-barrier.cc",
@@ -5611,7 +6350,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/heap/incremental-marking-job.cc",
     "src/heap/incremental-marking.cc",
     "src/heap/index-generator.cc",
-    "src/heap/large-page-metadata.cc",
+    "src/heap/large-page.cc",
     "src/heap/large-spaces.cc",
     "src/heap/local-factory.cc",
     "src/heap/local-heap.cc",
@@ -5623,18 +6362,18 @@ v8_source_set("v8_base_without_compiler") {
     "src/heap/marking.cc",
     "src/heap/memory-allocator.cc",
     "src/heap/memory-balancer.cc",
-    "src/heap/memory-chunk-metadata.cc",
     "src/heap/memory-chunk.cc",
     "src/heap/memory-measurement.cc",
+    "src/heap/memory-pool.cc",
     "src/heap/memory-reducer.cc",
     "src/heap/minor-gc-job.cc",
     "src/heap/minor-mark-sweep.cc",
-    "src/heap/mutable-page-metadata.cc",
+    "src/heap/mutable-page.cc",
     "src/heap/new-spaces.cc",
+    "src/heap/normal-page.cc",
     "src/heap/object-stats.cc",
-    "src/heap/page-metadata.cc",
-    "src/heap/page-pool.cc",
     "src/heap/paged-spaces.cc",
+    "src/heap/pending-allocations.cc",
     "src/heap/pretenuring-handler.cc",
     "src/heap/read-only-heap.cc",
     "src/heap/read-only-promotion.cc",
@@ -5679,6 +6418,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/interpreter/handler-table-builder.cc",
     "src/interpreter/interpreter-intrinsics.cc",
     "src/interpreter/interpreter.cc",
+    "src/interpreter/prototype-assignment-sequence-builder.cc",
     "src/json/json-parser.cc",
     "src/json/json-stringifier.cc",
     "src/libsampler/sampler.cc",
@@ -5690,6 +6430,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/logging/runtime-call-stats.cc",
     "src/logging/tracing-flags.cc",
     "src/numbers/conversions.cc",
+    "src/numbers/hash-seed.cc",
     "src/numbers/ieee754.cc",
     "src/numbers/math-random.cc",
     "src/objects/abstract-code.cc",
@@ -5707,6 +6448,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/objects/elements-kind.cc",
     "src/objects/elements.cc",
     "src/objects/embedder-data-array.cc",
+    "src/objects/feedback-transition-table.cc",
     "src/objects/feedback-vector.cc",
     "src/objects/field-type.cc",
     "src/objects/fixed-array.cc",
@@ -5716,6 +6458,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/objects/js-atomics-synchronization.cc",
     "src/objects/js-break-iterator.cc",
     "src/objects/js-collator.cc",
+    "src/objects/js-data-object-builder.cc",
     "src/objects/js-date-time-format.cc",
     "src/objects/js-display-names.cc",
     "src/objects/js-disposable-stack.cc",
@@ -5752,6 +6495,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/objects/property.cc",
     "src/objects/regexp-match-info.cc",
     "src/objects/scope-info.cc",
+    "src/objects/script.cc",
     "src/objects/shared-function-info.cc",
     "src/objects/simd.cc",
     "src/objects/source-text-module.cc",
@@ -5787,6 +6531,7 @@ v8_source_set("v8_base_without_compiler") {
     "src/profiler/cpu-profiler.cc",
     "src/profiler/heap-profiler.cc",
     "src/profiler/heap-snapshot-generator.cc",
+    "src/profiler/output-stream-writer.cc",
     "src/profiler/profile-generator.cc",
     "src/profiler/profiler-listener.cc",
     "src/profiler/profiler-stats.cc",
@@ -5802,14 +6547,14 @@ v8_source_set("v8_base_without_compiler") {
     "src/regexp/experimental/experimental.cc",
     "src/regexp/regexp-ast.cc",
     "src/regexp/regexp-bytecode-generator.cc",
+    "src/regexp/regexp-bytecode-iterator.cc",
     "src/regexp/regexp-bytecode-peephole.cc",
     "src/regexp/regexp-bytecodes.cc",
+    "src/regexp/regexp-code-generator.cc",
     "src/regexp/regexp-compiler-tonode.cc",
     "src/regexp/regexp-compiler.cc",
-    "src/regexp/regexp-dotprinter.cc",
     "src/regexp/regexp-error.cc",
     "src/regexp/regexp-interpreter.cc",
-    "src/regexp/regexp-macro-assembler-tracer.cc",
     "src/regexp/regexp-macro-assembler.cc",
     "src/regexp/regexp-parser.cc",
     "src/regexp/regexp-result-vector.cc",
@@ -5846,16 +6591,19 @@ v8_source_set("v8_base_without_compiler") {
     "src/runtime/runtime-test.cc",
     "src/runtime/runtime-trace.cc",
     "src/runtime/runtime-typedarray.cc",
-    "src/runtime/runtime-utils.cc",
     "src/runtime/runtime-weak-refs.cc",
     "src/runtime/runtime.cc",
-    "src/sandbox/code-pointer-table.cc",
+    "src/sandbox/bytecode-verifier.cc",
     "src/sandbox/cppheap-pointer-table.cc",
     "src/sandbox/external-pointer-table.cc",
+    "src/sandbox/external-strings-cage.cc",
     "src/sandbox/hardware-support.cc",
     "src/sandbox/js-dispatch-table.cc",
     "src/sandbox/sandbox.cc",
+    "src/sandbox/sandboxable-thread.cc",
+    "src/sandbox/segmented-table.cc",
     "src/sandbox/testing.cc",
+    "src/sandbox/trap-fuzzer.cc",
     "src/sandbox/trusted-pointer-scope.cc",
     "src/sandbox/trusted-pointer-table.cc",
     "src/snapshot/code-serializer.cc",
@@ -5889,7 +6637,6 @@ v8_source_set("v8_base_without_compiler") {
     "src/tasks/cancelable-task.cc",
     "src/tasks/operations-barrier.cc",
     "src/tasks/task-utils.cc",
-    "src/temporal/temporal-parser.cc",
     "src/tracing/trace-event.cc",
     "src/tracing/traced-value.cc",
     "src/tracing/tracing-category-observer.cc",
@@ -5899,7 +6646,6 @@ v8_source_set("v8_base_without_compiler") {
     "src/utils/detachable-vector.cc",
     "src/utils/hex-format.cc",
     "src/utils/identity-map.cc",
-    "src/utils/memcopy.cc",
     "src/utils/ostreams.cc",
     "src/utils/output-stream.cc",
     "src/utils/sha-256.cc",
@@ -5916,10 +6662,22 @@ v8_source_set("v8_base_without_compiler") {
     sources += [ "src/snapshot/snapshot-compression.cc" ]
   }
 
+  if (v8_enable_regexp_diagnostics) {
+    sources += [
+      "src/regexp/regexp-ast-printer.cc",
+      "src/regexp/regexp-dotprinter.cc",
+      "src/regexp/regexp-graph-printer.cc",
+      "src/regexp/regexp-macro-assembler-tracer.cc",
+      "src/regexp/regexp-node-printer.cc",
+      "src/regexp/regexp-printer.cc",
+    ]
+  }
+
   if (v8_enable_temporal_support) {
     sources += [
       "src/builtins/builtins-temporal.cc",
       "src/objects/js-temporal-objects.cc",
+      "src/objects/js-temporal-zoneinfo64.cc",
     ]
   }
 
@@ -5939,13 +6697,25 @@ v8_source_set("v8_base_without_compiler") {
       "src/maglev/maglev-compiler.cc",
       "src/maglev/maglev-concurrent-dispatcher.cc",
       "src/maglev/maglev-graph-builder.cc",
+      "src/maglev/maglev-graph-labeller.cc",
+      "src/maglev/maglev-graph-optimizer.cc",
       "src/maglev/maglev-graph-printer.cc",
+      "src/maglev/maglev-graph-serializer.cc",
+      "src/maglev/maglev-graph.cc",
+      "src/maglev/maglev-inlining.cc",
       "src/maglev/maglev-interpreter-frame-state.cc",
       "src/maglev/maglev-ir.cc",
+      "src/maglev/maglev-kna-processor.cc",
+      "src/maglev/maglev-known-node-aspects.cc",
+      "src/maglev/maglev-loop-peeler.cc",
+      "src/maglev/maglev-node-type.cc",
       "src/maglev/maglev-phi-representation-selector.cc",
       "src/maglev/maglev-pipeline-statistics.cc",
+      "src/maglev/maglev-range-verification.cc",
       "src/maglev/maglev-regalloc.cc",
+      "src/maglev/maglev-truncation.cc",
       "src/maglev/maglev.cc",
+      "src/maglev/turbolev-escape-analysis.cc",
     ]
     if (v8_current_cpu == "arm") {
       sources += [
@@ -5972,6 +6742,16 @@ v8_source_set("v8_base_without_compiler") {
         "src/maglev/s390/maglev-assembler-s390.cc",
         "src/maglev/s390/maglev-ir-s390.cc",
       ]
+    } else if (v8_current_cpu == "ppc64") {
+      sources += [
+        "src/maglev/ppc/maglev-assembler-ppc.cc",
+        "src/maglev/ppc/maglev-ir-ppc.cc",
+      ]
+    } else if (v8_current_cpu == "loong64") {
+      sources += [
+        "src/maglev/loong64/maglev-assembler-loong64.cc",
+        "src/maglev/loong64/maglev-ir-loong64.cc",
+      ]
     }
   }
 
@@ -5986,11 +6766,7 @@ v8_source_set("v8_base_without_compiler") {
   if (v8_enable_webassembly) {
     sources += [
       ### gcmole(all) ###
-      "src/asmjs/asm-js.cc",
-      "src/asmjs/asm-parser.cc",
-      "src/asmjs/asm-scanner.cc",
-      "src/asmjs/asm-types.cc",
-      "src/compiler/turboshaft/wasm-dead-code-elimination-phase.cc",
+      "src/compiler/wasm-compiler-definitions.cc",
       "src/debug/debug-wasm-objects.cc",
       "src/runtime/runtime-test-wasm.cc",
       "src/runtime/runtime-wasm.cc",
@@ -6003,6 +6779,7 @@ v8_source_set("v8_base_without_compiler") {
       "src/wasm/basic-block-calculator.cc",
       "src/wasm/canonical-types.cc",
       "src/wasm/code-space-access.cc",
+      "src/wasm/compilation-hints-generation.cc",
       "src/wasm/constant-expression-interface.cc",
       "src/wasm/constant-expression.cc",
       "src/wasm/function-body-decoder.cc",
@@ -6014,11 +6791,8 @@ v8_source_set("v8_base_without_compiler") {
       "src/wasm/module-instantiate.cc",
       "src/wasm/names-provider.cc",
       "src/wasm/pgo.cc",
-      "src/wasm/simd-shuffle.cc",
       "src/wasm/stacks.cc",
       "src/wasm/streaming-decoder.cc",
-      "src/wasm/sync-streaming-decoder.cc",
-      "src/wasm/turboshaft-graph-interface.cc",
       "src/wasm/value-type.cc",
       "src/wasm/wasm-code-manager.cc",
       "src/wasm/wasm-code-pointer-table.cc",
@@ -6031,6 +6805,7 @@ v8_source_set("v8_base_without_compiler") {
       "src/wasm/wasm-features.cc",
       "src/wasm/wasm-import-wrapper-cache.cc",
       "src/wasm/wasm-js.cc",
+      "src/wasm/wasm-memory-map-descriptor.cc",
       "src/wasm/wasm-module-builder.cc",
       "src/wasm/wasm-module-sourcemap.cc",
       "src/wasm/wasm-module.cc",
@@ -6038,9 +6813,11 @@ v8_source_set("v8_base_without_compiler") {
       "src/wasm/wasm-opcodes.cc",
       "src/wasm/wasm-result.cc",
       "src/wasm/wasm-serialization.cc",
+      "src/wasm/wasm-stack-wrapper-cache.cc",
       "src/wasm/wasm-subtyping.cc",
+      "src/wasm/wasm-tracing.cc",
+      "src/wasm/wasm-wrapper-cache.cc",
       "src/wasm/well-known-imports.cc",
-      "src/wasm/wrappers.cc",
     ]
     if (v8_wasm_random_fuzzers) {
       sources += [
@@ -6143,6 +6920,7 @@ v8_source_set("v8_base_without_compiler") {
     sources += [
       ### gcmole(arm64) ###
       "src/codegen/arm64/assembler-arm64.cc",
+      "src/codegen/arm64/constant-pool-arm64.cc",
       "src/codegen/arm64/cpu-arm64.cc",
       "src/codegen/arm64/decoder-arm64.cc",
       "src/codegen/arm64/instructions-arm64-constants.cc",
@@ -6230,6 +7008,7 @@ v8_source_set("v8_base_without_compiler") {
     sources += [
       ### gcmole(ppc64) ###
       "src/codegen/ppc/assembler-ppc.cc",
+      "src/codegen/ppc/constant-pool-ppc.cc",
       "src/codegen/ppc/constants-ppc.cc",
       "src/codegen/ppc/cpu-ppc.cc",
       "src/codegen/ppc/macro-assembler-ppc.cc",
@@ -6263,6 +7042,7 @@ v8_source_set("v8_base_without_compiler") {
       "src/codegen/riscv/base-assembler-riscv.cc",
       "src/codegen/riscv/base-constants-riscv.cc",
       "src/codegen/riscv/base-riscv-i.cc",
+      "src/codegen/riscv/constant-pool-riscv.cc",
       "src/codegen/riscv/cpu-riscv.cc",
       "src/codegen/riscv/extension-riscv-a.cc",
       "src/codegen/riscv/extension-riscv-b.cc",
@@ -6271,10 +7051,12 @@ v8_source_set("v8_base_without_compiler") {
       "src/codegen/riscv/extension-riscv-f.cc",
       "src/codegen/riscv/extension-riscv-m.cc",
       "src/codegen/riscv/extension-riscv-v.cc",
+      "src/codegen/riscv/extension-riscv-zfa.cc",
       "src/codegen/riscv/extension-riscv-zfh.cc",
       "src/codegen/riscv/extension-riscv-zicond.cc",
       "src/codegen/riscv/extension-riscv-zicsr.cc",
       "src/codegen/riscv/extension-riscv-zifencei.cc",
+      "src/codegen/riscv/extension-riscv-zimop.cc",
       "src/codegen/riscv/macro-assembler-riscv.cc",
       "src/deoptimizer/riscv/deoptimizer-riscv.cc",
       "src/diagnostics/riscv/disasm-riscv.cc",
@@ -6296,6 +7078,9 @@ v8_source_set("v8_base_without_compiler") {
       if (current_cpu == "x64" && is_linux) {
         sources += [ "src/trap-handler/handler-outside-simulator.cc" ]
       }
+      if (riscv_use_zicfiss) {
+        sources += [ "src/execution/riscv/shadow-stack-riscv.cc" ]
+      }
     }
   } else if (v8_current_cpu == "riscv32") {
     sources += [
@@ -6304,6 +7089,7 @@ v8_source_set("v8_base_without_compiler") {
       "src/codegen/riscv/base-assembler-riscv.cc",
       "src/codegen/riscv/base-constants-riscv.cc",
       "src/codegen/riscv/base-riscv-i.cc",
+      "src/codegen/riscv/constant-pool-riscv.cc",
       "src/codegen/riscv/cpu-riscv.cc",
       "src/codegen/riscv/extension-riscv-a.cc",
       "src/codegen/riscv/extension-riscv-b.cc",
@@ -6312,10 +7098,12 @@ v8_source_set("v8_base_without_compiler") {
       "src/codegen/riscv/extension-riscv-f.cc",
       "src/codegen/riscv/extension-riscv-m.cc",
       "src/codegen/riscv/extension-riscv-v.cc",
+      "src/codegen/riscv/extension-riscv-zfa.cc",
       "src/codegen/riscv/extension-riscv-zfh.cc",
       "src/codegen/riscv/extension-riscv-zicond.cc",
       "src/codegen/riscv/extension-riscv-zicsr.cc",
       "src/codegen/riscv/extension-riscv-zifencei.cc",
+      "src/codegen/riscv/extension-riscv-zimop.cc",
       "src/codegen/riscv/macro-assembler-riscv.cc",
       "src/deoptimizer/riscv/deoptimizer-riscv.cc",
       "src/diagnostics/riscv/disasm-riscv.cc",
@@ -6361,11 +7149,25 @@ v8_source_set("v8_base_without_compiler") {
     ":v8_shared_internal_headers",
     ":v8_tracing",
     ":v8_version",
-    "src/inspector:inspector",
+    "src/inspector",
     "//third_party/dragonbox",
     "//third_party/fast_float",
     "//third_party/highway:libhwy",
   ]
+
+  if (v8_enable_generated_code_validator) {
+    sources += [
+      "src/sandbox/generated-code-validator.cc",
+      "src/sandbox/generated-code-validator.h",
+    ]
+    if (v8_current_cpu == "x64") {
+      deps += [ "//third_party/fadec" ]
+      sources += [ "src/sandbox/generated-code-validator-x64.cc" ]
+    } else if (v8_current_cpu == "arm64") {
+      deps += [ "//third_party/disarm" ]
+      sources += [ "src/sandbox/generated-code-validator-arm64.cc" ]
+    }
+  }
 
   public_deps = [
     ":cppgc_base",
@@ -6375,15 +7177,26 @@ v8_source_set("v8_base_without_compiler") {
     ":v8_headers",
     ":v8_internal_headers",
     ":v8_maybe_icu",
-    "//third_party/simdutf:simdutf",
+    ":v8_simdutf",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    public_deps += [ ":run_torque_to_tsa" ]
+  }
 
   if (v8_fuzzilli) {
     sources += [
-      "src/fuzzilli/cov.cc",
-      "src/fuzzilli/cov.h",
       "src/fuzzilli/fuzzilli.cc",
       "src/fuzzilli/fuzzilli.h",
+    ]
+    public_deps += [ ":fuzzilli_cov" ]
+  }
+
+  if (v8_dumpling) {
+    sources += [
+      "src/dumpling/dumpling-manager.cc",
+      "src/dumpling/dumpling-manager.h",
+      "src/dumpling/object-dumping.cc",
+      "src/dumpling/object-dumping.h",
     ]
   }
 
@@ -6420,6 +7233,14 @@ v8_source_set("v8_base_without_compiler") {
       "$v8_zlib_path",
       "$v8_zlib_path/google:compression_utils_portable",
     ]
+  }
+
+  # In i18n mode, we can use ICU4C to load ICU4C's builtin zoneinfo64.res data
+  # In non-i18n mode, we need to copy that into the binary
+  if (v8_enable_temporal_support && !v8_enable_i18n_support) {
+    sources +=
+        [ "$target_gen_dir/src/builtins/builtins-temporal-zoneinfo64-data.cc" ]
+    deps += [ ":make_temporal_zoneinfo_cpp" ]
   }
 
   if (v8_postmortem_support) {
@@ -6513,10 +7334,15 @@ v8_source_set("torque_base") {
     "src/torque/utils.h",
   ]
 
-  deps = [
-    ":v8_flags",
-    ":v8_shared_internal_headers",
-  ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    sources += [
+      "src/torque/ast-visitor.h",
+      "src/torque/tsa-generator.cc",
+      "src/torque/tsa-generator.h",
+    ]
+  }
+
+  deps = [ ":v8_shared_internal_headers" ]
 
   public_deps = [
     ":v8_config_headers",
@@ -6580,6 +7406,7 @@ v8_component("v8_libbase") {
     "src/base/abort-mode.cc",
     "src/base/abort-mode.h",
     "src/base/address-region.h",
+    "src/base/algorithm.h",
     "src/base/atomic-utils.h",
     "src/base/atomicops.h",
     "src/base/base-export.h",
@@ -6594,8 +7421,8 @@ v8_component("v8_libbase") {
     "src/base/compiler-specific.h",
     "src/base/container-utils.h",
     "src/base/contextual.h",
-    "src/base/cpu.cc",
-    "src/base/cpu.h",
+    "src/base/cpu/cpu.cc",
+    "src/base/cpu/cpu.h",
     "src/base/debug/stack_trace.cc",
     "src/base/debug/stack_trace.h",
     "src/base/discriminated-union.h",
@@ -6609,9 +7436,12 @@ v8_component("v8_libbase") {
     "src/base/file-utils.cc",
     "src/base/file-utils.h",
     "src/base/flags.h",
+    "src/base/float16.h",
     "src/base/fpu.cc",
     "src/base/fpu.h",
     "src/base/free_deleter.h",
+    "src/base/functional/bind-internal.h",
+    "src/base/functional/function-ref.h",
     "src/base/hashing.h",
     "src/base/hashmap-entry.h",
     "src/base/hashmap.h",
@@ -6624,6 +7454,7 @@ v8_component("v8_libbase") {
     "src/base/logging.cc",
     "src/base/logging.h",
     "src/base/macros.h",
+    "src/base/memcopy.h",
     "src/base/memory.h",
     "src/base/numbers/bignum-dtoa.cc",
     "src/base/numbers/bignum-dtoa.h",
@@ -6710,6 +7541,7 @@ v8_component("v8_libbase") {
     "src/base/template-utils.h",
     "src/base/threaded-list.h",
     "src/base/timezone-cache.h",
+    "src/base/types/is-instantiation.h",
     "src/base/utils/random-number-generator.cc",
     "src/base/utils/random-number-generator.h",
     "src/base/vector.h",
@@ -6720,15 +7552,38 @@ v8_component("v8_libbase") {
     "src/base/vlq-base64.cc",
     "src/base/vlq-base64.h",
     "src/base/vlq.h",
+    "third_party/rapidhash-v8/rapidhash.h",
+    "third_party/rapidhash-v8/secret.h",
   ]
+
+  if (target_cpu == "x86" || target_cpu == "x64") {
+    sources += [ "src/base/cpu/cpu-x86.cc" ]
+  } else if (target_cpu == "arm" || target_cpu == "arm64") {
+    sources += [ "src/base/cpu/cpu-arm.cc" ]
+  } else if (target_cpu == "riscv64") {
+    sources += [ "src/base/cpu/cpu-riscv.cc" ]
+  } else if (target_cpu == "loong64") {
+    sources += [ "src/base/cpu/cpu-loong64.cc" ]
+  } else if (target_cpu == "mips64" || target_cpu == "mips64el") {
+    sources += [ "src/base/cpu/cpu-mips64.cc" ]
+  } else if (target_cpu == "ppc64") {
+    sources += [ "src/base/cpu/cpu-ppc.cc" ]
+  } else if (target_cpu == "s390x") {
+    sources += [ "src/base/cpu/cpu-s390.cc" ]
+  }
 
   configs = [ ":internal_config_base" ]
 
   public_configs = [ ":libbase_config" ]
+  v8_add_configs += [ "//build/config/compiler:thinlto_optimize_max" ]
+  v8_remove_configs += [ "//build/config/compiler:thinlto_optimize_default" ]
 
   deps = [ ":v8_config_headers" ]
 
-  public_deps = [ ":v8_abseil" ]
+  public_deps = [
+    ":v8_abseil",
+    "//build:buildflag_header_h",
+  ]
 
   if (current_os == "zos") {
     public_configs += [ ":zoslib_config" ]
@@ -6842,6 +7697,10 @@ v8_component("v8_libbase") {
       libs += [ "advapi32.lib" ]  # Needed for TraceLoggingProvider.h
     }
 
+    # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
+    # enable the diagnostic by removing this line.
+    configs += [ "//build/config/compiler:no_exit_time_destructors" ]
+
     data_deps += [ "//build/win:runtime_libs" ]
   } else if (current_os == "zos") {
     sources += [
@@ -6883,33 +7742,9 @@ v8_component("v8_libbase") {
     }
   }
 
-  if (v8_use_libm_trig_functions) {
-    deps += [ ":libm" ]
-  }
+  deps += [ "//third_party/llvm-libc:headers" ]
 
   # TODO(infra): Add support for qnx, freebsd, openbsd, netbsd, and solaris.
-}
-
-if (v8_use_libm_trig_functions) {
-  source_set("libm") {
-    sources = [
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/branred.c",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/branred.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/dla.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/endian.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/mydefs.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/s_sin.c",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/sincostab.c",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/trig.h",
-      "third_party/glibc/src/sysdeps/ieee754/dbl-64/usncs.h",
-    ]
-    configs += [ "//build/config/compiler:no_chromium_code" ]
-    configs -= [ "//build/config/compiler:chromium_code" ]
-    if (!is_debug) {
-      # Build code using -O3, see: crbug.com/1084371.
-      configs += [ "//build/config/compiler:optimize_speed" ]
-    }
-  }
 }
 
 v8_component("v8_libplatform") {
@@ -6944,6 +7779,8 @@ v8_component("v8_libplatform") {
   ]
 
   configs = [ ":internal_config_base" ]
+  v8_add_configs += [ "//build/config/compiler:thinlto_optimize_max" ]
+  v8_remove_configs += [ "//build/config/compiler:thinlto_optimize_default" ]
 
   if (is_component_build) {
     defines = [ "BUILDING_V8_PLATFORM_SHARED" ]
@@ -6958,6 +7795,10 @@ v8_component("v8_libplatform") {
     ":v8_libbase",
     ":v8_tracing",
   ]
+
+  if (v8_enable_partition_alloc) {
+    deps += [ "//third_party/partition_alloc" ]
+  }
 
   if (v8_use_perfetto) {
     sources -= [
@@ -7004,26 +7845,26 @@ v8_source_set("fuzzer_support") {
     ":v8_maybe_icu",
   ]
   deps = [ ":v8_maybe_temporal" ]
+
+  # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
+  # enable the diagnostic by removing this line.
+  configs += [ "//build/config/compiler:no_exit_time_destructors" ]
 }
 
 v8_source_set("v8_bigint") {
   sources = [
+    "src/bigint/bigint-inl.h",
     "src/bigint/bigint-internal.cc",
     "src/bigint/bigint-internal.h",
     "src/bigint/bigint.h",
-    "src/bigint/bitwise.cc",
-    "src/bigint/digit-arithmetic.h",
     "src/bigint/div-burnikel.cc",
-    "src/bigint/div-helpers.cc",
-    "src/bigint/div-helpers.h",
+    "src/bigint/div-helpers-inl.h",
     "src/bigint/div-schoolbook.cc",
     "src/bigint/fromstring.cc",
     "src/bigint/mul-karatsuba.cc",
-    "src/bigint/mul-schoolbook.cc",
     "src/bigint/tostring.cc",
     "src/bigint/util.h",
-    "src/bigint/vector-arithmetic.cc",
-    "src/bigint/vector-arithmetic.h",
+    "src/bigint/vector-arithmetic-inl.h",
   ]
 
   if (v8_advanced_bigint_algorithms) {
@@ -7046,6 +7887,7 @@ v8_header_set("v8_heap_base_headers") {
     "src/heap/base/incremental-marking-schedule.h",
     "src/heap/base/memory-tagging.h",
     "src/heap/base/stack.h",
+    "src/heap/base/unsafe-json-emitter.h",
     "src/heap/base/worklist.h",
   ]
 
@@ -7060,6 +7902,7 @@ v8_source_set("v8_heap_base") {
     "src/heap/base/incremental-marking-schedule.cc",
     "src/heap/base/memory-tagging.cc",
     "src/heap/base/stack.cc",
+    "src/heap/base/unsafe-json-emitter.cc",
     "src/heap/base/worklist.cc",
   ]
 
@@ -7172,111 +8015,115 @@ v8_header_set("cppgc_headers") {
   public_deps = [ ":v8_config_headers" ]
 }
 
-v8_source_set("cppgc_base") {
+v8_cluster_source_set("cppgc_base") {
   visibility = [ ":*" ]
 
   sources = [
-    "src/heap/cppgc/allocation.cc",
-    "src/heap/cppgc/compaction-worklists.cc",
-    "src/heap/cppgc/compaction-worklists.h",
-    "src/heap/cppgc/compactor.cc",
-    "src/heap/cppgc/compactor.h",
-    "src/heap/cppgc/concurrent-marker.cc",
-    "src/heap/cppgc/concurrent-marker.h",
-    "src/heap/cppgc/explicit-management.cc",
-    "src/heap/cppgc/free-list.cc",
-    "src/heap/cppgc/free-list.h",
-    "src/heap/cppgc/garbage-collector.h",
-    "src/heap/cppgc/gc-info-table.cc",
-    "src/heap/cppgc/gc-info-table.h",
-    "src/heap/cppgc/gc-info.cc",
-    "src/heap/cppgc/gc-invoker.cc",
-    "src/heap/cppgc/gc-invoker.h",
-    "src/heap/cppgc/globals.h",
-    "src/heap/cppgc/heap-base.cc",
-    "src/heap/cppgc/heap-base.h",
-    "src/heap/cppgc/heap-config.h",
-    "src/heap/cppgc/heap-consistency.cc",
-    "src/heap/cppgc/heap-growing.cc",
-    "src/heap/cppgc/heap-growing.h",
-    "src/heap/cppgc/heap-object-header.cc",
-    "src/heap/cppgc/heap-object-header.h",
-    "src/heap/cppgc/heap-page.cc",
-    "src/heap/cppgc/heap-page.h",
-    "src/heap/cppgc/heap-space.cc",
-    "src/heap/cppgc/heap-space.h",
-    "src/heap/cppgc/heap-state.cc",
-    "src/heap/cppgc/heap-statistics-collector.cc",
-    "src/heap/cppgc/heap-statistics-collector.h",
-    "src/heap/cppgc/heap-visitor.h",
-    "src/heap/cppgc/heap.cc",
-    "src/heap/cppgc/heap.h",
-    "src/heap/cppgc/liveness-broker.cc",
-    "src/heap/cppgc/liveness-broker.h",
-    "src/heap/cppgc/logging.cc",
-    "src/heap/cppgc/marker.cc",
-    "src/heap/cppgc/marker.h",
-    "src/heap/cppgc/marking-state.cc",
-    "src/heap/cppgc/marking-state.h",
-    "src/heap/cppgc/marking-verifier.cc",
-    "src/heap/cppgc/marking-verifier.h",
-    "src/heap/cppgc/marking-visitor.cc",
-    "src/heap/cppgc/marking-visitor.h",
-    "src/heap/cppgc/marking-worklists.cc",
-    "src/heap/cppgc/marking-worklists.h",
-    "src/heap/cppgc/member-storage.cc",
-    "src/heap/cppgc/member-storage.h",
-    "src/heap/cppgc/memory.cc",
-    "src/heap/cppgc/memory.h",
-    "src/heap/cppgc/metric-recorder.h",
-    "src/heap/cppgc/name-trait.cc",
-    "src/heap/cppgc/object-allocator.cc",
-    "src/heap/cppgc/object-allocator.h",
-    "src/heap/cppgc/object-poisoner.h",
-    "src/heap/cppgc/object-size-trait.cc",
-    "src/heap/cppgc/object-start-bitmap.h",
-    "src/heap/cppgc/object-view.h",
-    "src/heap/cppgc/page-memory.cc",
-    "src/heap/cppgc/page-memory.h",
-    "src/heap/cppgc/persistent-node.cc",
-    "src/heap/cppgc/platform.cc",
-    "src/heap/cppgc/platform.h",
-    "src/heap/cppgc/pointer-policies.cc",
-    "src/heap/cppgc/prefinalizer-handler.cc",
-    "src/heap/cppgc/prefinalizer-handler.h",
-    "src/heap/cppgc/process-heap-statistics.cc",
-    "src/heap/cppgc/process-heap-statistics.h",
-    "src/heap/cppgc/process-heap.cc",
-    "src/heap/cppgc/process-heap.h",
-    "src/heap/cppgc/raw-heap.cc",
-    "src/heap/cppgc/raw-heap.h",
-    "src/heap/cppgc/remembered-set.cc",
-    "src/heap/cppgc/remembered-set.h",
-    "src/heap/cppgc/stats-collector.cc",
-    "src/heap/cppgc/stats-collector.h",
-    "src/heap/cppgc/sweeper.cc",
-    "src/heap/cppgc/sweeper.h",
-    "src/heap/cppgc/task-handle.h",
-    "src/heap/cppgc/unmarker.h",
+    "src/heap/cppgc-internal/allocation.cc",
+    "src/heap/cppgc-internal/compaction-worklists.cc",
+    "src/heap/cppgc-internal/compaction-worklists.h",
+    "src/heap/cppgc-internal/compactor.cc",
+    "src/heap/cppgc-internal/compactor.h",
+    "src/heap/cppgc-internal/concurrent-marker.cc",
+    "src/heap/cppgc-internal/concurrent-marker.h",
+    "src/heap/cppgc-internal/explicit-management.cc",
+    "src/heap/cppgc-internal/free-list.cc",
+    "src/heap/cppgc-internal/free-list.h",
+    "src/heap/cppgc-internal/garbage-collector.h",
+    "src/heap/cppgc-internal/gc-info-table.cc",
+    "src/heap/cppgc-internal/gc-info-table.h",
+    "src/heap/cppgc-internal/gc-info.cc",
+    "src/heap/cppgc-internal/gc-invoker.cc",
+    "src/heap/cppgc-internal/gc-invoker.h",
+    "src/heap/cppgc-internal/globals.h",
+    "src/heap/cppgc-internal/heap-base.cc",
+    "src/heap/cppgc-internal/heap-base.h",
+    "src/heap/cppgc-internal/heap-config.h",
+    "src/heap/cppgc-internal/heap-consistency.cc",
+    "src/heap/cppgc-internal/heap-growing.cc",
+    "src/heap/cppgc-internal/heap-growing.h",
+    "src/heap/cppgc-internal/heap-object-header.cc",
+    "src/heap/cppgc-internal/heap-object-header.h",
+    "src/heap/cppgc-internal/heap-page.cc",
+    "src/heap/cppgc-internal/heap-page.h",
+    "src/heap/cppgc-internal/heap-space.cc",
+    "src/heap/cppgc-internal/heap-space.h",
+    "src/heap/cppgc-internal/heap-state.cc",
+    "src/heap/cppgc-internal/heap-statistics-collector.cc",
+    "src/heap/cppgc-internal/heap-statistics-collector.h",
+    "src/heap/cppgc-internal/heap-visitor.h",
+    "src/heap/cppgc-internal/heap.cc",
+    "src/heap/cppgc-internal/heap.h",
+    "src/heap/cppgc-internal/liveness-broker.cc",
+    "src/heap/cppgc-internal/liveness-broker.h",
+    "src/heap/cppgc-internal/logging.cc",
+    "src/heap/cppgc-internal/marker.cc",
+    "src/heap/cppgc-internal/marker.h",
+    "src/heap/cppgc-internal/marking-state.cc",
+    "src/heap/cppgc-internal/marking-state.h",
+    "src/heap/cppgc-internal/marking-verifier.cc",
+    "src/heap/cppgc-internal/marking-verifier.h",
+    "src/heap/cppgc-internal/marking-visitor.cc",
+    "src/heap/cppgc-internal/marking-visitor.h",
+    "src/heap/cppgc-internal/marking-worklists.cc",
+    "src/heap/cppgc-internal/marking-worklists.h",
+    "src/heap/cppgc-internal/member-storage.cc",
+    "src/heap/cppgc-internal/member-storage.h",
+    "src/heap/cppgc-internal/memory.cc",
+    "src/heap/cppgc-internal/memory.h",
+    "src/heap/cppgc-internal/metric-recorder.h",
+    "src/heap/cppgc-internal/name-trait.cc",
+    "src/heap/cppgc-internal/object-allocator.cc",
+    "src/heap/cppgc-internal/object-allocator.h",
+    "src/heap/cppgc-internal/object-poisoner.h",
+    "src/heap/cppgc-internal/object-size-trait.cc",
+    "src/heap/cppgc-internal/object-start-bitmap.h",
+    "src/heap/cppgc-internal/object-view.h",
+    "src/heap/cppgc-internal/page-memory.cc",
+    "src/heap/cppgc-internal/page-memory.h",
+    "src/heap/cppgc-internal/persistent-node.cc",
+    "src/heap/cppgc-internal/platform.cc",
+    "src/heap/cppgc-internal/platform.h",
+    "src/heap/cppgc-internal/pointer-policies.cc",
+    "src/heap/cppgc-internal/prefinalizer-handler.cc",
+    "src/heap/cppgc-internal/prefinalizer-handler.h",
+    "src/heap/cppgc-internal/process-heap-statistics.cc",
+    "src/heap/cppgc-internal/process-heap-statistics.h",
+    "src/heap/cppgc-internal/process-heap.cc",
+    "src/heap/cppgc-internal/process-heap.h",
+    "src/heap/cppgc-internal/raw-heap.cc",
+    "src/heap/cppgc-internal/raw-heap.h",
+    "src/heap/cppgc-internal/remembered-set.cc",
+    "src/heap/cppgc-internal/remembered-set.h",
+    "src/heap/cppgc-internal/stats-collector.cc",
+    "src/heap/cppgc-internal/stats-collector.h",
+    "src/heap/cppgc-internal/sweeper.cc",
+    "src/heap/cppgc-internal/sweeper.h",
+    "src/heap/cppgc-internal/task-handle.h",
+    "src/heap/cppgc-internal/unmarker.h",
 
     # TODO(v8:11952): Remove the testing header here once depending on both,
     # //v8:v8 and //v8:v8_for_testing does not result in ODR violations.
-    "src/heap/cppgc/testing.cc",
-    "src/heap/cppgc/trace-event.h",
-    "src/heap/cppgc/trace-trait.cc",
-    "src/heap/cppgc/virtual-memory.cc",
-    "src/heap/cppgc/virtual-memory.h",
-    "src/heap/cppgc/visitor.cc",
-    "src/heap/cppgc/visitor.h",
-    "src/heap/cppgc/write-barrier.cc",
-    "src/heap/cppgc/write-barrier.h",
+    "src/heap/cppgc-internal/testing.cc",
+    "src/heap/cppgc-internal/trace-event.h",
+    "src/heap/cppgc-internal/trace-trait.cc",
+    "src/heap/cppgc-internal/virtual-memory.cc",
+    "src/heap/cppgc-internal/virtual-memory.h",
+    "src/heap/cppgc-internal/visitor.cc",
+    "src/heap/cppgc-internal/visitor.h",
+    "src/heap/cppgc-internal/write-barrier.cc",
+    "src/heap/cppgc-internal/write-barrier.h",
+  ]
+
+  exclude_from_cluster = [
+    "src/heap/cppgc-internal/concurrent-marker.cc",  # kDefaultDeadlineCheckInterval.
   ]
 
   if (cppgc_enable_caged_heap) {
     sources += [
-      "src/heap/cppgc/caged-heap-local-data.cc",
-      "src/heap/cppgc/caged-heap.cc",
-      "src/heap/cppgc/caged-heap.h",
+      "src/heap/cppgc-internal/caged-heap-local-data.cc",
+      "src/heap/cppgc-internal/caged-heap.cc",
+      "src/heap/cppgc-internal/caged-heap.h",
     ]
   }
 
@@ -7300,6 +8147,7 @@ v8_source_set("cppgc_base") {
 
   if (v8_use_perfetto) {
     sources += [
+      "src/tracing/perfetto-sdk.h",
       "src/tracing/trace-categories.cc",
       "src/tracing/trace-categories.h",
     ]
@@ -7310,6 +8158,7 @@ if (v8_check_header_includes) {
   # This file will be generated by tools/generate-header-include-checks.py
   # if the "check_v8_header_includes" gclient variable is set.
   import("check-header-includes/sources.gni")
+
   v8_source_set("check_headers") {
     configs = [ ":internal_config" ]
     sources = check_header_includes_sources
@@ -7332,7 +8181,7 @@ if (v8_check_header_includes) {
       ":v8_maybe_temporal",
       ":v8_version",
       ":wee8",
-      "src/inspector:inspector",
+      "src/inspector",
       "src/inspector:inspector_string_conversions",
     ]
   }
@@ -7349,6 +8198,7 @@ if (v8_monolithic) {
   # Using external startup data would produce separate files.
   assert(!v8_use_external_startup_data,
          "Set `v8_use_external_startup_data = false` for v8_monolithic.")
+
   v8_static_library("v8_monolith") {
     deps = [
       ":v8",
@@ -7474,7 +8324,7 @@ if (current_toolchain == v8_snapshot_toolchain) {
       ldflags = [ "/OPT:NOICF" ]  # link.exe, but also lld-link.exe.
     } else if (is_apple && !use_lld) {
       ldflags = [ "-Wl,-no_deduplicate" ]  # ld64.
-    } else if (use_lld) {
+    } else if (use_lld || linker_path != "") {
       ldflags = [ "-Wl,--icf=none" ]
     }
   }
@@ -7613,7 +8463,70 @@ group("gn_all") {
 }
 
 group("v8_python_base") {
-  data = [ ".vpython3" ]
+  data = [
+    "vpython.toml",
+    "vpython.toml.uv.lock",
+  ]
+}
+
+# Enable fallbacks for files that might be hard to access on Clusterfuzz.
+copy("v8_clusterfuzz_fallbacks") {
+  testonly = true
+  sources = [ "test/mjsunit/wasm/wasm-module-builder.js" ]
+  outputs = [ "$root_out_dir/test/mjsunit/wasm/wasm-module-builder.js" ]
+}
+
+if (!build_with_chromium && !build_with_v8_embedder && !build_with_node) {
+  copy("v8_clusterfuzz_test262_fallbacks") {
+    testonly = true
+    sources = [
+      "test/test262/data/harness/assert.js",
+      "test/test262/data/harness/assertRelativeDateMs.js",
+      "test/test262/data/harness/asyncHelpers.js",
+      "test/test262/data/harness/atomicsHelper.js",
+      "test/test262/data/harness/byteConversionValues.js",
+      "test/test262/data/harness/compareArray.js",
+      "test/test262/data/harness/compareIterator.js",
+      "test/test262/data/harness/dateConstants.js",
+      "test/test262/data/harness/decimalToHexString.js",
+      "test/test262/data/harness/deepEqual.js",
+      "test/test262/data/harness/detachArrayBuffer.js",
+      "test/test262/data/harness/doneprintHandle.js",
+      "test/test262/data/harness/fnGlobalObject.js",
+      "test/test262/data/harness/isConstructor.js",
+      "test/test262/data/harness/iteratorZipUtils.js",
+      "test/test262/data/harness/nans.js",
+      "test/test262/data/harness/nativeErrors.js",
+      "test/test262/data/harness/nativeFunctionMatcher.js",
+      "test/test262/data/harness/promiseHelper.js",
+      "test/test262/data/harness/propertyHelper.js",
+      "test/test262/data/harness/proxyTrapsHelper.js",
+      "test/test262/data/harness/regExpUtils.js",
+      "test/test262/data/harness/resizableArrayBufferUtils.js",
+      "test/test262/data/harness/sm/assertThrowsValue.js",
+      "test/test262/data/harness/sm/non262-Date-shell.js",
+      "test/test262/data/harness/sm/non262-JSON-shell.js",
+      "test/test262/data/harness/sm/non262-Math-shell.js",
+      "test/test262/data/harness/sm/non262-Reflect-shell.js",
+      "test/test262/data/harness/sm/non262-Set-shell.js",
+      "test/test262/data/harness/sm/non262-Temporal-PlainMonthDay-shell.js",
+      "test/test262/data/harness/sm/non262-TypedArray-shell.js",
+      "test/test262/data/harness/sm/non262-expressions-shell.js",
+      "test/test262/data/harness/sm/non262-generators-shell.js",
+      "test/test262/data/harness/sm/non262-strict-shell.js",
+      "test/test262/data/harness/sta.js",
+      "test/test262/data/harness/tcoHelper.js",
+      "test/test262/data/harness/temporalHelpers.js",
+      "test/test262/data/harness/testAtomics.js",
+      "test/test262/data/harness/testIntl.js",
+      "test/test262/data/harness/testIntlNumberFormat.js",
+      "test/test262/data/harness/testTypedArray.js",
+      "test/test262/data/harness/typeCoercion.js",
+      "test/test262/data/harness/wellKnownIntrinsicObjects.js",
+    ]
+    outputs =
+        [ "$root_out_dir/{{source_root_relative_dir}}/{{source_file_part}}" ]
+  }
 }
 
 group("v8_clusterfuzz") {
@@ -7621,9 +8534,13 @@ group("v8_clusterfuzz") {
 
   deps = [
     ":d8",
+    ":v8_clusterfuzz_fallbacks",
     ":v8_simple_inspector_fuzzer",
     "tools/clusterfuzz/trials:v8_clusterfuzz_resources",
   ]
+  if (!build_with_chromium && !build_with_v8_embedder && !build_with_node) {
+    deps += [ ":v8_clusterfuzz_test262_fallbacks" ]
+  }
 
   if (v8_multi_arch_build) {
     deps += [
@@ -7651,7 +8568,7 @@ group("v8_archive") {
 
   if (!is_win) {
     # On windows, cctest doesn't link with v8_static_library.
-    deps += [ "test/cctest:cctest" ]
+    deps += [ "test/cctest" ]
   }
 }
 
@@ -7693,14 +8610,19 @@ group("v8_fuzzers") {
   if (v8_enable_webassembly) {
     if (v8_wasm_random_fuzzers) {
       data_deps += [
-        ":v8_simple_wasm_compile_all_fuzzer",
         ":v8_simple_wasm_compile_fuzzer",
         ":v8_simple_wasm_compile_revec_fuzzer",
         ":v8_simple_wasm_compile_simd_fuzzer",
-        ":v8_simple_wasm_compile_wasmgc_fuzzer",
-        ":v8_simple_wasm_deopt_fuzzer",
         ":v8_simple_wasm_init_expr_fuzzer",
       ]
+
+      if (!v8_disable_write_barriers) {
+        data_deps += [
+          ":v8_simple_wasm_compile_all_fuzzer",
+          ":v8_simple_wasm_compile_wasmgc_fuzzer",
+          ":v8_simple_wasm_deopt_fuzzer",
+        ]
+      }
     }
     data_deps += [
       ":v8_simple_multi_return_fuzzer",
@@ -7713,6 +8635,7 @@ group("v8_fuzzers") {
       data_deps += [
         ":v8_simple_wasm_fast_interpreter_fuzzer",
         ":v8_simple_wasm_interpreter_all_fuzzer",
+        ":v8_simple_wasm_interpreter_all_multiple_modules_fuzzer",
         ":v8_simple_wasm_interpreter_base_fuzzer",
         ":v8_simple_wasm_interpreter_code_fuzzer",
         ":v8_simple_wasm_interpreter_diff_fuzzer",
@@ -7734,6 +8657,8 @@ if (is_component_build) {
     ]
 
     configs = [ ":internal_config" ]
+    v8_add_configs += [ "//build/config/compiler:thinlto_optimize_max" ]
+    v8_remove_configs += [ "//build/config/compiler:thinlto_optimize_default" ]
 
     public_configs = [ ":external_config" ]
   }
@@ -7860,6 +8785,10 @@ v8_executable("d8") {
     "src/d8/d8-test.cc",
     "src/d8/d8.cc",
     "src/d8/d8.h",
+    "src/d8/hardware-watchpoints.cc",
+    "src/d8/hardware-watchpoints.h",
+    "src/d8/memory-access-information.cc",
+    "src/d8/memory-access-information.h",
   ]
 
   configs = [
@@ -7869,14 +8798,16 @@ v8_executable("d8") {
     ":internal_config_base",
     ":v8_tracing_config",
   ]
+  v8_add_configs += [ "//build/config/compiler:thinlto_optimize_max" ]
+  v8_remove_configs += [ "//build/config/compiler:thinlto_optimize_default" ]
 
   deps = [
     ":v8",
     ":v8_libbase",
     ":v8_libplatform",
+    ":v8_simdutf",
     ":v8_tracing",
     "//build/win:default_exe_manifest",
-    "//third_party/simdutf:simdutf",
   ]
 
   if (is_posix || is_fuchsia) {
@@ -7898,10 +8829,9 @@ v8_executable("d8") {
     deps += [ ":zoslib" ]
   }
 
-  if (v8_enable_partition_alloc) {
-    defines += [ "V8_ENABLE_PARTITION_ALLOC" ]
-    deps += [ "//third_party/partition_alloc" ]
-  }
+  # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
+  # enable the diagnostic by removing this line.
+  configs += [ "//build/config/compiler:no_exit_time_destructors" ]
 }
 
 v8_executable("v8_hello_world") {
@@ -7948,6 +8878,10 @@ v8_executable("v8_sample_process") {
   if (current_os == "zos" && is_component_build) {
     deps += [ ":zoslib" ]
   }
+
+  # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
+  # enable the diagnostic by removing this line.
+  configs += [ "//build/config/compiler:no_exit_time_destructors" ]
 }
 
 if (want_v8_shell) {
@@ -8003,6 +8937,8 @@ template("v8_fuzzer") {
   fuzzer_name = target_name
 
   v8_source_set(fuzzer_name) {
+    testonly = true
+
     sources = invoker.sources
 
     deps = [ ":fuzzer_support" ]
@@ -8014,9 +8950,15 @@ template("v8_fuzzer") {
       ":external_config",
       ":internal_config_base",
     ]
+
+    # TODO(crbug.com/40031409): Fix code that adds exit-time destructors and
+    # enable the diagnostic by removing this line.
+    configs += [ "//build/config/compiler:no_exit_time_destructors" ]
   }
 
   v8_executable("v8_simple_${fuzzer_name}") {
+    testonly = true
+
     deps = [
       ":${fuzzer_name}",
       "//build/win:default_exe_manifest",
@@ -8047,15 +8989,19 @@ if (v8_enable_webassembly) {
 
   if (v8_enable_drumbrake) {
     v8_source_set("lib_wasm_interpreter_fuzzer_common") {
+      testonly = true
+
       sources = [
         "test/fuzzer/wasm/interpreter/interpreter-fuzzer-common.cc",
         "test/fuzzer/wasm/interpreter/interpreter-fuzzer-common.h",
       ]
 
       deps = [
+        ":fuzzer_support",
         ":v8_internal_headers",
-        ":wasm_fuzzer_common",
       ]
+
+      public_deps = [ ":wasm_test_common" ]
 
       configs = [
         ":external_config",
@@ -8099,6 +9045,12 @@ if (v8_enable_webassembly) {
       deps = [ ":lib_wasm_interpreter_fuzzer_common" ]
     }
 
+    v8_fuzzer("wasm_interpreter_all_multiple_modules_fuzzer") {
+      sources =
+          [ "test/fuzzer/wasm/interpreter/interpreter-all-multiple-modules.cc" ]
+      deps = [ ":lib_wasm_interpreter_fuzzer_common" ]
+    }
+
     v8_fuzzer("wasm_interpreter_base_fuzzer") {
       sources = [ "test/fuzzer/wasm/interpreter/interpreter-base.cc" ]
 
@@ -8113,38 +9065,20 @@ if (v8_enable_webassembly) {
   }
 
   v8_source_set("wasm_test_common") {
+    testonly = true
+
     sources = [
+      "test/common/c-signature.h",
       "test/common/flag-utils.h",
+      "test/common/value-helper.h",
       "test/common/wasm/flag-utils.h",
+      "test/common/wasm/fuzzer-common.cc",
+      "test/common/wasm/fuzzer-common.h",
+      "test/common/wasm/wasm-macro-gen.h",
       "test/common/wasm/wasm-module-runner.cc",
       "test/common/wasm/wasm-module-runner.h",
-    ]
-
-    deps = [
-      ":generate_bytecode_builtins_list",
-      ":run_torque",
-      ":v8_internal_headers",
-      ":v8_libbase",
-      ":v8_maybe_temporal",
-      ":v8_shared_internal_headers",
-      ":v8_tracing",
-    ]
-
-    public_deps = [
-      ":v8_abseil",
-      ":v8_maybe_icu",
-    ]
-
-    configs = [
-      ":external_config",
-      ":internal_config_base",
-    ]
-  }
-
-  v8_source_set("wasm_fuzzer_common") {
-    sources = [
-      "test/fuzzer/wasm/fuzzer-common.cc",
-      "test/fuzzer/wasm/fuzzer-common.h",
+      "test/common/wasm/wasm-run-utils.cc",
+      "test/common/wasm/wasm-run-utils.h",
       "tools/wasm/mjsunit-module-disassembler-impl.h",
     ]
 
@@ -8153,10 +9087,14 @@ if (v8_enable_webassembly) {
       ":generate_bytecode_builtins_list",
       ":run_torque",
       ":v8_internal_headers",
+      ":v8_libbase",
       ":v8_maybe_temporal",
+      ":v8_shared_internal_headers",
       ":v8_tracing",
-      ":wasm_test_common",
     ]
+    if (v8_enable_experimental_tq_to_tsa) {
+      deps += [ ":run_torque_to_tsa" ]
+    }
 
     public_deps = [
       ":v8_abseil",
@@ -8171,11 +9109,9 @@ if (v8_enable_webassembly) {
 
   template("v8_wasm_fuzzer") {
     forward_variables_from(invoker, "*")
+
     v8_fuzzer(target_name) {
-      deps = [
-        ":wasm_fuzzer_common",
-        ":wasm_test_common",
-      ]
+      deps = [ ":wasm_test_common" ]
     }
   }
 
@@ -8199,13 +9135,6 @@ if (v8_enable_webassembly) {
   }
 
   if (v8_wasm_random_fuzzers) {
-    v8_wasm_fuzzer("wasm_compile_all_fuzzer") {
-      sources = [
-        "test/common/wasm/test-signatures.h",
-        "test/fuzzer/wasm/compile-all.cc",
-      ]
-    }
-
     v8_wasm_fuzzer("wasm_compile_fuzzer") {
       sources = [
         "test/common/wasm/test-signatures.h",
@@ -8227,19 +9156,28 @@ if (v8_enable_webassembly) {
       ]
     }
 
-    v8_wasm_fuzzer("wasm_compile_wasmgc_fuzzer") {
-      sources = [
-        "test/common/wasm/test-signatures.h",
-        "test/fuzzer/wasm/compile-wasmgc.cc",
-      ]
-    }
-
     v8_wasm_fuzzer("wasm_init_expr_fuzzer") {
       sources = [ "test/fuzzer/wasm/init-expr.cc" ]
     }
 
-    v8_wasm_fuzzer("wasm_deopt_fuzzer") {
-      sources = [ "test/fuzzer/wasm/deopt.cc" ]
+    if (!v8_disable_write_barriers) {
+      v8_wasm_fuzzer("wasm_compile_all_fuzzer") {
+        sources = [
+          "test/common/wasm/test-signatures.h",
+          "test/fuzzer/wasm/compile-all.cc",
+        ]
+      }
+
+      v8_wasm_fuzzer("wasm_compile_wasmgc_fuzzer") {
+        sources = [
+          "test/common/wasm/test-signatures.h",
+          "test/fuzzer/wasm/compile-wasmgc.cc",
+        ]
+      }
+
+      v8_wasm_fuzzer("wasm_deopt_fuzzer") {
+        sources = [ "test/fuzzer/wasm/deopt.cc" ]
+      }
     }
   }  # v8_wasm_random_fuzzers
 }
@@ -8258,6 +9196,9 @@ group("v8_generated_cc_files") {
     ":run_torque",
     "src/inspector:v8_generated_cc_files",
   ]
+  if (v8_enable_experimental_tq_to_tsa) {
+    deps += [ ":run_torque_to_tsa" ]
+  }
 }
 
 # Protobuf targets, used only when building outside of chromium.
@@ -8286,6 +9227,24 @@ if (!build_with_chromium && v8_use_perfetto) {
   }
 }  # if (!build_with_chromium && v8_use_perfetto)
 
+if (v8_fuzzilli) {
+  v8_source_set("fuzzilli_cov") {
+    visibility = [ "*" ]
+    sources = [
+      "src/fuzzilli/cov.cc",
+      "src/fuzzilli/cov.h",
+    ]
+    configs = [
+      ":internal_config_base",
+      ":internal_config",
+    ]
+    deps = [
+      ":v8_internal_headers",
+      ":v8_libbase",
+    ]
+  }
+}
+
 # GN evaluates each .gn file once per toolchain, so restricting to default
 # toolchain will ensure write_file() is called only once.
 if (current_toolchain == default_toolchain) {
@@ -8299,3 +9258,4 @@ if (current_toolchain == default_toolchain) {
 
   write_file("$root_build_dir/gn_logs.txt", _lines)
 }
+# LINT.ThenChange(BUILD.bazel)

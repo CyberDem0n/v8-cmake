@@ -4,11 +4,13 @@
 
 #include "src/compiler/js-inlining-heuristic.h"
 
+#include "src/codegen/machine-type.h"
 #include "src/compiler/common-operator.h"
 #include "src/compiler/compiler-source-position-table.h"
 #include "src/compiler/js-heap-broker.h"
 #include "src/compiler/node-matchers.h"
 #include "src/compiler/simplified-operator.h"
+#include "src/compiler/turboshaft/utils.h"
 #include "src/numbers/conversions-inl.h"
 
 namespace v8 {
@@ -30,6 +32,29 @@ bool IsSmallWithHeapNumberParam(int const size) {
   return size <= v8_flags.max_inlined_bytecode_size_small_with_heapnum_in_out;
 }
 
+bool HasNumberInputsAndOutputs(IrOpcode::Value opcode) {
+  switch (opcode) {
+    case IrOpcode::kSpeculativeNumberAdd:
+    case IrOpcode::kSpeculativeNumberSubtract:
+    case IrOpcode::kSpeculativeNumberMultiply:
+    case IrOpcode::kSpeculativeNumberPow:
+    case IrOpcode::kSpeculativeNumberDivide:
+    case IrOpcode::kSpeculativeNumberModulus:
+    case IrOpcode::kSpeculativeNumberBitwiseAnd:
+    case IrOpcode::kSpeculativeNumberBitwiseOr:
+    case IrOpcode::kSpeculativeNumberBitwiseXor:
+    case IrOpcode::kSpeculativeNumberShiftLeft:
+    case IrOpcode::kSpeculativeNumberShiftRight:
+    case IrOpcode::kSpeculativeNumberShiftRightLogical:
+    case IrOpcode::kSpeculativeAdditiveSafeIntegerAdd:
+    case IrOpcode::kSpeculativeAdditiveSafeIntegerSubtract:
+      return true;
+
+    default:
+      return false;
+  }
+}
+
 bool HasHeapNumberInputOrOutput(Node* node) {
   int input_count = node->InputCount();
   for (int j = 2; j < input_count; ++j) {
@@ -41,31 +66,18 @@ bool HasHeapNumberInputOrOutput(Node* node) {
       }
     } else if (input->opcode() == IrOpcode::kChangeFloat64HoleToTagged) {
       return true;
+    } else if (input->opcode() == IrOpcode::kLoadField &&
+               FieldAccessOf(input->op()).machine_type.representation() ==
+                   MachineRepresentation::kFloat64) {
+      return true;
+    } else if (HasNumberInputsAndOutputs(input->opcode())) {
+      return true;
     }
   }
 
   for (Edge const edge : node->use_edges()) {
     if (!NodeProperties::IsValueEdge(edge)) continue;
-    switch (edge.from()->opcode()) {
-      case IrOpcode::kSpeculativeNumberAdd:
-      case IrOpcode::kSpeculativeNumberSubtract:
-      case IrOpcode::kSpeculativeNumberMultiply:
-      case IrOpcode::kSpeculativeNumberPow:
-      case IrOpcode::kSpeculativeNumberDivide:
-      case IrOpcode::kSpeculativeNumberModulus:
-      case IrOpcode::kSpeculativeNumberBitwiseAnd:
-      case IrOpcode::kSpeculativeNumberBitwiseOr:
-      case IrOpcode::kSpeculativeNumberBitwiseXor:
-      case IrOpcode::kSpeculativeNumberShiftLeft:
-      case IrOpcode::kSpeculativeNumberShiftRight:
-      case IrOpcode::kSpeculativeNumberShiftRightLogical:
-      case IrOpcode::kSpeculativeAdditiveSafeIntegerAdd:
-      case IrOpcode::kSpeculativeAdditiveSafeIntegerSubtract:
-        return true;
-
-      default:
-        break;
-    }
+    if (HasNumberInputsAndOutputs(edge.from()->opcode())) return true;
   }
 
   return false;
@@ -244,7 +256,8 @@ Reduction JSInliningHeuristic::Reduce(Node* node) {
         candidate.can_inline_function[i],
         shared.IsInlineable(CodeKind::TURBOFAN_JS, broker()) ||
             shared.GetInlineability(CodeKind::TURBOFAN_JS, broker()) ==
-                SharedFunctionInfo::kHasOptimizationDisabled);
+                turboshaft::any_of(SharedFunctionInfo::kHasOptimizationDisabled,
+                                   SharedFunctionInfo::kMayContainBreakPoints));
     // Do not allow direct recursion i.e. f() -> f(). We still allow indirect
     // recursion like f() -> g() -> f(). The indirect recursion is helpful in
     // cases where f() is a small dispatch function that calls the appropriate
@@ -410,8 +423,9 @@ Node* JSInliningHeuristic::DuplicateStateValuesAndRename(Node* state_values,
                                                          StateCloneMode mode) {
   // Only rename in states that are not shared with other users. This needs to
   // be in sync with the condition in {CollectStateValuesOwnedUses}.
-  if (state_values->UseCount() > 1) return state_values;
-  Node* copy = mode == kChangeInPlace ? state_values : nullptr;
+  Node* copy = (mode == kChangeInPlace && state_values->UseCount() <= 1)
+                   ? state_values
+                   : nullptr;
   for (int i = 0; i < state_values->InputCount(); i++) {
     Node* input = state_values->InputAt(i);
     Node* processed;
@@ -793,6 +807,28 @@ Reduction JSInliningHeuristic::InlineCandidate(Candidate const& candidate,
   Node* if_successes[kMaxCallPolymorphism];
   Node* callee = NodeProperties::GetValueInput(node, 0);
 
+  {
+    // Re-collect functions from the live node to check for mutations. This
+    // should be rare, but can still happen if the callee has been mutated
+    // in-place following another inlining.
+    Candidate current_candidate = CollectFunctions(node, kMaxCallPolymorphism);
+
+    if (current_candidate.num_functions != candidate.num_functions) {
+      // Transitioned from Phi to non-phi or vice versa, or a phi changed input
+      // count.
+      // TODO(dmercadier): transitioning from Phi to non-phi is actually
+      // something for which we should probably still inline.. Maybe we could
+      // re-queue the candidate or something like that.
+      return NoChange();
+    }
+    for (int i = 0; i < candidate.num_functions; ++i) {
+      if (current_candidate.functions[i] != candidate.functions[i]) {
+        // A phi input changed.
+        return NoChange();
+      }
+    }
+  }
+
   // Setup the inputs for the cloned call nodes.
   int const input_count = node->InputCount();
   Node** inputs = graph()->zone()->AllocateArray<Node*>(input_count);
@@ -901,7 +937,9 @@ bool JSInliningHeuristic::CandidateCompare::operator()(
 
 void JSInliningHeuristic::PrintCandidates() {
   StdoutStream os;
-  os << candidates_.size() << " candidate(s) for inlining:" << std::endl;
+  os << "Budget used: " << total_inlined_bytecode_size_ << "/"
+     << max_inlined_bytecode_size_cumulative_ << " -- " << candidates_.size()
+     << " candidate(s) for inlining:" << std::endl;
   for (const Candidate& candidate : candidates_) {
     os << "- candidate: " << candidate.node->op()->mnemonic() << " node #"
        << candidate.node->id() << " with frequency " << candidate.frequency

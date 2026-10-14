@@ -16,10 +16,10 @@ namespace internal {
 namespace {
 
 template <typename BitField>
-Tagged<Smi> SetBitFieldValue(Isolate* isolate, Tagged<Smi> smi_handler,
-                             typename BitField::FieldType value) {
+inline Tagged<Smi> SetBitFieldValue(Tagged<Smi> smi_handler,
+                                    typename BitField::FieldType value) {
   int config = smi_handler.value();
-  config = BitField::update(config, true);
+  config = BitField::update(config, value);
   return Smi::FromInt(config);
 }
 
@@ -32,8 +32,8 @@ int InitPrototypeChecksImpl(Isolate* isolate, DirectHandle<ICHandler> handler,
                             MaybeObjectDirectHandle data1,
                             MaybeObjectDirectHandle maybe_data2) {
   int data_size = 1;
-  // Holder-is-receiver case itself does not add entries unless there is an
-  // optional data2 value provided.
+  // Holder-is-lookup-start-object case itself does not add entries unless
+  // there is an optional data2 value provided.
 
   DCHECK_IMPLIES(IsJSGlobalObjectMap(*lookup_start_object_map),
                  lookup_start_object_map->is_prototype_map());
@@ -44,26 +44,30 @@ int InitPrototypeChecksImpl(Isolate* isolate, DirectHandle<ICHandler> handler,
     // The validity cell check for primitive and global proxy receivers does
     // not guarantee that certain native context ever had access to other
     // native context. However, a handler created for one native context could
-    // be used in other native context through the megamorphic stub cache.
+    // be used in another native context through the megamorphic stub cache.
     // So we record the original native context to which this handler
-    // corresponds.
+    // corresponds in the validity cell.
     if (fill_handler) {
-      DirectHandle<Context> native_context = isolate->native_context();
-      handler->set_data2(MakeWeak(*native_context));
+      if (DEBUG_BOOL) {
+        // Make sure validity cell contains native context.
+        Tagged<Cell> validity_cell = Cast<Cell>(handler->validity_cell());
+        Tagged<HeapObject> heap_object;
+        CHECK(validity_cell->maybe_value().GetHeapObject(&heap_object));
+        CHECK(IsNativeContext(heap_object));
+      }
     } else {
       // Enable access checks on the lookup start object.
       *smi_handler = SetBitFieldValue<
           typename ICHandler::DoAccessCheckOnLookupStartObjectBits>(
-          isolate, *smi_handler, true);
+          *smi_handler, true);
     }
-    data_size++;
   } else if (lookup_start_object_map->is_dictionary_map() &&
              !IsJSGlobalObjectMap(*lookup_start_object_map)) {
     if (!fill_handler) {
       // Enable lookup on lookup start object.
       *smi_handler =
           SetBitFieldValue<typename ICHandler::LookupOnLookupStartObjectBits>(
-              isolate, *smi_handler, true);
+              *smi_handler, true);
     }
   }
   if (fill_handler) {
@@ -112,7 +116,7 @@ void InitPrototypeChecks(
 }  // namespace
 
 // static
-Handle<Object> LoadHandler::LoadFromPrototype(
+Handle<LoadHandler> LoadHandler::LoadFromPrototype(
     Isolate* isolate, DirectHandle<Map> lookup_start_object_map,
     DirectHandle<JSReceiver> holder, Tagged<Smi> smi_handler,
     MaybeObjectDirectHandle maybe_data1, MaybeObjectDirectHandle maybe_data2) {
@@ -130,42 +134,19 @@ Handle<Object> LoadHandler::LoadFromPrototype(
       Map::GetOrCreatePrototypeChainValidityCell(lookup_start_object_map,
                                                  isolate);
 
+  // There must be a validity cell in case access check is needed.
+  // ICs support access checks only for JSGlobalProxy objects and they are
+  // guaranteed to have validity cell.
+  DCHECK_IMPLIES(
+      *validity_cell == Map::kNoValidityCellSentinel,
+      !DoAccessCheckOnLookupStartObjectBits::decode(smi_handler.value()));
+
   Handle<LoadHandler> handler = isolate->factory()->NewLoadHandler(data_size);
 
   handler->set_smi_handler(smi_handler);
   handler->set_validity_cell(*validity_cell);
   InitPrototypeChecks(isolate, direct_handle(handler), lookup_start_object_map,
                       data1, maybe_data2);
-  return handler;
-}
-
-// static
-Handle<Object> LoadHandler::LoadFullChain(
-    Isolate* isolate, DirectHandle<Map> lookup_start_object_map,
-    const MaybeObjectDirectHandle& holder, Handle<Smi> smi_handler_handle) {
-  Tagged<Smi> smi_handler = *smi_handler_handle;
-  MaybeObjectDirectHandle data1 = holder;
-  int data_size = GetHandlerDataSize<LoadHandler>(
-      isolate, &smi_handler, lookup_start_object_map, data1);
-
-  DirectHandle<UnionOf<Smi, Cell>> validity_cell =
-      Map::GetOrCreatePrototypeChainValidityCell(lookup_start_object_map,
-                                                 isolate);
-  if (IsSmi(*validity_cell)) {
-    DCHECK_EQ(1, data_size);
-    // Lookup on lookup start object isn't supported in case of a simple smi
-    // handler.
-    if (!LookupOnLookupStartObjectBits::decode(smi_handler.value())) {
-      return smi_handler_handle;
-    }
-  }
-
-  Handle<LoadHandler> handler = isolate->factory()->NewLoadHandler(data_size);
-
-  handler->set_smi_handler(smi_handler);
-  handler->set_validity_cell(*validity_cell);
-  InitPrototypeChecks(isolate, direct_handle(handler), lookup_start_object_map,
-                      data1);
   return handler;
 }
 
@@ -182,10 +163,17 @@ Handle<Object> LoadHandler::LoadNonExistent(
       Map::GetOrCreatePrototypeChainValidityCell(lookup_start_object_map,
                                                  isolate, &prototype_info);
 
+  // There must be a validity cell in case access check is needed.
+  // ICs support access checks only for JSGlobalProxy objects and they are
+  // guaranteed to have validity cell.
+  DCHECK_IMPLIES(
+      *validity_cell == Map::kNoValidityCellSentinel,
+      !DoAccessCheckOnLookupStartObjectBits::decode(smi_handler.value()));
+
   // Try to fetch cached handler if it was already created.
   int handler_index;
 
-  if (IsSmi(*validity_cell)) {
+  if (*validity_cell == Map::kNoValidityCellSentinel) {
     DCHECK_EQ(1, data_size);
     // Lookup on lookup start object isn't supported in case of a simple smi
     // handler.
@@ -238,6 +226,71 @@ Handle<Object> LoadHandler::LoadNonExistent(
   if (handler_index >= 0) {
     prototype_info->set_cached_handler(handler_index, *handler);
   }
+  return handler;
+}
+
+// static
+Handle<LoadHandler> LoadHandler::LoadProxyFast(
+    Isolate* isolate, DirectHandle<Map> target_map,
+    DirectHandle<Map> handler_map, DirectHandle<Smi> get_smi_handler,
+    DirectHandle<Object> trap_method) {
+  Handle<Smi> smi_handler = LoadProxy(isolate);
+
+  Handle<LoadHandler> handler =
+      isolate->factory()->NewLoadHandler(LoadHandler::kProxyDataFieldCount);
+  handler->set_smi_handler(*smi_handler);
+  handler->set_validity_cell(Map::kNoValidityCellSentinel);
+
+  // data1: target map
+  handler->set_data1(MakeWeak(Cast<HeapObject>(*target_map)));
+  // LoadIC
+  // data2: handler map
+  handler->set_data2(MakeWeak(Cast<HeapObject>(*handler_map)));
+  // data3: smi handler
+  handler->set_data3(*get_smi_handler);
+  // CallIC
+  // data4: trap method
+  handler->set_data4(MakeWeak(Cast<HeapObject>(*trap_method)));
+  // data5: counter
+  handler->set_data5(Smi::zero());
+
+  return handler;
+}
+
+// static
+Handle<LoadHandler> LoadHandler::LoadInterceptorHolderIsLookupStartupObject(
+    Isolate* isolate, DirectHandle<Map> lookup_start_object_map,
+    DirectHandle<InterceptorInfo> interceptor_info) {
+  Tagged<Smi> smi_handler = LoadInterceptor(interceptor_info->non_masking());
+
+  bool access_check_needed = lookup_start_object_map->is_access_check_needed();
+
+  // Enable access checks on the lookup start object if needed.
+  smi_handler = SetBitFieldValue<DoAccessCheckOnLookupStartObjectBits>(
+      smi_handler, access_check_needed);
+
+  // This handler doesn't set LookupOnLookupStartObjectBits because
+  // interceptor callbacks should be called before the own property lookup,
+  // while if this bit was set the IC dispatcher would perform the own lookup
+  // even before interpreting the IC kind value.
+
+  DirectHandle<UnionOf<Smi, Cell>> validity_cell;
+  if (access_check_needed || interceptor_info->non_masking()) {
+    // Validity cell in required for access check (it caches the respective
+    // NativeContext) and it's required for the non-masking case to guard
+    // against modifications of the whole prototype chain.
+    validity_cell = Map::GetOrCreatePrototypeChainValidityCell(
+        lookup_start_object_map, isolate);
+  }
+
+  int data_size = 2;  // null (holder) + interceptor_info.
+  Handle<LoadHandler> handler = isolate->factory()->NewLoadHandler(data_size);
+
+  handler->set_smi_handler(smi_handler);
+  handler->set_validity_cell(
+      validity_cell.is_null() ? Map::kNoValidityCellSentinel : *validity_cell);
+  handler->set_data1(MakeWeak(ReadOnlyRoots(isolate).null_value()));
+  handler->set_data2(*interceptor_info);
   return handler;
 }
 
@@ -305,9 +358,9 @@ MaybeObjectHandle StoreHandler::StoreOwnTransition(Isolate* isolate,
   if (!is_dictionary_map) {
     InternalIndex descriptor = transition_map->LastAdded();
     DirectHandle<DescriptorArray> descriptors(
-        transition_map->instance_descriptors(isolate), isolate);
+        transition_map->instance_descriptors(), isolate);
     PropertyDetails details = descriptors->GetDetails(descriptor);
-    if (descriptors->GetKey(descriptor)->IsPrivate()) {
+    if (descriptors->GetKey(descriptor)->IsAnyPrivate()) {
       DCHECK_EQ(DONT_ENUM, details.attributes());
     } else {
       DCHECK_EQ(NONE, details.attributes());
@@ -341,11 +394,11 @@ MaybeObjectHandle StoreHandler::StoreTransition(Isolate* isolate,
   if (!is_dictionary_map) {
     InternalIndex descriptor = transition_map->LastAdded();
     DirectHandle<DescriptorArray> descriptors(
-        transition_map->instance_descriptors(isolate), isolate);
+        transition_map->instance_descriptors(), isolate);
     // Private fields must be added via StoreOwnTransition handler.
-    DCHECK(!descriptors->GetKey(descriptor)->IsPrivateName());
+    DCHECK(!descriptors->GetKey(descriptor)->IsAnyPrivateName());
     PropertyDetails details = descriptors->GetDetails(descriptor);
-    if (descriptors->GetKey(descriptor)->IsPrivate()) {
+    if (descriptors->GetKey(descriptor)->IsAnyPrivate()) {
       DCHECK_EQ(DONT_ENUM, details.attributes());
     } else {
       DCHECK_EQ(NONE, details.attributes());
@@ -402,12 +455,56 @@ Handle<Object> StoreHandler::StoreThroughPrototype(
   DirectHandle<UnionOf<Smi, Cell>> validity_cell =
       Map::GetOrCreatePrototypeChainValidityCell(receiver_map, isolate);
 
+  // There must be a validity cell in case access check is needed.
+  // ICs support access checks only for JSGlobalProxy objects and they are
+  // guaranteed to have validity cell.
+  DCHECK_IMPLIES(
+      *validity_cell == Map::kNoValidityCellSentinel,
+      !DoAccessCheckOnLookupStartObjectBits::decode(smi_handler.value()));
+
   Handle<StoreHandler> handler = isolate->factory()->NewStoreHandler(data_size);
 
   handler->set_smi_handler(smi_handler);
   handler->set_validity_cell(*validity_cell);
   InitPrototypeChecks(isolate, direct_handle(handler), receiver_map, data1,
                       maybe_data2);
+  return handler;
+}
+
+// static
+Handle<StoreHandler> StoreHandler::StoreInterceptorHolderIsReceiver(
+    Isolate* isolate, DirectHandle<Map> lookup_start_object_map,
+    DirectHandle<InterceptorInfo> interceptor_info) {
+  Tagged<Smi> smi_handler = StoreInterceptor(interceptor_info->non_masking());
+
+  bool access_check_needed = lookup_start_object_map->is_access_check_needed();
+
+  // Enable access checks on the lookup start object if needed.
+  smi_handler = SetBitFieldValue<DoAccessCheckOnLookupStartObjectBits>(
+      smi_handler, access_check_needed);
+
+  // This handler doesn't set LookupOnLookupStartObjectBits because
+  // interceptor callbacks should be called before the own property lookup,
+  // while if this bit was set the IC dispatcher would perform the own lookup
+  // even before interpreting the IC kind value.
+
+  DirectHandle<UnionOf<Smi, Cell>> validity_cell;
+  if (access_check_needed || interceptor_info->non_masking()) {
+    // Validity cell in required for access check (it caches the respective
+    // NativeContext) and it's required for the non-masking case to guard
+    // against modifications of the whole prototype chain.
+    validity_cell = Map::GetOrCreatePrototypeChainValidityCell(
+        lookup_start_object_map, isolate);
+  }
+
+  int data_size = 2;  // null (holder) + interceptor_info.
+  Handle<StoreHandler> handler = isolate->factory()->NewStoreHandler(data_size);
+
+  handler->set_smi_handler(smi_handler);
+  handler->set_validity_cell(
+      validity_cell.is_null() ? Map::kNoValidityCellSentinel : *validity_cell);
+  handler->set_data1(MakeWeak(ReadOnlyRoots(isolate).null_value()));
+  handler->set_data2(*interceptor_info);
   return handler;
 }
 
@@ -444,28 +541,21 @@ void PrintSmiLoadHandler(int raw_handler, std::ostream& os) {
   switch (kind) {
     case LoadHandler::Kind::kElement:
       os << "kElement, ";
-      if (LoadHandler::IsWasmArrayBits::decode(raw_handler)) {
-        os << "WasmArray, "
-           << LoadHandler::WasmArrayTypeBits::decode(raw_handler);
-
-      } else {
-        os << "allow out of bounds = "
-           << LoadHandler::AllowOutOfBoundsBits::decode(raw_handler)
-           << ", is JSArray = "
-           << LoadHandler::IsJsArrayBits::decode(raw_handler)
-           << ", alow reading holes = "
-           << LoadHandler::AllowHandlingHole::decode(raw_handler)
-           << ", elements kind = "
-           << ElementsKindToString(
-                  LoadHandler::ElementsKindBits::decode(raw_handler));
-      }
+      os << "allow out of bounds = "
+         << LoadHandler::AllowOutOfBoundsBits::decode(raw_handler)
+         << ", is JSArray = " << LoadHandler::IsJsArrayBits::decode(raw_handler)
+         << ", allow reading holes = "
+         << LoadHandler::AllowHandlingHole::decode(raw_handler)
+         << ", elements kind = "
+         << ElementsKindToString(
+                LoadHandler::ElementsKindBits::decode(raw_handler));
       break;
     case LoadHandler::Kind::kElementWithTransition:
       os << "kElementWithTransition, ";
       os << "allow out of bounds = "
          << LoadHandler::AllowOutOfBoundsBits::decode(raw_handler)
          << ", is JSArray = " << LoadHandler::IsJsArrayBits::decode(raw_handler)
-         << ", alow reading holes = "
+         << ", allow reading holes = "
          << LoadHandler::AllowHandlingHole::decode(raw_handler)
          << ", elements kind = "
          << ElementsKindToString(
@@ -482,18 +572,13 @@ void PrintSmiLoadHandler(int raw_handler, std::ostream& os) {
       os << "kGlobal";
       break;
     case LoadHandler::Kind::kField: {
-      if (LoadHandler::IsWasmStructBits::decode(raw_handler)) {
-        os << "kField, WasmStruct, type = "
-           << LoadHandler::WasmFieldTypeBits::decode(raw_handler)
-           << ", field offset = "
-           << LoadHandler::WasmFieldOffsetBits::decode(raw_handler);
-      } else {
-        os << "kField, is in object = "
-           << LoadHandler::IsInobjectBits::decode(raw_handler)
-           << ", is double = " << LoadHandler::IsDoubleBits::decode(raw_handler)
-           << ", field index = "
-           << LoadHandler::FieldIndexBits::decode(raw_handler);
-      }
+      os << "kField, is in object = "
+         << LoadHandler::IsInobjectBits::decode(raw_handler)
+         << ", is double = " << LoadHandler::IsDoubleBits::decode(raw_handler)
+         << ", storage offset in words = "
+         << LoadHandler::StorageOffsetInWordsBits::decode(raw_handler)
+         << ", descriptor index = "
+         << LoadHandler::DescriptorIndexBits::decode(raw_handler);
       break;
     }
     case LoadHandler::Kind::kConstantFromPrototype:
@@ -525,6 +610,9 @@ void PrintSmiLoadHandler(int raw_handler, std::ostream& os) {
       os << "kModuleExport, exports index = "
          << LoadHandler::ExportsIndexBits::decode(raw_handler);
       break;
+    case LoadHandler::Kind::kGeneric:
+      os << "kGeneric";
+      break;
     default:
       os << "<invalid value " << static_cast<int>(kind) << ">";
       break;
@@ -548,8 +636,8 @@ void PrintSmiStoreHandler(int raw_handler, std::ostream& os) {
          << ", is in object = "
          << StoreHandler::IsInobjectBits::decode(raw_handler)
          << ", representation = " << representation.Mnemonic()
-         << ", field index = "
-         << StoreHandler::FieldIndexBits::decode(raw_handler);
+         << ", storage offset in words = "
+         << StoreHandler::StorageOffsetInWordsBits::decode(raw_handler);
       break;
     }
     case StoreHandler::Kind::kAccessorFromPrototype:
@@ -577,6 +665,9 @@ void PrintSmiStoreHandler(int raw_handler, std::ostream& os) {
       os << "kSlow, keyed access store mode = " << keyed_access_store_mode;
       break;
     }
+    case StoreHandler::Kind::kGeneric:
+      os << "kGeneric";
+      break;
     case StoreHandler::Kind::kProxy:
       os << "kProxy";
       break;
@@ -598,9 +689,9 @@ void LoadHandler::PrintHandler(Tagged<Object> handler, std::ostream& os) {
     os << "LoadHandler(Smi)(";
     PrintSmiLoadHandler(raw_handler, os);
     os << ")";
-  } else if (IsCode(handler)) {
-    os << "LoadHandler(Code)("
-       << Builtins::name(Cast<Code>(handler)->builtin_id()) << ")";
+  } else if (Is<Code>(handler)) {
+    Tagged<Code> code = TrustedCast<Code>(handler);
+    os << "LoadHandler(Code)(" << Builtins::name(code->builtin_id()) << ")";
   } else if (IsSymbol(handler)) {
     os << "LoadHandler(Symbol)(" << Brief(Cast<Symbol>(handler)) << ")";
   } else if (IsLoadHandler(handler)) {
@@ -623,6 +714,14 @@ void LoadHandler::PrintHandler(Tagged<Object> handler, std::ostream& os) {
       os << ", data3 = ";
       ShortPrint(load_handler->data3(), os);
     }
+    if (load_handler->data_field_count() >= 4) {
+      os << ", data4 = ";
+      ShortPrint(load_handler->data4(), os);
+    }
+    if (load_handler->data_field_count() >= 5) {
+      os << ", data5 = ";
+      ShortPrint(load_handler->data5(), os);
+    }
     os << ", validity cell = ";
     ShortPrint(load_handler->validity_cell(), os);
     os << ")";
@@ -641,8 +740,7 @@ void StoreHandler::PrintHandler(Tagged<Object> handler, std::ostream& os) {
   } else if (IsStoreHandler(handler)) {
     os << "StoreHandler(";
     Tagged<StoreHandler> store_handler = Cast<StoreHandler>(handler);
-    if (IsCode(store_handler->smi_handler())) {
-      Tagged<Code> code = Cast<Code>(store_handler->smi_handler());
+    if (Tagged<Code> code; TryCast(store_handler->smi_handler(), &code)) {
       os << "builtin = ";
       ShortPrint(code, os);
     } else {
@@ -671,8 +769,8 @@ void StoreHandler::PrintHandler(Tagged<Object> handler, std::ostream& os) {
   } else if (IsMap(handler)) {
     os << "StoreHandler(field transition to " << Brief(handler) << ")"
        << std::endl;
-  } else if (IsCode(handler)) {
-    Tagged<Code> code = Cast<Code>(handler);
+  } else if (Is<Code>(handler)) {
+    Tagged<Code> code = TrustedCast<Code>(handler);
     os << "StoreHandler(builtin = ";
     ShortPrint(code, os);
     os << ")" << std::endl;
@@ -681,9 +779,6 @@ void StoreHandler::PrintHandler(Tagged<Object> handler, std::ostream& os) {
   }
 }
 
-std::ostream& operator<<(std::ostream& os, WasmValueType type) {
-  return os << WasmValueType2String(type);
-}
 
 #endif  // defined(OBJECT_PRINT)
 

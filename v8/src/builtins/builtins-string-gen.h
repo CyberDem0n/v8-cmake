@@ -16,7 +16,7 @@ class StringBuiltinsAssembler : public CodeStubAssembler {
   explicit StringBuiltinsAssembler(compiler::CodeAssemblerState* state)
       : CodeStubAssembler(state) {}
 
-  // ES#sec-getsubstitution
+  // https://tc39.es/ecma262/#sec-getsubstitution
   TNode<String> GetSubstitution(TNode<Context> context,
                                 TNode<String> subject_string,
                                 TNode<Smi> match_start_index,
@@ -26,8 +26,7 @@ class StringBuiltinsAssembler : public CodeStubAssembler {
                         TNode<String> rhs, TNode<Word32T> rhs_instance_type,
                         TNode<IntPtrT> length, Label* if_equal,
                         Label* if_not_equal, Label* if_indirect);
-  void BranchIfStringPrimitiveWithNoCustomIteration(TNode<Object> object,
-                                                    TNode<Context> context,
+  void BranchIfStringPrimitiveWithNoCustomIteration(TNode<JSAnyNotSmi> object,
                                                     Label* if_true,
                                                     Label* if_false);
 
@@ -175,14 +174,14 @@ class StringBuiltinsAssembler : public CodeStubAssembler {
   // Implements boilerplate logic for {match, split, replace, search} of the
   // form:
   //
-  //  if (!IS_NULL_OR_UNDEFINED(object)) {
+  //  if (IS_OBJECT(object)) {
   //    var maybe_function = object[symbol];
   //    if (!IS_UNDEFINED(maybe_function)) {
   //      return %_Call(maybe_function, ...);
   //    }
   //  }
   //
-  // Contains fast paths for Smi and RegExp objects.
+  // Contains fast paths for RegExp objects.
   // Important: {regexp_call} may not contain any code that can call into JS.
   using NodeFunction0 = std::function<void()>;
   using NodeFunction1 = std::function<void(TNode<Object> fn)>;
@@ -197,9 +196,11 @@ class StringBuiltinsAssembler : public CodeStubAssembler {
  private:
   template <typename T>
   TNode<String> AllocAndCopyStringCharacters(TNode<T> from,
+                                             TNode<String> tagged_source,
                                              TNode<BoolT> from_is_one_byte,
                                              TNode<IntPtrT> from_index,
-                                             TNode<IntPtrT> character_count);
+                                             TNode<IntPtrT> character_count,
+                                             Label* if_bailout);
 };
 
 }  // namespace internal

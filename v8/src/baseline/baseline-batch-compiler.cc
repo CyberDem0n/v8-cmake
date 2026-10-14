@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include "src/base/fpu.h"
+#include "src/base/numerics/checked_math.h"
 #include "src/baseline/baseline-compiler.h"
 #include "src/codegen/compiler.h"
 #include "src/execution/isolate.h"
@@ -104,7 +105,7 @@ class BaselineBatchCompilerJob {
     for (int i = 0; i < batch_size; i++) {
       Tagged<MaybeObject> maybe_sfi = task_queue->get(i);
       // TODO(victorgomes): Do I need to clear the value?
-      task_queue->set(i, ClearedValue(isolate));
+      task_queue->set(i, kClearedWeakValue);
       Tagged<HeapObject> obj;
       // Skip functions where weak reference is no longer valid.
       if (!maybe_sfi.GetHeapObjectIfWeak(&obj)) continue;
@@ -252,8 +253,7 @@ BaselineBatchCompiler::~BaselineBatchCompiler() {
 }
 
 bool BaselineBatchCompiler::concurrent() const {
-  return v8_flags.concurrent_sparkplug &&
-         !isolate_->EfficiencyModeEnabledForTiering();
+  return v8_flags.concurrent_sparkplug && !isolate_->EfficiencyModeEnabled();
 }
 
 void BaselineBatchCompiler::EnqueueFunction(DirectHandle<JSFunction> function) {
@@ -303,7 +303,7 @@ void BaselineBatchCompiler::EnsureQueueCapacity() {
                                                 AllocationType::kOld));
     return;
   }
-  if (last_index_ >= compilation_queue_->length()) {
+  if (last_index_ >= compilation_queue_->ulength().value()) {
     DirectHandle<WeakFixedArray> new_queue =
         isolate_->factory()->CopyWeakFixedArrayAndGrow(compilation_queue_,
                                                        last_index_);
@@ -319,10 +319,10 @@ void BaselineBatchCompiler::CompileBatch(DirectHandle<JSFunction> function) {
     Compiler::CompileBaseline(isolate_, function, Compiler::CLEAR_EXCEPTION,
                               &is_compiled_scope);
   }
-  for (int i = 0; i < last_index_; i++) {
+  for (uint32_t i = 0; i < last_index_; i++) {
     Tagged<MaybeObject> maybe_sfi = compilation_queue_->get(i);
     MaybeCompileFunction(maybe_sfi);
-    compilation_queue_->set(i, ClearedValue(isolate_));
+    compilation_queue_->set(i, kClearedWeakValue);
   }
   ClearBatch();
 }
@@ -343,20 +343,23 @@ bool BaselineBatchCompiler::ShouldCompileBatch(
   if (shared->is_sparkplug_compiling()) return false;
   if (!CanCompileWithBaseline(isolate_, shared)) return false;
 
-  int estimated_size;
+  base::CheckedNumeric<int> estimated_size;
   {
     DisallowHeapAllocation no_gc;
     estimated_size = BaselineCompiler::EstimateInstructionSize(
         shared->GetBytecodeArray(isolate_));
   }
-  estimated_instruction_size_ += estimated_size;
+  int raw_estimated_size = estimated_size.ValueOrDefault(kMaxInt);
+  base::CheckedNumeric<int> new_size = estimated_instruction_size_;
+  new_size += raw_estimated_size;
+  estimated_instruction_size_ = new_size.ValueOrDefault(kMaxInt);
   if (v8_flags.trace_baseline_batch_compilation) {
     CodeTracer::Scope trace_scope(isolate_->GetCodeTracer());
     PrintF(trace_scope.file(), "[Baseline batch compilation] Enqueued SFI %s",
            shared->DebugNameCStr().get());
     PrintF(trace_scope.file(),
-           " with estimated size %d (current budget: %d/%d)\n", estimated_size,
-           estimated_instruction_size_,
+           " with estimated size %d (current budget: %d/%d)\n",
+           raw_estimated_size, estimated_instruction_size_,
            v8_flags.baseline_batch_compilation_threshold.value());
   }
   if (estimated_instruction_size_ >=

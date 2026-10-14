@@ -86,7 +86,7 @@ class MemoryProtectionTest : public TestWithNativeContext {
     WasmDetectedFeatures detected_features;
     ModuleResult result =
         DecodeWasmModule(WasmEnabledFeatures::All(), bytes.as_vector(), false,
-                         kWasmOrigin, &detected_features);
+                         &detected_features);
     CHECK(result.ok());
 
     ErrorThrower thrower(isolate(), "");
@@ -214,6 +214,15 @@ TEST_P(ParameterizedMemoryProtectionTestWithSignalHandling, TestSignalHandler) {
   // that we use in the wild.
   // (see https://google.github.io/googletest/reference/assertions.html)
   CHECK_EQ("threadsafe", GTEST_FLAG_GET(death_test_style));
+
+  // This test isn't currently compatible with sandbox hardware support, mostly
+  // because the signal handler attempts to write to stack memory which is now
+  // protected with a PKEY to which the handler has no access.
+  // TODO(428680013): if we use an untrusted stack for sandboxed execution
+  // mode, then this test should just work again.
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  if (SandboxHardwareSupport::IsActive()) return;
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
 
   const bool write_in_signal_handler = std::get<0>(GetParam());
   const bool open_write_scope = std::get<1>(GetParam());

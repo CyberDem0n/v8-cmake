@@ -5,6 +5,7 @@
 #ifndef V8_INTERPRETER_BYTECODE_ARRAY_BUILDER_H_
 #define V8_INTERPRETER_BYTECODE_ARRAY_BUILDER_H_
 
+#include <cstddef>
 #include <optional>
 
 #include "src/ast/ast.h"
@@ -54,21 +55,27 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   DirectHandle<TrustedByteArray> ToSourcePositionTable(IsolateT* isolate);
 
 #ifdef DEBUG
-  int CheckBytecodeMatches(Tagged<BytecodeArray> bytecode);
+  int CheckBytecodeMatches(Handle<BytecodeArray> bytecode);
 #endif
 
   // Get the number of parameters expected by function.
   uint16_t parameter_count() const { return parameter_count_; }
   uint16_t max_arguments() const { return max_arguments_; }
 
-  void UpdateMaxArguments(uint16_t max_arguments) {
-    max_arguments_ = std::max(max_arguments_, max_arguments);
+  void UpdateMaxArguments(int max_arguments) {
+    CHECK_LE(max_arguments, Code::kMaxArguments);
+    max_arguments_ =
+        std::max(max_arguments_, static_cast<uint16_t>(max_arguments));
   }
 
   // Get the number of locals required for bytecode array.
   int locals_count() const {
     DCHECK_GE(local_register_count_, 0);
     return local_register_count_;
+  }
+
+  int potentially_throwing_bytecode_count() const {
+    return potentially_throwing_bytecode_count_;
   }
 
   // Returns the number of fixed (non-temporary) registers.
@@ -100,6 +107,10 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   BytecodeArrayBuilder& LoadFalse();
   BytecodeArrayBuilder& LoadBoolean(bool value);
 
+  // Merges the boilerplate definition at index_obj into the prototype of the
+  // function object in accumulator
+  BytecodeArrayBuilder& SetPrototypeProperties(size_t index_obj, size_t slot);
+
   // Global loads to the accumulator and stores from the accumulator.
   BytecodeArrayBuilder& LoadGlobal(const AstRawString* name, int feedback_slot,
                                    TypeofMode typeof_mode);
@@ -108,10 +119,8 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
 
   // Load the object at |variable| at |depth| in the context chain starting
   // with |context| into the accumulator.
-  enum ContextSlotMutability { kImmutableSlot, kMutableSlot };
   BytecodeArrayBuilder& LoadContextSlot(Register context, Variable* variable,
-                                        int depth,
-                                        ContextSlotMutability immutable);
+                                        int depth);
 
   // Stores the object in the accumulator into |variable| at |depth| in the
   // context chain starting with |context|.
@@ -150,6 +159,13 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
                                                     Register cache_type,
                                                     int feedback_slot);
 
+  BytecodeArrayBuilder& GetPrivateField(Register context, int slot_index,
+                                        int depth, Register object,
+                                        int feedback_slot);
+  BytecodeArrayBuilder& SetPrivateField(Register context, int slot_index,
+                                        int depth, Register object,
+                                        int feedback_slot);
+
   // Named load property of the @@iterator symbol.
   BytecodeArrayBuilder& LoadIteratorProperty(Register object,
                                              int feedback_slot);
@@ -157,6 +173,7 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   // Load and call property of the @@iterator symbol
   BytecodeArrayBuilder& GetIterator(Register object, int load_feedback_slot,
                                     int call_feedback_slot);
+  BytecodeArrayBuilder& ArrayDestructure(RegisterList outputs, int count);
 
   // Named load property of the @@asyncIterator symbol.
   BytecodeArrayBuilder& LoadAsyncIteratorProperty(Register object,
@@ -190,6 +207,13 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   BytecodeArrayBuilder& DefineNamedOwnProperty(Register object,
                                                const AstRawString* name,
                                                int feedback_slot);
+
+  // Like DefineNamedOwnProperty, but may only be used for the initializing
+  // store of a property of an object literal created from a boilerplate: the
+  // property exists in the object's map and still holds the uninitialized
+  // value.
+  BytecodeArrayBuilder& DefineNamedOwnPropertyInLiteral(
+      Register object, const AstRawString* name, int feedback_slot);
 
   // Set a property keyed by a value in a register, trigger the setters and
   // set traps if necessary. The value to be set should be in the
@@ -376,9 +400,9 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   // Type feedback will be recorded in the |feedback_slot|
   BytecodeArrayBuilder& BinaryOperation(Token::Value binop, Register reg,
                                         int feedback_slot);
-  BytecodeArrayBuilder& Add_LhsIsStringConstant_Internalize(Token::Value binop,
-                                                            Register reg,
-                                                            int feedback_slot);
+  BytecodeArrayBuilder& Add_StringConstant_Internalize(
+      Token::Value binop, Register reg, int feedback_slot,
+      AddStringConstantAndInternalizeVariant as_variant);
   // Same as above, but lhs in the accumulator and rhs in |literal|.
   BytecodeArrayBuilder& BinaryOperationSmiLiteral(Token::Value binop,
                                                   Tagged<Smi> literal,
@@ -438,6 +462,7 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
                                     HandlerTable::CatchPrediction will_catch);
   BytecodeArrayBuilder& MarkTryBegin(int handler_id, Register context);
   BytecodeArrayBuilder& MarkTryEnd(int handler_id);
+  BytecodeArrayBuilder& DropHandlerEntry(int handler_id);
 
   // Flow Control.
   BytecodeArrayBuilder& Bind(BytecodeLabel* label);
@@ -494,6 +519,9 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
                                   int feedback_slot);
   BytecodeArrayBuilder& ForInStep(Register index);
 
+  BytecodeArrayBuilder& ForOfNext(Register object, Register next,
+                                  int call_slot);
+
   // Generators.
   BytecodeArrayBuilder& SuspendGenerator(Register generator,
                                          RegisterList registers,
@@ -510,6 +538,7 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   // Allocates a new jump table of given |size| and |case_value_base| in the
   // constant pool.
   BytecodeJumpTable* AllocateJumpTable(int size, int case_value_base);
+  void TrimJumpTable(BytecodeJumpTable* jump_table, int size);
 
   BytecodeRegisterOptimizer* GetRegisterOptimizer() {
     return register_optimizer_;
@@ -592,6 +621,10 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   void OutputMovRaw(Register src, Register dest);
 
   void EmitFunctionStartSourcePosition(int position);
+
+  size_t current_bytecode_size() const {
+    return bytecode_array_writer_.current_bytecode_size();
+  }
 
   // Accessors
   BytecodeRegisterAllocator* register_allocator() {
@@ -679,6 +712,21 @@ class V8_EXPORT_PRIVATE BytecodeArrayBuilder final {
   BytecodeRegisterOptimizer* register_optimizer_;
   BytecodeSourceInfo latest_source_info_;
   BytecodeSourceInfo deferred_source_info_;
+  int potentially_throwing_bytecode_count_;
+};
+
+class V8_NODISCARD ThrowTrackingScope {
+ public:
+  explicit ThrowTrackingScope(BytecodeArrayBuilder* builder)
+      : builder_(builder),
+        start_count_(builder->potentially_throwing_bytecode_count()) {}
+  bool HasEmittedThrowingBytecode() const {
+    return builder_->potentially_throwing_bytecode_count() > start_count_;
+  }
+
+ private:
+  BytecodeArrayBuilder* builder_;
+  int start_count_;
 };
 
 V8_EXPORT_PRIVATE std::ostream& operator<<(

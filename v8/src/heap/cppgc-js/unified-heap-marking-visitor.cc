@@ -4,9 +4,9 @@
 
 #include "src/heap/cppgc-js/unified-heap-marking-visitor.h"
 
+#include "src/heap/cppgc-internal/marking-state.h"
+#include "src/heap/cppgc-internal/visitor.h"
 #include "src/heap/cppgc-js/unified-heap-marking-state-inl.h"
-#include "src/heap/cppgc/marking-state.h"
-#include "src/heap/cppgc/visitor.h"
 #include "src/heap/heap.h"
 #include "src/heap/mark-compact.h"
 #include "src/heap/minor-mark-sweep.h"
@@ -120,12 +120,17 @@ ConcurrentUnifiedHeapMarkingVisitor::ConcurrentUnifiedHeapMarkingVisitor(
       local_marking_worklist_(GetV8MarkingWorklists(v8_heap, collection_type)),
       concurrent_unified_heap_marking_state_(
           v8_heap, local_marking_worklist_.get(), collection_type) {
+  // For testing there also exist configurations with stand-alone CppHeap's that
+  // are not yet attached to an Isolate.
+  if (v8_heap) {
+    current_isolate_scope_.emplace(v8_heap->isolate());
 #ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
-  // This method might be called on a thread that's not bound to any Isolate
-  // and thus IsolateGroup::current could be unset.
-  saved_isolate_group_ = IsolateGroup::current();
-  IsolateGroup::set_current(v8_heap->isolate()->isolate_group());
+    // This method might be called on a thread that's not bound to any Isolate
+    // and thus IsolateGroup::current could be unset.
+    saved_isolate_group_ = IsolateGroup::current();
+    IsolateGroup::set_current(v8_heap->isolate()->isolate_group());
 #endif
+  }
 }
 
 ConcurrentUnifiedHeapMarkingVisitor::~ConcurrentUnifiedHeapMarkingVisitor() {

@@ -58,11 +58,12 @@ BUILTIN(RegExpPrototypeToString) {
 // The properties $1..$9 are the first nine capturing substrings of the last
 // successful match, or ''.  The function RegExpMakeCaptureGetter will be
 // called with indices from 1 to 9.
-#define DEFINE_CAPTURE_GETTER(i)                        \
-  BUILTIN(RegExpCapture##i##Getter) {                   \
-    HandleScope scope(isolate);                         \
-    return *RegExpUtils::GenericCaptureGetter(          \
-        isolate, isolate->regexp_last_match_info(), i); \
+#define DEFINE_CAPTURE_GETTER(i)                               \
+  BUILTIN(RegExpCapture##i##Getter) {                          \
+    HandleScope scope(isolate);                                \
+    isolate->CountUsage(v8::Isolate::kRegExpStaticProperties); \
+    return *regexp::Utils::GenericCaptureGetter(               \
+        isolate, isolate->regexp_last_match_info(), i);        \
   }
 DEFINE_CAPTURE_GETTER(1)
 DEFINE_CAPTURE_GETTER(2)
@@ -81,10 +82,11 @@ DEFINE_CAPTURE_GETTER(9)
 
 BUILTIN(RegExpInputGetter) {
   HandleScope scope(isolate);
+  isolate->CountUsage(v8::Isolate::kRegExpStaticProperties);
   DirectHandle<Object> obj(isolate->regexp_last_match_info()->last_input(),
                            isolate);
-  return IsUndefined(*obj, isolate) ? ReadOnlyRoots(isolate).empty_string()
-                                    : Cast<String>(*obj);
+  return IsUndefined(*obj) ? ReadOnlyRoots(isolate).empty_string()
+                           : Cast<String>(*obj);
 }
 
 BUILTIN(RegExpInputSetter) {
@@ -103,12 +105,14 @@ BUILTIN(RegExpInputSetter) {
 // of the last successful match.
 BUILTIN(RegExpLastMatchGetter) {
   HandleScope scope(isolate);
-  return *RegExpUtils::GenericCaptureGetter(
+  isolate->CountUsage(v8::Isolate::kRegExpStaticPropertiesWithLastMatch);
+  return *regexp::Utils::GenericCaptureGetter(
       isolate, isolate->regexp_last_match_info(), 0);
 }
 
 BUILTIN(RegExpLastParenGetter) {
   HandleScope scope(isolate);
+  isolate->CountUsage(v8::Isolate::kRegExpStaticProperties);
   DirectHandle<RegExpMatchInfo> match_info = isolate->regexp_last_match_info();
   const int length = match_info->number_of_capture_registers();
   if (length <= 2) {
@@ -121,11 +125,13 @@ BUILTIN(RegExpLastParenGetter) {
   // We match the SpiderMonkey behavior: return the substring defined by the
   // last pair (after the first pair) of elements of the capture array even if
   // it is empty.
-  return *RegExpUtils::GenericCaptureGetter(isolate, match_info, last_capture);
+  return *regexp::Utils::GenericCaptureGetter(isolate, match_info,
+                                              last_capture);
 }
 
 BUILTIN(RegExpLeftContextGetter) {
   HandleScope scope(isolate);
+  isolate->CountUsage(v8::Isolate::kRegExpStaticPropertiesWithLastMatch);
   DirectHandle<RegExpMatchInfo> match_info = isolate->regexp_last_match_info();
   const int start_index = match_info->capture(0);
   Handle<String> last_subject(match_info->last_subject(), isolate);
@@ -134,6 +140,7 @@ BUILTIN(RegExpLeftContextGetter) {
 
 BUILTIN(RegExpRightContextGetter) {
   HandleScope scope(isolate);
+  isolate->CountUsage(v8::Isolate::kRegExpStaticPropertiesWithLastMatch);
   DirectHandle<RegExpMatchInfo> match_info = isolate->regexp_last_match_info();
   const int start_index = match_info->capture(1);
   Handle<String> last_subject(match_info->last_subject(), isolate);
@@ -343,6 +350,7 @@ MaybeDirectHandle<String> RegExpEscapeImpl(Isolate* isolate,
 }
 }  // namespace
 
+// https://tc39.es/ecma262/#sec-regexp.escape
 BUILTIN(RegExpEscape) {
   HandleScope scope(isolate);
   Handle<Object> value = args.atOrUndefined(isolate, 1);
@@ -364,7 +372,7 @@ BUILTIN(RegExpEscape) {
   // A copy of the input characters is needed because RegExpEscapeImpl builds up
   // the escaped string using IncrementalStringBuilder, which may allocate.
   str = String::Flatten(isolate, str);
-  if (str->IsOneByteRepresentation()) {
+  if (String::IsOneByteRepresentationUnderneath(*str)) {
     base::OwnedVector<const uint8_t> copy;
     {
       DisallowGarbageCollection no_gc;

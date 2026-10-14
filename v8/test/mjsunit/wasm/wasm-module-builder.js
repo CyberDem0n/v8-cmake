@@ -81,6 +81,7 @@ let kWasmSharedTypeForm = 0x65;
 let kWasmFunctionTypeForm = 0x60;
 let kWasmStructTypeForm = 0x5f;
 let kWasmArrayTypeForm = 0x5e;
+let kWasmContTypeForm = 0x5d;
 let kWasmSubtypeForm = 0x50;
 let kWasmSubtypeFinalForm = 0x4f;
 let kWasmRecursiveTypeGroupForm = 0x4e;
@@ -142,6 +143,8 @@ let kWasmStringRef = -0x19;
 let kWasmStringViewWtf8 = -0x1a;
 let kWasmStringViewWtf16 = -0x20;
 let kWasmStringViewIter = -0x1f;
+let kWasmWaitqueueRef = -0x24;
+let kWasmNullWaitqueueRef = -0x25;
 const kWasmContRef = -0x18;
 const kWasmNullContRef = -0x0b;
 
@@ -164,6 +167,8 @@ let kStringRefCode = kWasmStringRef & kLeb128Mask;
 let kStringViewWtf8Code = kWasmStringViewWtf8 & kLeb128Mask;
 let kStringViewWtf16Code = kWasmStringViewWtf16 & kLeb128Mask;
 let kStringViewIterCode = kWasmStringViewIter & kLeb128Mask;
+let kWaitqueueRefCode = kWasmWaitqueueRef & kLeb128Mask;
+let kNullWaitqueueRefCode = kWasmNullWaitqueueRef & kLeb128Mask;
 const kContRefCode = kWasmContRef & kLeb128Mask;
 const kNullContRefCode = kWasmNullContRef & kLeb128Mask;
 
@@ -204,6 +209,11 @@ let kExternalTable = 1;
 let kExternalMemory = 2;
 let kExternalGlobal = 3;
 let kExternalTag = 4;
+let kExternalExactFunction = 32;
+
+let kCompactImportByModule = 0x7F;
+let kCompactImportByModuleAndType = 0x7E;
+let kIndividualImportEncoding = 0;
 
 let kTableZero = 0;
 let kMemoryZero = 0;
@@ -229,6 +239,7 @@ let kSig_i_f = makeSig([kWasmF32], [kWasmI32]);
 let kSig_i_ff = makeSig([kWasmF32, kWasmF32], [kWasmI32]);
 let kSig_f_ff = makeSig([kWasmF32, kWasmF32], [kWasmF32]);
 let kSig_f_ffff = makeSig([kWasmF32, kWasmF32, kWasmF32, kWasmF32], [kWasmF32]);
+let kSig_f_lff = makeSig([kWasmI64, kWasmF32, kWasmF32], [kWasmF32]);
 let kSig_d_dd = makeSig([kWasmF64, kWasmF64], [kWasmF64]);
 let kSig_d_dddd = makeSig([kWasmF64, kWasmF64, kWasmF64, kWasmF64], [kWasmF64]);
 let kSig_l_ll = makeSig([kWasmI64, kWasmI64], [kWasmI64]);
@@ -503,7 +514,14 @@ const kWasmOpcodes = {
   'RefEq': 0xd3,
   'RefAsNonNull': 0xd4,
   'BrOnNull': 0xd5,
-  'BrOnNonNull': 0xd6
+  'BrOnNonNull': 0xd6,
+  'ContNew': 0xe0,
+  'ContBind': 0xe1,
+  'Suspend': 0xe2,
+  'Resume': 0xe3,
+  'ResumeThrow': 0xe4,
+  'ResumeThrowRef': 0xe5,
+  'Switch': 0xe6
 };
 
 function defineWasmOpcode(name, value) {
@@ -576,11 +594,13 @@ let kExprI31GetS = 0x1d;
 let kExprI31GetU = 0x1e;
 let kExprRefI31Shared = 0x1f;
 // Custom Descriptors proposal:
+let kExprStructNewDesc = 0x20;
+let kExprStructNewDefaultDesc = 0x21;
 let kExprRefGetDesc = 0x22;
-let kExprRefCastDesc = 0x23;
-let kExprRefCastDescNull = 0x24;
-let kExprBrOnCastDesc = 0x25;
-let kExprBrOnCastDescFail = 0x26;
+let kExprRefCastDescEq = 0x23;
+let kExprRefCastDescEqNull = 0x24;
+let kExprBrOnCastDescEq = 0x25;
+let kExprBrOnCastDescEqFail = 0x26;
 
 let kExprRefCastNop = 0x4c;
 
@@ -649,6 +669,10 @@ let kExprTableCopy = 0x0e;
 let kExprTableGrow = 0x0f;
 let kExprTableSize = 0x10;
 let kExprTableFill = 0x11;
+let kExprI64Add128 = 0x13;
+let kExprI64Sub128 = 0x14;
+let kExprI64MulWideS = 0x15;
+let kExprI64MulWideU = 0x16;
 
 // Atomic opcodes.
 let kExprAtomicNotify = 0x00;
@@ -721,6 +745,13 @@ let kExprI64AtomicCompareExchange16U = 0x4d;
 let kExprI64AtomicCompareExchange32U = 0x4e;
 
 // Atomic GC opcodes (shared-everything-threads).
+const kExprPause = 0x04;
+// TODO(manoskouk): These are just placeholders, adjust them when the spec
+// defines them.
+const kExprStructWait = 0x05;
+const kExprWaitqueueNotify = 0x06;
+const kExprWaitqueueNew = 0x07;
+const kExprPublish = 0x0f;
 const kExprStructAtomicGet = 0x5c;
 const kExprStructAtomicGetS = 0x5d;
 const kExprStructAtomicGetU = 0x5e;
@@ -730,6 +761,8 @@ const kExprStructAtomicSub = 0x61;
 const kExprStructAtomicAnd = 0x62;
 const kExprStructAtomicOr = 0x63;
 const kExprStructAtomicXor = 0x64;
+const kExprStructAtomicExchange = 0x65;
+const kExprStructAtomicCompareExchange = 0x66;
 const kExprArrayAtomicGet = 0x67;
 const kExprArrayAtomicGetS = 0x68;
 const kExprArrayAtomicGetU = 0x69;
@@ -739,6 +772,8 @@ const kExprArrayAtomicSub = 0x6c;
 const kExprArrayAtomicAnd = 0x6d;
 const kExprArrayAtomicOr = 0x6e;
 const kExprArrayAtomicXor = 0x6f;
+const kExprArrayAtomicExchange = 0x70;
+const kExprArrayAtomicCompareExchange = 0x71;
 
 // Simd opcodes.
 let kExprS128LoadMem = 0x00;
@@ -1001,7 +1036,11 @@ let kExprI16x8RelaxedQ15MulRS = wasmSignedLeb(0x111);
 let kExprI16x8DotI8x16I7x16S = wasmSignedLeb(0x112);
 let kExprI32x4DotI8x16I7x16AddS = wasmSignedLeb(0x113);
 
-// FP16 SIMD
+// FP16
+// kNumericPrefix instructions:
+let kExprF32LoadF16 = wasmSignedLeb(0x30);
+let kExprF32StoreF16 = wasmSignedLeb(0x31);
+// kSimdPrefix instructions:
 let kExprF16x8Splat = wasmSignedLeb(0x120);
 let kExprF16x8ExtractLane = wasmSignedLeb(0x121);
 let kExprF16x8ReplaceLane = wasmSignedLeb(0x122);
@@ -1036,15 +1075,6 @@ let kExprF32x4PromoteLowF16x8 = wasmSignedLeb(0x14b);
 let kExprF16x8Qfma = wasmSignedLeb(0x14e);
 let kExprF16x8Qfms = wasmSignedLeb(0x14f);
 
-// Compilation hint constants.
-let kCompilationHintStrategyDefault = 0x00;
-let kCompilationHintStrategyLazy = 0x01;
-let kCompilationHintStrategyEager = 0x02;
-let kCompilationHintStrategyLazyBaselineEagerTopTier = 0x03;
-let kCompilationHintTierDefault = 0x00;
-let kCompilationHintTierBaseline = 0x01;
-let kCompilationHintTierOptimized = 0x02;
-
 let kTrapUnreachable = 0;
 let kTrapMemOutOfBounds = 1;
 let kTrapDivByZero = 2;
@@ -1052,15 +1082,16 @@ let kTrapDivUnrepresentable = 3;
 let kTrapRemByZero = 4;
 let kTrapFloatUnrepresentable = 5;
 let kTrapTableOutOfBounds = 6;
-let kTrapFuncSigMismatch = 7;
-let kTrapUnalignedAccess = 8;
-let kTrapDataSegmentOutOfBounds = 9;
-let kTrapElementSegmentOutOfBounds = 10;
-let kTrapRethrowNull = 11;
-let kTrapArrayTooLarge = 12;
-let kTrapArrayOutOfBounds = 13;
-let kTrapNullDereference = 14;
-let kTrapIllegalCast = 15;
+let kTrapNullFunc = 7;
+let kTrapFuncSigMismatch = 8;
+let kTrapUnalignedAccess = 9;
+let kTrapDataSegmentOutOfBounds = 10;
+let kTrapElementSegmentOutOfBounds = 11;
+let kTrapRethrowNull = 12;
+let kTrapArrayTooLarge = 13;
+let kTrapArrayOutOfBounds = 14;
+let kTrapNullDereference = 15;
+let kTrapIllegalCast = 16;
 
 let kAtomicWaitOk = 0;
 let kAtomicWaitNotEqual = 1;
@@ -1072,6 +1103,10 @@ let kCatchRef = 0x1;
 let kCatchAllNoRef = 0x2;
 let kCatchAllRef = 0x3;
 
+// Stack switching handler kinds.
+let kOnSuspend = 0x0;
+let kOnSwitch = 0x1;
+
 let kTrapMsgs = [
   'unreachable',                                    // --
   'memory access out of bounds',                    // --
@@ -1080,7 +1115,8 @@ let kTrapMsgs = [
   'remainder by zero',                              // --
   'float unrepresentable in integer range',         // --
   'table index is out of bounds',                   // --
-  'null function or function signature mismatch',   // --
+  'null function',   // --
+  'function signature mismatch',   // --
   'operation does not support unaligned accesses',  // --
   'data segment out of bounds',                     // --
   'element segment out of bounds',                  // --
@@ -1261,11 +1297,6 @@ class WasmFunctionBuilder {
     return this;
   }
 
-  setCompilationHint(strategy, baselineTier, topTier) {
-    this.module.setCompilationHint(strategy, baselineTier, topTier, this.index);
-    return this;
-  }
-
   addBody(body) {
     checkExpr(body);
     // Store a copy of the body, and automatically add the end opcode.
@@ -1361,20 +1392,25 @@ function MustBeNumber(x, name) {
 }
 
 class WasmStruct {
-  constructor(fields, is_final, is_shared, supertype_idx) {
+  constructor(fields_or_options) {
+    let fields = fields_or_options;
+    let is_final = false;
+    let is_shared = false;
+    let supertype_idx = kNoSuperType;
     let descriptor = undefined;
     let describes = undefined;
     if (Array.isArray(fields)) {
       // Fall through.
     } else if (fields.constructor === Object) {
       // Options bag.
-      is_final = fields.is_final ?? fields.final ?? false;
-      is_shared = fields.is_shared ?? fields.shared ?? false;
+      is_final = fields.is_final ?? fields.final ?? is_final;
+      is_shared = fields.is_shared ?? fields.shared ?? is_shared;
       supertype_idx = MustBeNumber(
-          fields.supertype_idx ?? fields.supertype ?? kNoSuperType,
+          fields.supertype_idx ?? fields.supertype ?? supertype_idx,
           "supertype");
-      descriptor = MustBeNumber(fields.descriptor, "'descriptor'");
-      describes = MustBeNumber(fields.describes, "'describes'");
+      descriptor = MustBeNumber(
+          fields.descriptor ?? descriptor, "'descriptor'");
+      describes = MustBeNumber(fields.describes ?? describes, "'describes'");
       fields = fields.fields ?? [];  // This must happen last.
     } else {
       throw new Error('struct fields must be an array');
@@ -1390,13 +1426,34 @@ class WasmStruct {
 }
 
 class WasmArray {
-  constructor(type, mutability, is_final, is_shared, supertype_idx) {
+  constructor(type, options) {
+    let mutability = true;
+    let is_final = false;
+    let is_shared = false;
+    let supertype_idx = kNoSuperType;
+    if (typeof options === 'object') {
+      mutability = options.mutable ?? options.mutability ?? mutability;
+      is_final = options.is_final ?? options.final ?? is_final;
+      is_shared = options.is_shared ?? options.shared ?? is_shared;
+      supertype_idx = MustBeNumber(
+          options.supertype_idx ?? options.supertype ?? supertype_idx,
+          "supertype");
+    }
     this.type = type;
-    this.mutability = mutability;
     this.type_form = kWasmArrayTypeForm;
+    this.mutability = mutability;
     this.is_final = is_final;
     this.is_shared = is_shared;
     this.supertype = supertype_idx;
+  }
+}
+
+class WasmCont {
+  constructor(type_index) {
+    this.type_index = type_index;
+    this.supertype = kNoSuperType;
+    this.is_final = true;
+    this.is_shared = false;
   }
 }
 
@@ -1436,6 +1493,131 @@ class WasmElemSegment {
   }
 }
 
+class ImportGroupBuilder {
+  constructor(builder, encoding, module, kind = null, fields = null) {
+    this.builder = builder;
+    this.encoding = encoding;
+    this.module = module;
+    this.kind = kind;
+    Object.assign(this, fields);
+    this.imports = [];
+  }
+
+  add(name) {
+    if (this.kind === null) {
+      throw new Error("must specify import kind/type in import group");
+    }
+    this.imports.push({ name });
+    if (this.kind === kExternalFunction) {
+      if (this.builder.functions.length != 0) {
+        throw new Error(
+          'Imported functions must be declared before local ones');
+      }
+      return this.builder.num_imported_funcs++;
+    }
+    if (this.kind === kExternalGlobal) {
+      if (this.builder.globals.length != 0) {
+        throw new Error(
+          'Imported globals must be declared before local ones');
+      }
+      return this.builder.num_imported_globals++;
+    }
+    if (this.kind === kExternalMemory) {
+      if (this.builder.memories.length != 0) {
+        throw new Error(
+          'Add imported memories before declared memories to avoid ' +
+          'messing up the indexes');
+      }
+      return this.builder.num_imported_memories++;
+    }
+    if (this.kind === kExternalTable) {
+      if (this.builder.tables.length != 0) {
+        throw new Error('Imported tables must be declared before local ones');
+      }
+      return this.builder.num_imported_tables++;
+    }
+    if (this.kind === kExternalTag) {
+      if (this.builder.tags.length != 0) {
+        throw new Error('Imported tags must be declared before local ones');
+      }
+      return this.builder.num_imported_tags++;
+    }
+  }
+
+  addFunction(name, type) {
+    if (this.kind !== null) {
+      throw new Error("use simple 'add(name)' for typed import groups");
+    }
+    if (this.builder.functions.length != 0) {
+      throw new Error(
+        'Imported functions must be declared before local ones');
+    }
+    let type_index =
+      (typeof type) == 'number' ? type : this.builder.addType(type);
+    this.imports.push({ name, kind: kExternalFunction, type_index });
+    return this.builder.num_imported_funcs++;
+  }
+
+  addGlobal(name, type, mutable = false, shared = false) {
+    if (this.kind !== null) {
+      throw new Error("use simple 'add(name)' for typed import groups");
+    }
+    if (this.builder.globals.length != 0) {
+      throw new Error('Imported globals must be declared before local ones');
+    }
+    this.imports.push({ name, kind: kExternalGlobal, type, mutable, shared });
+    return this.builder.num_imported_globals++;
+  }
+
+  addMemory(name, initial = 0, maximum, shared, is_memory64) {
+    if (this.kind !== null) {
+      throw new Error("use simple 'add(name)' for typed import groups");
+    }
+    if (this.builder.memories.length !== 0) {
+      throw new Error(
+        'Add imported memories before declared memories to avoid messing ' +
+        'up the indexes');
+    }
+    shared = !!shared;
+    is_memory64 = !!is_memory64;
+    this.imports.push({
+      name, kind: kExternalMemory, initial, maximum, shared, is_memory64
+    });
+    return this.builder.num_imported_memories++;
+  }
+
+  addTable(
+    name, initial, maximum, type = kWasmFuncRef, shared = false,
+    is_table64 = false) {
+    if (this.kind !== null) {
+      throw new Error("use simple 'add(name)' for typed import groups");
+    }
+    if (this.builder.tables.length != 0) {
+      throw new Error('Imported tables must be declared before local ones');
+    }
+    shared = !!shared;
+    is_table64 = !!is_table64;
+    this.imports.push({
+      name, kind: kExternalTable, initial, maximum, type, shared,
+      is_table64
+    });
+    return this.builder.num_imported_tables++;
+  }
+
+  addTag(name, type) {
+    if (this.kind !== null) {
+      throw new Error("use simple 'add(name)' for typed import groups");
+    }
+    if (this.builder.tags.length != 0) {
+      throw new Error('Imported tags must be declared before local ones');
+    }
+    let type_index =
+      (typeof type) == 'number' ? type : this.builder.addType(type);
+    this.imports.push({ name, kind: kExternalTag, type_index });
+    return this.builder.num_imported_tags++;
+  }
+}
+
 class WasmModuleBuilder {
   constructor() {
     this.types = [];
@@ -1447,17 +1629,22 @@ class WasmModuleBuilder {
     this.tags = [];
     this.memories = [];
     this.functions = [];
-    this.compilation_hints = [];
     this.element_segments = [];
     this.data_segments = [];
     this.explicit = [];
     this.rec_groups = [];
+    this.compilation_priorities = new Map();
+    this.instruction_frequencies = new Map();
+    this.call_targets = new Map();
+    this.start_index = undefined;
     this.num_imported_funcs = 0;
     this.num_imported_globals = 0;
     this.num_imported_tables = 0;
     this.num_imported_tags = 0;
+    this.num_imported_memories = 0;
     return this;
   }
+
 
   addStart(start_index) {
     this.start_index = start_index;
@@ -1467,9 +1654,7 @@ class WasmModuleBuilder {
   addMemory(min, max, shared) {
     // Note: All imported memories are added before declared ones (see the check
     // in {addImportedMemory}).
-    const imported_memories =
-        this.imports.filter(i => i.kind == kExternalMemory).length;
-    const mem_index = imported_memories + this.memories.length;
+    const mem_index = this.num_imported_memories + this.memories.length;
     this.memories.push(
         {min: min, max: max, shared: shared || false, is_memory64: false});
     return mem_index;
@@ -1478,9 +1663,7 @@ class WasmModuleBuilder {
   addMemory64(min, max, shared) {
     // Note: All imported memories are added before declared ones (see the check
     // in {addImportedMemory}).
-    const imported_memories =
-        this.imports.filter(i => i.kind == kExternalMemory).length;
-    const mem_index = imported_memories + this.memories.length;
+    const mem_index = this.num_imported_memories + this.memories.length;
     this.memories.push(
         {min: min, max: max, shared: shared || false, is_memory64: true});
     return mem_index;
@@ -1532,22 +1715,30 @@ class WasmModuleBuilder {
     return this.stringrefs.length - 1;
   }
 
-  // {fields} may be a list of fields, in which case the other parameters are
-  // relevant; or an options bag, which replaces the other parameters.
-  // Example: addStruct({fields: [...], supertype: 3})
-  addStruct(fields, supertype_idx = kNoSuperType, is_final = false,
-            is_shared = false) {
-    this.types.push(
-        new WasmStruct(fields, is_final, is_shared, supertype_idx));
+  // {fields} may be a list of fields, or an options bag with more attributes.
+  // Example:
+  // addStruct({fields: [...], supertype: 3, final: true, shared: true})
+  addStruct(fields_or_options) {
+    this.types.push(new WasmStruct(fields_or_options));
     return this.types.length - 1;
   }
 
-  addArray(type, mutability, supertype_idx = kNoSuperType, is_final = false,
-           is_shared = false) {
-    this.types.push(
-        new WasmArray(type, mutability, is_final, is_shared, supertype_idx));
+  // {options}: mutable (default: true), final (default: false),
+  //            shared (default: false), supertype (default: kNoSuperType)
+  addArray(type, options) {
+    if (options !== undefined && typeof options !== 'object') {
+      throw new Error(`options must be an object, is ${options}`);
+    }
+    this.types.push(new WasmArray(type, options));
     return this.types.length - 1;
   }
+
+  addCont(type) {
+    let type_index = (typeof type) == 'number' ? type : this.addType(type);
+    this.types.push(new WasmCont(type_index));
+    return this.types.length - 1;
+  }
+
 
   nextTypeIndex() { return this.types.length; }
 
@@ -1618,27 +1809,24 @@ class WasmModuleBuilder {
     arg_names = arg_names || [];
     let type_index = (typeof type) == 'number' ? type : this.addType(type);
     let num_args = this.types[type_index].params.length;
-    if (num_args < arg_names.length)
+    if (num_args < arg_names.length) {
       throw new Error('too many arg names provided');
-    if (num_args > arg_names.length)
+    }
+    if (num_args > arg_names.length) {
       arg_names.push(num_args - arg_names.length);
+    }
     let func = new WasmFunctionBuilder(this, name, type_index, arg_names);
     func.index = this.functions.length + this.num_imported_funcs;
     this.functions.push(func);
     return func;
   }
 
-  addImport(module, name, type) {
+  addImport(module, name, type, kind = kExternalFunction) {
     if (this.functions.length != 0) {
       throw new Error('Imported functions must be declared before local ones');
     }
     let type_index = (typeof type) == 'number' ? type : this.addType(type);
-    this.imports.push({
-      module: module,
-      name: name,
-      kind: kExternalFunction,
-      type_index: type_index
-    });
+    this.imports.push({ module, name, kind, encoding: kIndividualImportEncoding, type_index });
     return this.num_imported_funcs++;
   }
 
@@ -1646,15 +1834,8 @@ class WasmModuleBuilder {
     if (this.globals.length != 0) {
       throw new Error('Imported globals must be declared before local ones');
     }
-    let o = {
-      module: module,
-      name: name,
-      kind: kExternalGlobal,
-      type: type,
-      mutable: mutable,
-      shared: shared
-    };
-    this.imports.push(o);
+    let kind = kExternalGlobal;
+    this.imports.push({ module, name, kind, encoding: kIndividualImportEncoding, type, mutable, shared });
     return this.num_imported_globals++;
   }
 
@@ -1664,37 +1845,23 @@ class WasmModuleBuilder {
           'Add imported memories before declared memories to avoid messing ' +
           'up the indexes');
     }
-    let mem_index = this.imports.filter(i => i.kind == kExternalMemory).length;
-    let o = {
-      module: module,
-      name: name,
-      kind: kExternalMemory,
-      initial: initial,
-      maximum: maximum,
-      shared: !!shared,
-      is_memory64: !!is_memory64
-    };
-    this.imports.push(o);
-    return mem_index;
+    let kind = kExternalMemory;
+    shared = !!shared;
+    is_memory64 = !!is_memory64;
+    this.imports.push({ module, name, kind, encoding: kIndividualImportEncoding, initial, maximum, shared, is_memory64 });
+    return this.num_imported_memories++;
   }
 
   addImportedTable(
       module, name, initial, maximum, type = kWasmFuncRef, shared = false,
-      is_table64 = false) {
+    is_table64 = false) {
     if (this.tables.length != 0) {
       throw new Error('Imported tables must be declared before local ones');
     }
-    let o = {
-      module: module,
-      name: name,
-      kind: kExternalTable,
-      initial: initial,
-      maximum: maximum,
-      type: type,
-      shared: !!shared,
-      is_table64: !!is_table64,
-    };
-    this.imports.push(o);
+    let kind = kExternalTable;
+    shared = !!shared;
+    is_table64 = !!is_table64;
+    this.imports.push({ module, name, kind, encoding: kIndividualImportEncoding, initial, maximum, type, shared, is_table64 });
     return this.num_imported_tables++;
   }
 
@@ -1703,14 +1870,56 @@ class WasmModuleBuilder {
       throw new Error('Imported tags must be declared before local ones');
     }
     let type_index = (typeof type) == 'number' ? type : this.addType(type);
-    let o = {
-      module: module,
-      name: name,
-      kind: kExternalTag,
-      type_index: type_index
-    };
-    this.imports.push(o);
+    let kind = kExternalTag;
+    this.imports.push({ module, name, kind, encoding: kIndividualImportEncoding, type_index });
     return this.num_imported_tags++;
+  }
+
+  addImportGroup(module) {
+    let group = new ImportGroupBuilder(this, kCompactImportByModule, module);
+    this.imports.push(group);
+    return group;
+  }
+
+  addImportedFunctionGroup(module, type) {
+    let type_index = (typeof type) == 'number' ? type : this.addType(type);
+    let group = new ImportGroupBuilder(
+      this, kCompactImportByModuleAndType, module, kExternalFunction, { type_index: type_index });
+    this.imports.push(group);
+    return group;
+  }
+
+  addImportedGlobalsGroup(module, type, mutable, shared) {
+    let group = new ImportGroupBuilder(
+      this, kCompactImportByModuleAndType, module, kExternalGlobal,
+      { type, mutable, shared });
+    this.imports.push(group);
+    return group;
+  }
+
+  addImportedTableGroup(module, initial, maximum, type, shared, is_table64) {
+    let group = new ImportGroupBuilder(
+      this, kCompactImportByModuleAndType, module, kExternalTable,
+      { initial, maximum, type, shared, is_table64 });
+    this.imports.push(group);
+    return group;
+  }
+
+  addImportedMemoryGroup(module, initial, maximum, shared, is_memory64) {
+    let group = new ImportGroupBuilder(
+      this, kCompactImportByModuleAndType, module, kExternalMemory,
+      { initial, maximum, shared, is_memory64 });
+    this.imports.push(group);
+    return group;
+  }
+
+  addImportedTagGroup(module, type) {
+    let type_index = (typeof type) == 'number' ? type : this.addType(type);
+    let group = new ImportGroupBuilder(
+      this, kCompactImportByModuleAndType, module, kExternalTag,
+      { type_index: type_index });
+    this.imports.push(group);
+    return group;
   }
 
   addExport(name, index) {
@@ -1728,15 +1937,6 @@ class WasmModuleBuilder {
       throw new Error('Index for exports must be a number')
     }
     this.exports.push({name: name, kind: kind, index: index});
-    return this;
-  }
-
-  setCompilationHint(strategy, baselineTier, topTier, index) {
-    this.compilation_hints[index] = {
-      strategy: strategy,
-      baselineTier: baselineTier,
-      topTier: topTier
-    };
     return this;
   }
 
@@ -1760,8 +1960,7 @@ class WasmModuleBuilder {
 
   exportMemoryAs(name, memory_index) {
     if (memory_index === undefined) {
-      const num_memories = this.memories.length +
-          this.imports.filter(i => i.kind == kExternalMemory).length;
+      const num_memories = this.memories.length + this.num_imported_memories;
       if (num_memories !== 1) {
         throw new Error(
             'Pass memory index to \'exportMemoryAs\' if there is not exactly ' +
@@ -1854,6 +2053,30 @@ class WasmModuleBuilder {
     return this;
   }
 
+  setCompilationPriority(
+      function_index, compilation_priority, optimization_priority) {
+    this.compilation_priorities.set(function_index, {
+      compilation_priority, optimization_priority
+    });
+  }
+
+  // `instruction_frequencies` must be an array of {offset, frequency} objects.
+  setInstructionFrequencies(function_index, instruction_frequencies) {
+    if (!Array.isArray(instruction_frequencies)) {
+      throw new Error("instruction_frequencies must be an array");
+    }
+    this.instruction_frequencies.set(function_index, instruction_frequencies);
+  }
+
+  // `call_targets` must be an array of {offset, targets} object, where
+  // `targets` is an array of {function_index, frequency_percent} objects.
+  setCallTargets(function_index, call_targets) {
+    if (!Array.isArray(call_targets)) {
+      throw new Error("call_targets must be an array");
+    }
+    this.call_targets.set(function_index, call_targets);
+  }
+
   toBuffer(debug = false) {
     let binary = new Binary;
     let wasm = this;
@@ -1911,6 +2134,9 @@ class WasmModuleBuilder {
             section.emit_u8(kWasmArrayTypeForm);
             section.emit_type(type.type);
             section.emit_u8(type.mutability ? 1 : 0);
+          } else if (type instanceof WasmCont) {
+            section.emit_u8(kWasmContTypeForm);
+            section.emit_u32v(type.type_index);
           } else {
             section.emit_u8(kWasmFunctionTypeForm);
             section.emit_u32v(type.params.length);
@@ -1926,47 +2152,70 @@ class WasmModuleBuilder {
       });
     }
 
+    const emitExternType = (bin, imp) => {
+      bin.emit_u8(imp.kind);
+      if (imp.kind == kExternalFunction ||
+          imp.kind == kExternalExactFunction) {
+        bin.emit_u32v(imp.type_index);
+      } else if (imp.kind == kExternalGlobal) {
+        bin.emit_type(imp.type);
+        let flags = (imp.mutable ? 1 : 0) | (imp.shared ? 0b10 : 0);
+        bin.emit_u8(flags);
+      } else if (imp.kind == kExternalMemory) {
+        const has_max = imp.maximum !== undefined;
+        const is_shared = !!imp.shared;
+        const is_memory64 = !!imp.is_memory64;
+        let limits_byte =
+            (is_memory64 ? 4 : 0) | (is_shared ? 2 : 0) | (has_max ? 1 : 0);
+        bin.emit_u8(limits_byte);
+        let emit = val =>
+            is_memory64 ? bin.emit_u64v(val) : bin.emit_u32v(val);
+        emit(imp.initial);
+        if (has_max) emit(imp.maximum);
+      } else if (imp.kind == kExternalTable) {
+        bin.emit_type(imp.type);
+        const has_max = (typeof imp.maximum) != 'undefined';
+        const is_shared = !!imp.shared;
+        const is_table64 = !!imp.is_table64;
+        let limits_byte =
+            (is_table64 ? 4 : 0) | (is_shared ? 2 : 0) | (has_max ? 1 : 0);
+        bin.emit_u8(limits_byte);                 // flags
+        bin.emit_u32v(imp.initial);               // initial
+        if (has_max) bin.emit_u32v(imp.maximum);  // maximum
+      } else if (imp.kind == kExternalTag) {
+        bin.emit_u32v(kExceptionAttribute);
+        bin.emit_u32v(imp.type_index);
+      } else {
+        throw new Error('unknown/unsupported import kind ' + imp.kind);
+      }
+    };
+
     // Add imports section.
     if (wasm.imports.length > 0) {
-      if (debug) print('emitting imports @ ' + binary.length);
+      if (debug) print('emitting imports @ ' + binary.length + ` ${JSON.stringify(wasm.imports)}`);
       binary.emit_section(kImportSectionCode, section => {
         section.emit_u32v(wasm.imports.length);
-        for (let imp of wasm.imports) {
-          section.emit_string(imp.module);
-          section.emit_string(imp.name || '');
-          section.emit_u8(imp.kind);
-          if (imp.kind == kExternalFunction) {
-            section.emit_u32v(imp.type_index);
-          } else if (imp.kind == kExternalGlobal) {
-            section.emit_type(imp.type);
-            let flags = (imp.mutable ? 1 : 0) | (imp.shared ? 0b10 : 0);
-            section.emit_u8(flags);
-          } else if (imp.kind == kExternalMemory) {
-            const has_max = imp.maximum !== undefined;
-            const is_shared = !!imp.shared;
-            const is_memory64 = !!imp.is_memory64;
-            let limits_byte =
-                (is_memory64 ? 4 : 0) | (is_shared ? 2 : 0) | (has_max ? 1 : 0);
-            section.emit_u8(limits_byte);
-            let emit = val =>
-                is_memory64 ? section.emit_u64v(val) : section.emit_u32v(val);
-            emit(imp.initial);
-            if (has_max) emit(imp.maximum);
-          } else if (imp.kind == kExternalTable) {
-            section.emit_type(imp.type);
-            const has_max = (typeof imp.maximum) != 'undefined';
-            const is_shared = !!imp.shared;
-            const is_table64 = !!imp.is_table64;
-            let limits_byte =
-                (is_table64 ? 4 : 0) | (is_shared ? 2 : 0) | (has_max ? 1 : 0);
-            section.emit_u8(limits_byte);                 // flags
-            section.emit_u32v(imp.initial);               // initial
-            if (has_max) section.emit_u32v(imp.maximum);  // maximum
-          } else if (imp.kind == kExternalTag) {
-            section.emit_u32v(kExceptionAttribute);
-            section.emit_u32v(imp.type_index);
+        for (let impEntry of wasm.imports) {
+          section.emit_string(impEntry.module);
+          if (impEntry.encoding === kCompactImportByModule) {
+            section.emit_string("");
+            section.emit_u8(kCompactImportByModule);
+            section.emit_u32v(impEntry.imports.length);
+            for (let sub of impEntry.imports) {
+              section.emit_string(sub.name);
+              emitExternType(section, sub);
+            }
+          } else if (impEntry.encoding === kCompactImportByModuleAndType) {
+            section.emit_string("");
+            section.emit_u8(kCompactImportByModuleAndType);
+            emitExternType(section, impEntry);
+            section.emit_u32v(impEntry.imports.length);
+            for (let sub of impEntry.imports) {
+              section.emit_string(sub.name);
+            }
           } else {
-            throw new Error('unknown/unsupported import kind ' + imp.kind);
+            section.emit_string(impEntry.name || '');
+            emitExternType(section, impEntry);
           }
         }
       });
@@ -2158,40 +2407,6 @@ class WasmModuleBuilder {
       });
     }
 
-    // If there are compilation hints add a custom section 'compilationHints'
-    // after the function section and before the code section.
-    if (wasm.compilation_hints.length > 0) {
-      if (debug) print('emitting compilation hints @ ' + binary.length);
-      // Build custom section payload.
-      let payloadBinary = new Binary();
-      let implicit_compilation_hints_count = wasm.functions.length;
-      payloadBinary.emit_u32v(implicit_compilation_hints_count);
-
-      // Defaults to the compiler's choice if no better hint was given (0x00).
-      let defaultHintByte = kCompilationHintStrategyDefault |
-          (kCompilationHintTierDefault << 2) |
-          (kCompilationHintTierDefault << 4);
-
-      // Emit hint byte for every function defined in this module.
-      for (let i = 0; i < implicit_compilation_hints_count; i++) {
-        let index = wasm.num_imported_funcs + i;
-        var hintByte;
-        if (index in wasm.compilation_hints) {
-          let hint = wasm.compilation_hints[index];
-          hintByte =
-              hint.strategy | (hint.baselineTier << 2) | (hint.topTier << 4);
-        } else {
-          hintByte = defaultHintByte;
-        }
-        payloadBinary.emit_u8(hintByte);
-      }
-
-      // Finalize as custom section.
-      let name = 'compilationHints';
-      let bytes = this.createCustomSection(name, payloadBinary.trunc_buffer());
-      binary.emit_bytes(bytes);
-    }
-
     // Add function bodies.
     if (wasm.functions.length > 0) {
       // emit function bodies
@@ -2309,6 +2524,76 @@ class WasmModuleBuilder {
           });
         }
       });
+    }
+
+    // Add compilation priorities.
+    if (this.compilation_priorities.size > 0) {
+      binary.emit_section(kUnknownSectionCode, section => {
+        section.emit_string("metadata.code.compilation_priority");
+        section.emit_u32v(this.compilation_priorities.size);
+        this.compilation_priorities.forEach((priority, index) => {
+          section.emit_u32v(index);
+          section.emit_u8(0);  // Byte offset 0 for function-level hint.
+          let compilation_priority =
+              wasmUnsignedLeb(priority.compilation_priority);
+          let optimization_priority =
+              priority.optimization_priority != undefined ?
+              wasmUnsignedLeb(priority.optimization_priority) :
+              [];
+          section.emit_u32v(compilation_priority.length +
+                            optimization_priority.length);
+          section.emit_bytes(compilation_priority);
+          section.emit_bytes(optimization_priority);
+        })
+      })
+    }
+
+    // Add instruction frequencies.
+    if (this.instruction_frequencies.size > 0) {
+      binary.emit_section(kUnknownSectionCode, section => {
+        section.emit_string("metadata.code.instr_freq");
+        section.emit_u32v(this.instruction_frequencies.size);
+        this.instruction_frequencies.forEach((frequencies, index) => {
+          section.emit_u32v(index);
+          section.emit_u32v(frequencies.length);
+          frequencies.forEach(frequency => {
+            section.emit_u32v(frequency.offset);
+            section.emit_u32v(1);  // Hint length.
+            section.emit_u8(frequency.frequency);
+          })
+        })
+      })
+    }
+
+    // Add call targets.
+    if (this.call_targets.size > 0) {
+      binary.emit_section(kUnknownSectionCode, section => {
+        section.emit_string("metadata.code.call_targets");
+        section.emit_u32v(this.call_targets.size);
+        this.call_targets.forEach((targets, index) => {
+          section.emit_u32v(index);
+          section.emit_u32v(targets.length);
+          targets.forEach(targets_for_offset => {
+            section.emit_u32v(targets_for_offset.offset);
+            let hints = targets_for_offset.targets.map(target => {
+              return {
+                function_index: wasmUnsignedLeb(target.function_index),
+                frequency_percent: wasmUnsignedLeb(target.frequency_percent)
+              }
+            })
+            var hint_length = 0;
+            hints.forEach(hint => {
+              hint_length += hint.function_index.length;
+              hint_length += hint.frequency_percent.length;
+            });
+            section.emit_u32v(hint_length);
+            hints.forEach(hint => {
+              section.emit_u32v(hint.function_index);
+              section.emit_u32v(hint.frequency_percent);
+            })
+          })
+        })
+      })
     }
 
     return binary.trunc_buffer();
@@ -2452,7 +2737,7 @@ let wasmEncodeHeapType = function(type) {
   return result;
 };
 
-let [wasmBrOnCast, wasmBrOnCastFail, wasmBrOnCastDesc, wasmBrOnCastDescFail] =
+let [wasmBrOnCast, wasmBrOnCastFail, wasmBrOnCastDescEq, wasmBrOnCastDescEqFail] =
 (function() {
   return [
     (labelIdx, sourceType, targetType) =>
@@ -2460,9 +2745,9 @@ let [wasmBrOnCast, wasmBrOnCastFail, wasmBrOnCastDesc, wasmBrOnCastDescFail] =
     (labelIdx, sourceType, targetType) =>
       wasmBrOnCastImpl(labelIdx, sourceType, targetType, kExprBrOnCastFail),
     (labelIdx, sourceType, targetType) =>
-      wasmBrOnCastImpl(labelIdx, sourceType, targetType, kExprBrOnCastDesc),
+      wasmBrOnCastImpl(labelIdx, sourceType, targetType, kExprBrOnCastDescEq),
     (labelIdx, sourceType, targetType) =>
-      wasmBrOnCastImpl(labelIdx, sourceType, targetType, kExprBrOnCastDescFail),
+      wasmBrOnCastImpl(labelIdx, sourceType, targetType, kExprBrOnCastDescEqFail),
   ];
   function wasmBrOnCastImpl(labelIdx, sourceType, targetType, opcode) {
     labelIdx = wasmUnsignedLeb(labelIdx, kMaxVarInt32Size);
@@ -2486,4 +2771,37 @@ function wasmF32ConstSignalingNaN() {
 
 function wasmF64ConstSignalingNaN() {
   return [kExprF64Const, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf4, 0x7f];
+}
+
+// Polyfill for "new WebAssembly.Function" from the defunct "type reflection"
+// proposal.
+function WebAssemblyFunction(sig, closure) {
+  const typeMap = {
+    'i32': kWasmI32,
+    'i64': kWasmI64,
+    'f32': kWasmF32,
+    'f64': kWasmF64,
+    'externref': kWasmExternRef,
+    'funcref': kWasmFuncRef,
+    'anyfunc': kWasmFuncRef,
+    'v128': kWasmS128,
+    'structref': kWasmStructRef,
+    'arrayref': kWasmArrayRef,
+  };
+
+  let builder = new WasmModuleBuilder();
+  let params = sig.parameters.map(t => {
+    let mapped = typeMap[t];
+    if (mapped === undefined) throw new Error(`Unknown type: ${t}`);
+    return mapped;
+  });
+  let results = sig.results.map(t => {
+    let mapped = typeMap[t];
+    if (mapped === undefined) throw new Error(`Unknown type: ${t}`);
+    return mapped;
+  });
+  let index = builder.addImport('m', 'f', makeSig(params, results));
+  builder.addExport('f', index);
+  let instance = builder.instantiate({m: {f: closure}});
+  return instance.exports.f;
 }

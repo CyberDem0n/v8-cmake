@@ -7,15 +7,12 @@
 #include <iomanip>
 
 #include "src/deoptimizer/translated-state.h"
+#include "src/heap/local-heap-inl.h"
 #include "src/interpreter/bytecode-array-iterator.h"
 #include "src/objects/casting.h"
 #include "src/objects/code.h"
 #include "src/objects/deoptimization-data-inl.h"
 #include "src/objects/shared-function-info.h"
-
-#ifdef V8_USE_ZLIB
-#include "third_party/zlib/google/compression_utils_portable.h"
-#endif  // V8_USE_ZLIB
 
 namespace v8 {
 namespace internal {
@@ -23,52 +20,158 @@ namespace internal {
 DirectHandle<Object> DeoptimizationLiteral::Reify(Isolate* isolate) const {
   Validate();
   switch (kind_) {
-    case DeoptimizationLiteralKind::kObject: {
+    case DeoptimizationLiteralKind::kObject:
       return object_;
-    }
-    case DeoptimizationLiteralKind::kNumber: {
+    case DeoptimizationLiteralKind::kNumber:
       return isolate->factory()->NewNumber(number_);
-    }
-    case DeoptimizationLiteralKind::kSignedBigInt64: {
+    case DeoptimizationLiteralKind::kSignedBigInt64:
       return BigInt::FromInt64(isolate, int64_);
-    }
-    case DeoptimizationLiteralKind::kUnsignedBigInt64: {
+    case DeoptimizationLiteralKind::kUnsignedBigInt64:
       return BigInt::FromUint64(isolate, uint64_);
-    }
-    case DeoptimizationLiteralKind::kHoleNaN: {
+    case DeoptimizationLiteralKind::kHoleNaN:
       // Hole NaNs that made it to here represent the undefined value.
       return isolate->factory()->undefined_value();
-    }
     case DeoptimizationLiteralKind::kWasmI31Ref:
     case DeoptimizationLiteralKind::kWasmInt32:
     case DeoptimizationLiteralKind::kWasmFloat32:
     case DeoptimizationLiteralKind::kWasmFloat64:
-    case DeoptimizationLiteralKind::kInvalid: {
-      UNREACHABLE();
-    }
+    case DeoptimizationLiteralKind::kInvalid:
+      break;
   }
   UNREACHABLE();
 }
 
+size_t DeoptimizationLiteral::SerializationSize() const {
+  static constexpr size_t kSizeOfKind = 1;
+  switch (kind_) {
+    case DeoptimizationLiteralKind::kInvalid:
+    case DeoptimizationLiteralKind::kObject:
+    case DeoptimizationLiteralKind::kNumber:
+    case DeoptimizationLiteralKind::kHoleNaN:
+      break;
+    case DeoptimizationLiteralKind::kSignedBigInt64:
+      return kSizeOfKind + sizeof(int64_);
+    case DeoptimizationLiteralKind::kUnsignedBigInt64:
+      return kSizeOfKind + sizeof(uint64_);
+    case DeoptimizationLiteralKind::kWasmI31Ref:
+    case DeoptimizationLiteralKind::kWasmInt32:
+      return kSizeOfKind + sizeof(int32_t);
+    case DeoptimizationLiteralKind::kWasmFloat32:
+      return kSizeOfKind + sizeof(Float32);
+    case DeoptimizationLiteralKind::kWasmFloat64:
+      return kSizeOfKind + sizeof(Float64);
+  }
+  UNREACHABLE();
+}
+
+size_t DeoptimizationLiteral::Write(base::Vector<uint8_t> buffer) const {
+  static constexpr size_t kSizeOfKind = 1;
+  static_assert(
+      std::is_same_v<uint8_t,
+                     std::underlying_type_t<DeoptimizationLiteralKind>>);
+  DCHECK_LE(kSizeOfKind, buffer.size());
+  buffer[0] = static_cast<uint8_t>(kind());
+  buffer += kSizeOfKind;
+  auto WriteValue = [buffer](auto value) {
+    static_assert(std::is_trivially_copyable_v<decltype(value)>);
+    DCHECK_LE(sizeof(value), buffer.size());
+    memcpy(buffer.data(), &value, sizeof(value));
+    return sizeof(value) + kSizeOfKind;
+  };
+  switch (kind_) {
+    case DeoptimizationLiteralKind::kInvalid:
+    case DeoptimizationLiteralKind::kObject:
+    case DeoptimizationLiteralKind::kNumber:
+    case DeoptimizationLiteralKind::kHoleNaN:
+      break;
+    case DeoptimizationLiteralKind::kSignedBigInt64:
+      return WriteValue(int64_);
+    case DeoptimizationLiteralKind::kUnsignedBigInt64:
+      return WriteValue(uint64_);
+    case DeoptimizationLiteralKind::kWasmI31Ref:
+    case DeoptimizationLiteralKind::kWasmInt32:
+      return WriteValue(int32_);
+    case DeoptimizationLiteralKind::kWasmFloat32:
+      return WriteValue(float32_);
+    case DeoptimizationLiteralKind::kWasmFloat64:
+      return WriteValue(float64_);
+  }
+  UNREACHABLE();
+}
+
+// static
+size_t DeoptimizationLiteral::Read(base::Vector<const uint8_t> buffer,
+                                   DeoptimizationLiteral* out) {
+  static constexpr size_t kSizeOfKind = 1;
+  static_assert(
+      std::is_same_v<uint8_t,
+                     std::underlying_type_t<DeoptimizationLiteralKind>>);
+  DCHECK_NE(0, buffer.size());
+  DeoptimizationLiteralKind kind =
+      static_cast<DeoptimizationLiteralKind>(buffer[0]);
+  buffer += kSizeOfKind;
+  auto Read = []<typename T, typename R = T>(base::Vector<const uint8_t> buffer,
+                                             DeoptimizationLiteral* out,
+                                             std::function<R(T)> convert = {}) {
+    T value;
+    DCHECK_LE(sizeof(value), buffer.size());
+    memcpy(&value, buffer.data(), sizeof(value));
+    R result_value;
+    if constexpr (std::is_same_v<T, R>) {
+      result_value = convert ? convert(value) : value;
+    } else {
+      DCHECK_NOT_NULL(convert);
+      result_value = convert(value);
+    }
+    *out = DeoptimizationLiteral{result_value};
+    return sizeof(value) + kSizeOfKind;
+  };  // NOLINT(readability/braces)
+
+  switch (kind) {
+    case DeoptimizationLiteralKind::kInvalid:
+    case DeoptimizationLiteralKind::kObject:
+    case DeoptimizationLiteralKind::kNumber:
+    case DeoptimizationLiteralKind::kHoleNaN:
+      break;
+    case DeoptimizationLiteralKind::kSignedBigInt64:
+      return Read.operator()<int64_t>(buffer, out);
+    case DeoptimizationLiteralKind::kUnsignedBigInt64:
+      return Read.operator()<uint64_t>(buffer, out);
+    case DeoptimizationLiteralKind::kWasmI31Ref:
+      return Read.operator()<int32_t, Tagged<Smi>>(
+          buffer, out, [](int32_t value) { return Smi::FromInt(value); });
+    case DeoptimizationLiteralKind::kWasmInt32:
+      return Read.operator()<int32_t>(buffer, out);
+    case DeoptimizationLiteralKind::kWasmFloat32:
+      return Read.operator()<Float32>(buffer, out);
+    case DeoptimizationLiteralKind::kWasmFloat64:
+      return Read.operator()<Float64>(buffer, out);
+  }
+  UNREACHABLE();
+}
+
+// TODO(375937549): Convert deopt_entry_count to uint32_t.
 Handle<DeoptimizationData> DeoptimizationData::New(Isolate* isolate,
                                                    int deopt_entry_count) {
-  return Cast<DeoptimizationData>(
-      isolate->factory()->NewProtectedFixedArray(LengthFor(deopt_entry_count)));
+  return UncheckedCast<DeoptimizationData>(
+      isolate->factory()->NewProtectedFixedArray(
+          static_cast<uint32_t>(LengthFor(deopt_entry_count))));
 }
 
 Handle<DeoptimizationData> DeoptimizationData::New(LocalIsolate* isolate,
                                                    int deopt_entry_count) {
-  return Cast<DeoptimizationData>(
-      isolate->factory()->NewProtectedFixedArray(LengthFor(deopt_entry_count)));
+  return UncheckedCast<DeoptimizationData>(
+      isolate->factory()->NewProtectedFixedArray(
+          static_cast<uint32_t>(LengthFor(deopt_entry_count))));
 }
 
 Handle<DeoptimizationData> DeoptimizationData::Empty(Isolate* isolate) {
-  return Cast<DeoptimizationData>(
+  return UncheckedCast<DeoptimizationData>(
       isolate->factory()->empty_protected_fixed_array());
 }
 
 Handle<DeoptimizationData> DeoptimizationData::Empty(LocalIsolate* isolate) {
-  return Cast<DeoptimizationData>(
+  return UncheckedCast<DeoptimizationData>(
       isolate->factory()->empty_protected_fixed_array());
 }
 
@@ -82,12 +185,7 @@ Tagged<SharedFunctionInfo> DeoptimizationData::GetInlinedFunction(int index) {
 
 #ifdef DEBUG
 void DeoptimizationData::Verify(Handle<BytecodeArray> bytecode) const {
-#ifdef V8_USE_ZLIB
-  if (V8_UNLIKELY(v8_flags.turbo_compress_frame_translations)) {
-    return;
-  }
-#endif  // V8_USE_ZLIB
-  for (int i = 0; i < DeoptCount(); ++i) {
+  for (uint32_t i = 0; i < DeoptCount(); ++i) {
     // Check the frame count and identify the bailout id of the top compilation
     // unit.
     int idx = TranslationIndex(i).value();
@@ -143,7 +241,7 @@ void print_pc(std::ostream& os, int pc) {
 }  // namespace
 
 void DeoptimizationData::PrintDeoptimizationData(std::ostream& os) const {
-  if (length() == 0) {
+  if (ulength().value() == 0) {
     os << "Deoptimization Input Data invalidated by lazy deoptimization\n";
     return;
   }
@@ -155,7 +253,7 @@ void DeoptimizationData::PrintDeoptimizationData(std::ostream& os) const {
     os << " " << Brief(Cast<i::SharedFunctionInfo>(info)) << "\n";
   }
   os << "\n";
-  int deopt_count = DeoptCount();
+  const uint32_t deopt_count = DeoptCount();
   os << "Deoptimization Input Data (deopt points = " << deopt_count << ")\n";
   if (0 != deopt_count) {
 #ifdef DEBUG
@@ -166,7 +264,7 @@ void DeoptimizationData::PrintDeoptimizationData(std::ostream& os) const {
     if (v8_flags.print_code_verbose) os << "  commands";
     os << "\n";
   }
-  for (int i = 0; i < deopt_count; i++) {
+  for (uint32_t i = 0; i < deopt_count; i++) {
     os << std::setw(6) << i << "  " << std::setw(15)
        << GetBytecodeOffsetOrBuiltinContinuationId(i).ToInt() << "  "
 #ifdef DEBUG
@@ -189,30 +287,6 @@ void DeoptimizationData::PrintDeoptimizationData(std::ostream& os) const {
 DeoptTranslationIterator::DeoptTranslationIterator(
     base::Vector<const uint8_t> buffer, int index)
     : buffer_(buffer), index_(index) {
-#ifdef V8_USE_ZLIB
-  if (V8_UNLIKELY(v8_flags.turbo_compress_frame_translations)) {
-    const int size =
-        base::ReadUnalignedValue<uint32_t>(reinterpret_cast<Address>(
-            &buffer_[DeoptimizationFrameTranslation::kUncompressedSizeOffset]));
-    uncompressed_contents_.insert(uncompressed_contents_.begin(), size, 0);
-
-    uLongf uncompressed_size = size *
-                               DeoptimizationFrameTranslation::
-                                   kDeoptimizationFrameTranslationElementSize;
-
-    CHECK_EQ(zlib_internal::UncompressHelper(
-                 zlib_internal::ZRAW,
-                 reinterpret_cast<Bytef*>(uncompressed_contents_.data()),
-                 &uncompressed_size,
-                 buffer_.begin() +
-                     DeoptimizationFrameTranslation::kCompressedDataOffset,
-                 buffer_.length()),
-             Z_OK);
-    DCHECK(index >= 0 && index < size);
-    return;
-  }
-#endif  // V8_USE_ZLIB
-  DCHECK(!v8_flags.turbo_compress_frame_translations);
   DCHECK(index >= 0 && index < buffer_.length());
   // Starting at a location other than a BEGIN would make
   // MATCH_PREVIOUS_TRANSLATION instructions not work.
@@ -223,12 +297,11 @@ DeoptTranslationIterator::DeoptTranslationIterator(
 DeoptimizationFrameTranslation::Iterator::Iterator(
     Tagged<DeoptimizationFrameTranslation> buffer, int index)
     : DeoptTranslationIterator(
-          base::Vector<uint8_t>(buffer->begin(), buffer->length()), index) {}
+          base::Vector<uint8_t>(buffer->begin(), buffer->ulength().value()),
+          index) {}
 
 int32_t DeoptTranslationIterator::NextOperand() {
-  if (V8_UNLIKELY(v8_flags.turbo_compress_frame_translations)) {
-    return uncompressed_contents_[index_++];
-  } else if (remaining_ops_to_use_from_previous_translation_) {
+  if (remaining_ops_to_use_from_previous_translation_) {
     int32_t value = base::VLQDecode(buffer_.begin(), &previous_index_);
     DCHECK_LT(previous_index_, index_);
     return value;
@@ -255,9 +328,7 @@ uint32_t DeoptTranslationIterator::NextUnsignedOperandAtPreviousIndex() {
 }
 
 uint32_t DeoptTranslationIterator::NextOperandUnsigned() {
-  if (V8_UNLIKELY(v8_flags.turbo_compress_frame_translations)) {
-    return uncompressed_contents_[index_++];
-  } else if (remaining_ops_to_use_from_previous_translation_) {
+  if (remaining_ops_to_use_from_previous_translation_) {
     return NextUnsignedOperandAtPreviousIndex();
   } else {
     uint32_t value = base::VLQDecodeUnsigned(buffer_.begin(), &index_);
@@ -267,9 +338,6 @@ uint32_t DeoptTranslationIterator::NextOperandUnsigned() {
 }
 
 TranslationOpcode DeoptTranslationIterator::NextOpcode() {
-  if (V8_UNLIKELY(v8_flags.turbo_compress_frame_translations)) {
-    return static_cast<TranslationOpcode>(NextOperandUnsigned());
-  }
   if (remaining_ops_to_use_from_previous_translation_) {
     --remaining_ops_to_use_from_previous_translation_;
   }
@@ -365,12 +433,8 @@ TranslationOpcode DeoptTranslationIterator::SeekNextFrame() {
 }
 
 bool DeoptTranslationIterator::HasNextOpcode() const {
-  if (V8_UNLIKELY(v8_flags.turbo_compress_frame_translations)) {
-    return index_ < static_cast<int>(uncompressed_contents_.size());
-  } else {
-    return index_ < buffer_.length() ||
-           remaining_ops_to_use_from_previous_translation_ > 1;
-  }
+  return index_ < buffer_.length() ||
+         remaining_ops_to_use_from_previous_translation_ > 1;
 }
 
 void DeoptTranslationIterator::SkipOpcodeAndItsOperandsAtPreviousIndex() {

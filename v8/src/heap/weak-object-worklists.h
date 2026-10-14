@@ -39,6 +39,11 @@ struct HeapObjectAndCode {
   Tagged<Code> code;
 };
 
+struct DispatchHandleAndCode {
+  JSDispatchHandle dispatch_handle;
+  Tagged<Code> code;
+};
+
 class EphemeronHashTable;
 class JSFunction;
 class SharedFunctionInfo;
@@ -50,7 +55,7 @@ class TransitionArray;
 // 1) Type of the worklist entry.
 // 2) Lower-case name of the worklsit.
 // 3) Capitalized name of the worklist.
-#define WEAK_OBJECT_WORKLISTS_GENERIC(F)                                      \
+#define WEAK_OBJECT_WORKLISTS(F)                                              \
   F(Tagged<TransitionArray>, transition_arrays, TransitionArrays)             \
   /* Keep track of all EphemeronHashTables in the heap to process             \
      them in the atomic pause. */                                             \
@@ -58,7 +63,7 @@ class TransitionArray;
   /* Keep track of all ephemerons for concurrent marking tasks. Only store    \
      ephemerons in these worklists if both (key, value) are unreachable at    \
      the moment.                                                              \
-     MarkCompactCollector::MarkTransitiveClosureUntilFixpoint drains/fills    \
+     MarkCompactCollector::MarkTransitiveClosureFixpoint drains/fills         \
      these worklists. current_ephemerons is used as draining worklist in      \
      the current fixpoint iteration. */                                       \
   F(Ephemeron, current_ephemerons, CurrentEphemerons)                         \
@@ -72,22 +77,13 @@ class TransitionArray;
     WeakReferencesNonTrivialUnmarked)                                         \
   F(TrustedObjectAndSlot, weak_references_trusted, WeakReferencesTrusted)     \
   F(HeapObjectAndCode, weak_objects_in_code, WeakObjectsInCode)               \
+  F(DispatchHandleAndCode, weak_dispatch_handles_in_code,                     \
+    WeakDispatchHandlesInCode)                                                \
   F(Tagged<JSWeakRef>, js_weak_refs, JSWeakRefs)                              \
   F(Tagged<WeakCell>, weak_cells, WeakCells)                                  \
   F(Tagged<SharedFunctionInfo>, code_flushing_candidates,                     \
     CodeFlushingCandidates)                                                   \
   F(Tagged<JSFunction>, flushed_js_functions, FlushedJSFunctions)
-
-#ifdef V8_ENABLE_LEAPTIERING
-// Baseline code flushing for JSFunctions with leaptiering works by sweeping the
-// JSDispatchTable and does not need any additional tracking.
-#define WEAK_OBJECT_WORKLISTS(F) WEAK_OBJECT_WORKLISTS_GENERIC(F)
-#else
-#define WEAK_OBJECT_WORKLISTS(F)                      \
-  WEAK_OBJECT_WORKLISTS_GENERIC(F)                    \
-  F(Tagged<JSFunction>, baseline_flushing_candidates, \
-    BaselineFlushingCandidates)
-#endif  // V8_ENABLE_LEAPTIERING
 
 class WeakObjects final {
  private:

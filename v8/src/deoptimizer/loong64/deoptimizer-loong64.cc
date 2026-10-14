@@ -4,18 +4,25 @@
 
 #include "src/codegen/flush-instruction-cache.h"
 #include "src/codegen/macro-assembler.h"
+#include "src/common/code-memory-access-inl.h"
 #include "src/deoptimizer/deoptimizer.h"
 
 namespace v8 {
 namespace internal {
 
-const int Deoptimizer::kEagerDeoptExitSize = 2 * kInstrSize;
-const int Deoptimizer::kLazyDeoptExitSize = 2 * kInstrSize;
+const int Deoptimizer::kEagerDeoptExitSize = 1 * kInstrSize;
+const int Deoptimizer::kLazyDeoptExitSize = 1 * kInstrSize;
 
 const int Deoptimizer::kAdaptShadowStackOffsetToSubtract = 0;
 
 // static
+void Deoptimizer::ZapCode(Address start, Address end, RelocIterator& it) {
+  // TODO(422364570): Support this platform.
+}
+
+// static
 void Deoptimizer::PatchToJump(Address pc, Address new_pc) {
+  RwxMemoryWriteScope rwx_write_scope("Patch jump to deopt trampoline");
   intptr_t offset = (new_pc - pc) / kInstrSize;
   // We'll overwrite only one instruction of 4-bytes. Give enough
   // space not to try to grow the buffer.

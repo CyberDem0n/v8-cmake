@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <initializer_list>
+#include <stack>
+#include <type_traits>
 #include <vector>
 
 #include "testing/gmock-support.h"
@@ -605,8 +607,9 @@ void TestInsertMultipleTrivial() {
   EXPECT_LE(size + added, v.capacity());
   for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i]);
   for (int i = ipos; i < ipos + iadded; ++i) EXPECT_EQ(1000, v[i]);
-  for (int i = ipos + iadded; i < isize + iadded; ++i)
+  for (int i = ipos + iadded; i < isize + iadded; ++i) {
     EXPECT_EQ(i - iadded + 1, v[i]);
+  }
 }
 }  // anonymous namespace
 
@@ -646,8 +649,9 @@ void TestInsertListTrivial() {
   EXPECT_LE(size + added, v.capacity());
   for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i]);
   for (int i = ipos; i < ipos + iadded; ++i) EXPECT_EQ(1000 + i - ipos, v[i]);
-  for (int i = ipos + iadded; i < isize + iadded; ++i)
+  for (int i = ipos + iadded; i < isize + iadded; ++i) {
     EXPECT_EQ(i - iadded + 1, v[i]);
+  }
 }
 }  // anonymous namespace
 
@@ -688,8 +692,9 @@ void TestInsertIterTrivial() {
   EXPECT_LE(size + added, v.capacity());
   for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i]);
   for (int i = ipos; i < ipos + iadded; ++i) EXPECT_EQ(1000 + i - ipos, v[i]);
-  for (int i = ipos + iadded; i < isize + iadded; ++i)
+  for (int i = ipos + iadded; i < isize + iadded; ++i) {
     EXPECT_EQ(i - iadded + 1, v[i]);
+  }
 }
 }  // anonymous namespace
 
@@ -723,7 +728,7 @@ void TestEraseTrivial() {
   SmallVector<int, capacity> v{make_int_list<size, 1>()};
   const size_t real_capacity = v.capacity();
 
-  v.erase(v.begin() + pos);
+  v.erase(v.begin() + pos, v.end());
   EXPECT_EQ(pos, v.size());
   EXPECT_EQ(real_capacity, v.capacity());
   for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i]);
@@ -744,6 +749,78 @@ TEST(SmallVectorTest, EraseTrivial) {
   TestEraseTrivial<0, 7, 0>();
   TestEraseTrivial<0, 7, 4>();
   TestEraseTrivial<0, 7, 7>();
+}
+
+namespace {
+template <size_t capacity, size_t size, size_t pos>
+void TestEraseOneTrivial() {
+  constexpr int ipos = static_cast<int>(pos);
+  static_assert(pos <= size);
+  SmallVector<int, capacity> v{make_int_list<size, 1>()};
+  const size_t real_capacity = v.capacity();
+
+  int* p = v.erase(v.begin() + pos);
+  EXPECT_EQ(size - 1, v.size());
+  EXPECT_EQ(real_capacity, v.capacity());
+  EXPECT_EQ(v.begin() + pos, p);
+  if (p < v.end()) EXPECT_EQ(ipos + 2, *p);
+  for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i]);
+  for (int i = ipos; i < static_cast<int>(v.size()); ++i) {
+    EXPECT_EQ(i + 2, v[i]);
+  }
+}
+}  // anonymous namespace
+
+TEST(SmallVectorTest, EraseOneTrivial) {
+  TestEraseOneTrivial<10, 7, 0>();
+  TestEraseOneTrivial<10, 7, 4>();
+  TestEraseOneTrivial<10, 7, 6>();
+  TestEraseOneTrivial<10, 10, 0>();
+  TestEraseOneTrivial<10, 10, 4>();
+  TestEraseOneTrivial<10, 10, 7>();
+  TestEraseOneTrivial<10, 17, 0>();
+  TestEraseOneTrivial<10, 17, 13>();
+  TestEraseOneTrivial<10, 17, 16>();
+  TestEraseOneTrivial<0, 7, 0>();
+  TestEraseOneTrivial<0, 7, 4>();
+  TestEraseOneTrivial<0, 7, 6>();
+}
+
+namespace {
+template <size_t capacity, size_t size, size_t pos, size_t dist>
+void TestEraseRangeTrivial() {
+  constexpr int ipos = static_cast<int>(pos);
+  constexpr int idist = static_cast<int>(dist);
+  static_assert(pos <= size);
+  SmallVector<int, capacity> v{make_int_list<size, 1>()};
+  const size_t real_capacity = v.capacity();
+
+  int* p = v.erase(v.begin() + pos, v.begin() + pos + idist);
+  EXPECT_EQ(size - dist, v.size());
+  EXPECT_EQ(real_capacity, v.capacity());
+  EXPECT_EQ(v.begin() + pos, p);
+  if (p < v.end()) EXPECT_EQ(ipos + idist + 1, *p);
+  for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i]);
+  for (int i = ipos; i < static_cast<int>(v.size()); ++i) {
+    EXPECT_EQ(i + 1 + idist, v[i]);
+  }
+}
+}  // anonymous namespace
+
+TEST(SmallVectorTest, EraseRangeTrivial) {
+  TestEraseRangeTrivial<10, 7, 0, 2>();
+  TestEraseRangeTrivial<10, 7, 4, 3>();
+  TestEraseRangeTrivial<10, 7, 7, 0>();
+  TestEraseRangeTrivial<10, 10, 0, 6>();
+  TestEraseRangeTrivial<10, 10, 4, 6>();
+  TestEraseRangeTrivial<10, 10, 7, 1>();
+  TestEraseRangeTrivial<10, 17, 0, 17>();
+  TestEraseRangeTrivial<10, 17, 13, 2>();
+  TestEraseRangeTrivial<10, 17, 17, 0>();
+  TestEraseRangeTrivial<0, 0, 0, 0>();
+  TestEraseRangeTrivial<0, 7, 0, 3>();
+  TestEraseRangeTrivial<0, 7, 4, 3>();
+  TestEraseRangeTrivial<0, 7, 7, 0>();
 }
 
 namespace {
@@ -1791,8 +1868,9 @@ void TestInsertMultipleNonTrivial() {
     EXPECT_LE(size + added, v.capacity());
     for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i].value());
     for (int i = ipos; i < ipos + iadded; ++i) EXPECT_EQ(1000, v[i].value());
-    for (int i = ipos + iadded; i < isize + iadded; ++i)
+    for (int i = ipos + iadded; i < isize + iadded; ++i) {
       EXPECT_EQ(i - iadded + 1, v[i].value());
+    }
   }
   if (size + added <= real_capacity) {
     EXPECT_EQ(iadded, ElementType::GetCounter(kDefaultConstructor));
@@ -1871,10 +1949,12 @@ void TestInsertListNonTrivial() {
     EXPECT_EQ(size + added, v.size());
     EXPECT_LE(size + added, v.capacity());
     for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i].value());
-    for (int i = ipos; i < ipos + iadded; ++i)
+    for (int i = ipos; i < ipos + iadded; ++i) {
       EXPECT_EQ(1000 + i - ipos, v[i].value());
-    for (int i = ipos + iadded; i < isize + iadded; ++i)
+    }
+    for (int i = ipos + iadded; i < isize + iadded; ++i) {
       EXPECT_EQ(i - iadded + 1, v[i].value());
+    }
   }
   if (size + added <= real_capacity) {
     EXPECT_EQ(iadded, ElementType::GetCounter(kDefaultConstructor));
@@ -1934,10 +2014,12 @@ void TestInsertIterNonTrivial() {
     EXPECT_EQ(size + added, v.size());
     EXPECT_LE(size + added, v.capacity());
     for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i].value());
-    for (int i = ipos; i < ipos + iadded; ++i)
+    for (int i = ipos; i < ipos + iadded; ++i) {
       EXPECT_EQ(1000 + i - ipos, v[i].value());
-    for (int i = ipos + iadded; i < isize + iadded; ++i)
+    }
+    for (int i = ipos + iadded; i < isize + iadded; ++i) {
       EXPECT_EQ(i - iadded + 1, v[i].value());
+    }
   }
   if (size + added <= real_capacity) {
     EXPECT_EQ(iadded, ElementType::GetCounter(kDefaultConstructor));
@@ -1991,7 +2073,7 @@ void TestEraseNonTrivial() {
   ElementType::ResetCounters();
 
   {
-    v.erase(v.begin() + pos);
+    v.erase(v.begin() + pos, v.end());
     EXPECT_EQ(pos, v.size());
     EXPECT_EQ(real_capacity, v.capacity());
     for (int i = 0; i < ipos; ++i) EXPECT_EQ(i + 1, v[i].value());
@@ -2039,8 +2121,9 @@ void TestResizeNonTrivial() {
     } else {
       EXPECT_LE(new_size, v.capacity());
     }
-    for (int i = 0; i < std::min(isize, new_isize); ++i)
+    for (int i = 0; i < std::min(isize, new_isize); ++i) {
       EXPECT_EQ(i + 1, v[i].value());
+    }
   }
   if (new_size <= real_capacity) {
     EXPECT_EQ(size_diff(new_isize, isize),
@@ -2104,8 +2187,9 @@ void TestResizeInitNonTrivial() {
     } else {
       EXPECT_LE(new_size, v.capacity());
     }
-    for (int i = 0; i < std::min(isize, new_isize); ++i)
+    for (int i = 0; i < std::min(isize, new_isize); ++i) {
       EXPECT_EQ(i + 1, v[i].value());
+    }
     for (int i = isize; i < new_isize; ++i) EXPECT_EQ(42, v[i].value());
   }
   if (new_size <= real_capacity) {
@@ -2286,6 +2370,63 @@ TEST(SmallVectorTest, NoAssign) {
   TestNoAssign<10, 17>();
   TestNoAssign<0, 0>();
   TestNoAssign<0, 7>();
+}
+
+TEST(SmallVectorTest, Stack) {
+  std::stack<int, SmallVector<int, 2>> stack;
+  EXPECT_EQ(0U, stack.size());
+  stack.push(1);
+  stack.push(2);
+  EXPECT_EQ(2U, stack.size());
+  // This will now trigger SmallVector to allocate external storage.
+  stack.push(3);
+  EXPECT_EQ(3U, stack.size());
+  EXPECT_EQ(3, stack.top());
+  stack.pop();
+  EXPECT_EQ(2, stack.top());
+  stack.pop();
+  EXPECT_EQ(1, stack.top());
+  stack.pop();
+  EXPECT_EQ(0U, stack.size());
+}
+
+namespace {
+struct ImplicitLifetimeNonTrivialConstructor {
+  int val = -42;
+};
+// As the struct is trivially copy constructible and trivially destructible,
+// base::SmallVector sets kHasTrivialElement treating it as a "trivial" type as
+// this classifies it as an implicit lifetime type.
+static_assert(std::is_trivially_copy_constructible_v<
+              ImplicitLifetimeNonTrivialConstructor>);
+static_assert(
+    std::is_trivially_destructible_v<ImplicitLifetimeNonTrivialConstructor>);
+// Still, the constructor is non-trivial and therefore the SmallVector needs to
+// explicitly perform default-initialization.
+static_assert(!std::is_trivially_default_constructible_v<
+              ImplicitLifetimeNonTrivialConstructor>);
+}  // anonymous namespace
+
+TEST(SmallVectorTest, ImplicitLifetimeNonTrivialConstructor) {
+  using ElementType = ImplicitLifetimeNonTrivialConstructor;
+  {  // Construct with size, expect default-initialization.
+    base::SmallVector<ElementType, 0> on_heap(2);
+    EXPECT_EQ(-42, on_heap.at(0).val);
+    EXPECT_EQ(-42, on_heap.at(1).val);
+    // Growing default-initializes the new elements as well.
+    on_heap.resize(4);
+    EXPECT_EQ(-42, on_heap.at(2).val);
+    EXPECT_EQ(-42, on_heap.at(3).val);
+  }
+  {  // Construct with size, expect default-initialization.
+    base::SmallVector<ElementType, 4> on_stack(2);
+    EXPECT_EQ(-42, on_stack.at(0).val);
+    EXPECT_EQ(-42, on_stack.at(1).val);
+    // Growing default-initializes the new elements as well.
+    on_stack.resize(4);
+    EXPECT_EQ(-42, on_stack.at(2).val);
+    EXPECT_EQ(-42, on_stack.at(3).val);
+  }
 }
 
 }  // namespace v8::base

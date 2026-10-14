@@ -16,12 +16,10 @@ BytecodeOffsetIterator::BytecodeOffsetIterator(
     Handle<TrustedByteArray> mapping_table, Handle<BytecodeArray> bytecodes)
     : mapping_table_(mapping_table),
       data_start_address_(mapping_table_->begin()),
-      data_length_(mapping_table_->length()),
+      data_length_(mapping_table_->ulength().value()),
       current_index_(0),
       bytecode_iterator_(bytecodes),
-      local_heap_(LocalHeap::Current()
-                      ? LocalHeap::Current()
-                      : Isolate::Current()->main_thread_local_heap()) {
+      local_heap_(LocalHeap::Current()) {
   local_heap_->AddGCEpilogueCallback(UpdatePointersCallback, this);
   Initialize();
 }
@@ -29,7 +27,7 @@ BytecodeOffsetIterator::BytecodeOffsetIterator(
 BytecodeOffsetIterator::BytecodeOffsetIterator(
     Tagged<TrustedByteArray> mapping_table, Tagged<BytecodeArray> bytecodes)
     : data_start_address_(mapping_table->begin()),
-      data_length_(mapping_table->length()),
+      data_length_(mapping_table->ulength().value()),
       current_index_(0),
       bytecode_handle_storage_(bytecodes),
       // In the non-handlified version, no GC is allowed. We use a "dummy"

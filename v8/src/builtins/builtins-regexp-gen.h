@@ -42,6 +42,9 @@ class RegExpBuiltinsAssembler : public CodeStubAssembler {
   void SlowStoreLastIndex(TNode<Context> context, TNode<JSAny> regexp,
                           TNode<Object> value);
 
+  TNode<RegExpData> LoadRegExpDataFromObject(TNode<HeapObject> object,
+                                             int offset);
+
   TNode<Smi> LoadCaptureCount(TNode<RegExpData> data);
   TNode<Smi> RegistersForCaptureCount(TNode<Smi> capture_count);
 
@@ -62,10 +65,26 @@ class RegExpBuiltinsAssembler : public CodeStubAssembler {
   void FreeRegExpResultVector(TNode<RawPtrT> result_vector,
                               TNode<BoolT> is_dynamic);
 
+  // Grows {match_info} if it cannot hold {register_count} registers and
+  // initializes its header. The caller fills in the capture offsets.
+  TNode<RegExpMatchInfo> PrepareMatchInfo(TNode<Context> context,
+                                          TNode<RegExpMatchInfo> match_info,
+                                          TNode<Smi> register_count,
+                                          TNode<String> subject);
+
   TNode<RegExpMatchInfo> InitializeMatchInfoFromRegisters(
       TNode<Context> context, TNode<RegExpMatchInfo> match_info,
       TNode<Smi> register_count, TNode<String> subject,
       TNode<RawPtrT> result_offsets_vector);
+
+  void TryRegExpSplitCacheLookup(TNode<Context> context, TNode<JSRegExp> regexp,
+                                 TNode<RegExpData> data, TNode<String> string,
+                                 TVariable<JSArray>* var_result,
+                                 Label* if_found);
+  TNode<FixedArray> SnapshotLastMatchInfo(TNode<Context> context,
+                                          TNode<BoolT> did_match);
+  void ReplayLastMatchInfo(TNode<Context> context, TNode<String> subject,
+                           TNode<FixedArray> last_match_cache);
 
   // Low level logic around the actual call into pattern matching code.
   //
@@ -216,9 +235,10 @@ class RegExpBuiltinsAssembler : public CodeStubAssembler {
     return CAST(AdvanceStringIndex(string, index, is_unicode, true));
   }
 
-  TNode<Smi> AdvanceStringIndexSlow(TNode<String> string, TNode<Number> index,
-                                    TNode<BoolT> is_unicode) {
-    return CAST(AdvanceStringIndex(string, index, is_unicode, false));
+  TNode<Number> AdvanceStringIndexSlow(TNode<String> string,
+                                       TNode<Number> index,
+                                       TNode<BoolT> is_unicode) {
+    return AdvanceStringIndex(string, index, is_unicode, false);
   }
 
   TNode<JSArray> RegExpPrototypeSplitBody(TNode<Context> context,

@@ -18,10 +18,10 @@ static_assert(
 #include "src/base/flags.h"
 #include "src/base/macros.h"
 #include "src/base/utils/random-number-generator.h"
+#include "src/heap/cppgc-internal/heap-base.h"
+#include "src/heap/cppgc-internal/marker.h"
+#include "src/heap/cppgc-internal/stats-collector.h"
 #include "src/heap/cppgc-js/cross-heap-remembered-set.h"
-#include "src/heap/cppgc/heap-base.h"
-#include "src/heap/cppgc/marker.h"
-#include "src/heap/cppgc/stats-collector.h"
 #include "src/logging/metrics.h"
 #include "src/objects/cpp-heap-object-wrapper.h"
 #include "src/objects/js-objects.h"
@@ -80,6 +80,7 @@ class V8_EXPORT_PRIVATE CppHeap final
     ExtractLastIncrementalMarkEvent();
 
     void ClearCachedEvents();
+    void ClearCachedYoungEvents();
 
    private:
     Isolate* GetIsolate() const;
@@ -109,7 +110,8 @@ class V8_EXPORT_PRIVATE CppHeap final
 
   CppHeap(v8::Platform*,
           const std::vector<std::unique_ptr<cppgc::CustomSpaceBase>>&,
-          cppgc::Heap::MarkingType, cppgc::Heap::SweepingType);
+          cppgc::Heap::MarkingType, cppgc::Heap::SweepingType,
+          std::optional<cppgc::StackStartMarker>);
   ~CppHeap() final;
 
   CppHeap(const CppHeap&) = delete;
@@ -121,8 +123,6 @@ class V8_EXPORT_PRIVATE CppHeap final
   void AttachIsolate(Isolate* isolate);
   void StartDetachingIsolate();
   void DetachIsolate();
-
-  void Terminate();
 
   void CollectCustomSpaceStatisticsAtLastGC(
       std::vector<cppgc::CustomSpaceIndex>,
@@ -138,7 +138,8 @@ class V8_EXPORT_PRIVATE CppHeap final
       GarbageCollectionFlags = GarbageCollectionFlagValues::kNoFlags);
   void StartMarking();
   bool AdvanceMarking(v8::base::TimeDelta max_duration,
-                      size_t marked_bytes_limit);
+                      std::optional<size_t> marked_bytes_limit,
+                      cppgc::EmbedderStackState stack_state);
   bool IsMarkingDone() const;
   size_t last_bytes_marked() const;
   void ProcessCrossThreadWeakness();
@@ -166,11 +167,18 @@ class V8_EXPORT_PRIVATE CppHeap final
   MetricRecorderAdapter* GetMetricRecorder() const;
 
   Isolate* isolate() const { return isolate_; }
+  std::shared_ptr<bool> isolate_alive_token() const {
+    return isolate_alive_token_;
+  }
+  void invalidate_isolate_alive_token() {
+    *isolate_alive_token_ = false;
+    isolate_alive_token_.reset();
+  }
 
   size_t used_size() const {
     return used_size_.load(std::memory_order_relaxed);
   }
-  size_t allocated_size() const { return allocated_size_; }
+  uint64_t allocated_size() const { return allocated_size_; }
 
   ::heap::base::Stack* stack() final;
 
@@ -186,6 +194,7 @@ class V8_EXPORT_PRIVATE CppHeap final
   void clear_overridden_stack_state() override;
 
   void StartIncrementalGarbageCollection(cppgc::internal::GCConfig) override;
+  bool RetryAllocate(v8::base::FunctionRef<bool()> allocate) override;
   size_t epoch() const override;
 #ifdef V8_ENABLE_ALLOCATION_TIMEOUT
   std::optional<int> UpdateAllocationTimeout() final;
@@ -202,6 +211,12 @@ class V8_EXPORT_PRIVATE CppHeap final
   void EnableDetachedGarbageCollectionsForTesting();
   void CollectGarbageForTesting(CollectionType, StackState);
   void UpdateGCCapabilitiesFromFlagsForTesting();
+  // Only meaningful for a heap attached to an isolate: CompactAndSweep()
+  // requires atomic sweeping when there is no isolate.
+  void SetForceIncrementalSweepingForTesting(bool value) {
+    DCHECK_IMPLIES(value, isolate_ != nullptr);
+    force_incremental_sweeping_for_testing_ = value;
+  }
 
   bool CurrentThreadIsHeapThread() const final;
 
@@ -227,7 +242,6 @@ class V8_EXPORT_PRIVATE CppHeap final
 
   bool TracingInitialized() const { return collection_type_.has_value(); }
 
-  bool IsGCForbidden() const override;
   bool IsGCAllowed() const override;
   bool IsDetachedGCAllowed() const;
 
@@ -235,6 +249,11 @@ class V8_EXPORT_PRIVATE CppHeap final
 
   Isolate* isolate_ = nullptr;
   Heap* heap_ = nullptr;
+  // Token to indicate that the isolate is alive. The token is only reset to
+  // false when the CppHeap gets released from the isolate. Otherwise, the
+  // CppHeap dies together with the isolate, and therefore the token never has
+  // to be set to false.
+  std::shared_ptr<bool> isolate_alive_token_;
   bool marking_done_ = true;
   // |collection_type_| is initialized when marking is in progress.
   std::optional<CollectionType> collection_type_;
@@ -253,13 +272,14 @@ class V8_EXPORT_PRIVATE CppHeap final
 
   bool in_detached_testing_mode_ = false;
   bool force_incremental_marking_for_testing_ = false;
+  bool force_incremental_sweeping_for_testing_ = false;
   bool is_in_v8_marking_step_ = false;
 
   // Used size of objects. Reported to V8's regular heap growing strategy.
   std::atomic<size_t> used_size_{0};
-  // Total bytes allocated since the last GC. Monotonically increasing value.
-  // Used to approximate allocation rate.
-  size_t allocated_size_ = 0;
+  // Total bytes allocated. Monotonically increasing value. Used to
+  // approximate allocation rate.
+  uint64_t allocated_size_ = 0;
   // Limit for |allocated_size| in bytes to avoid checking for starting a GC
   // on each increment.
   size_t allocated_size_limit_for_check_ = 0;
@@ -272,7 +292,6 @@ class V8_EXPORT_PRIVATE CppHeap final
   std::optional<v8::base::RandomNumberGenerator> allocation_timeout_rng_;
 #endif  // V8_ENABLE_ALLOCATION_TIMEOUT
 
-  bool already_terminated_ = false;
   bool is_detached_ = true;
 
   friend class MetricRecorderAdapter;

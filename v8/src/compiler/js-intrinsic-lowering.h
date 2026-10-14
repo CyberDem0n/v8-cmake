@@ -41,6 +41,7 @@ class V8_EXPORT_PRIVATE JSIntrinsicLowering final
   Reduction ReduceCopyDataProperties(Node* node);
   Reduction ReduceCopyDataPropertiesWithExcludedPropertiesOnStack(Node* node);
   Reduction ReduceCreateIterResultObject(Node* node);
+  Reduction ReduceGeneratorYieldResult(Node* node);
   Reduction ReduceDeoptimizeNow(Node* node);
   Reduction ReduceCreateJSGeneratorObject(Node* node);
   Reduction ReduceGeneratorClose(Node* node);
@@ -56,6 +57,7 @@ class V8_EXPORT_PRIVATE JSIntrinsicLowering final
   Reduction ReduceIsInstanceType(Node* node, InstanceType instance_type);
   Reduction ReduceIsJSReceiver(Node* node);
   Reduction ReduceIsBeingInterpreted(Node* node);
+  Reduction ReduceMajorGCForCompilerTesting(Node* node);
   Reduction ReduceTurbofanStaticAssert(Node* node);
   Reduction ReduceVerifyType(Node* node);
   Reduction ReduceCheckTurboshaftTypeOf(Node* node);
@@ -65,6 +67,7 @@ class V8_EXPORT_PRIVATE JSIntrinsicLowering final
   Reduction ReduceCall(Node* node);
   Reduction ReduceIncBlockCounter(Node* node);
   Reduction ReduceAddLhsIsStringConstantInternalize(Node* node);
+  Reduction ReduceAddRhsIsStringConstantInternalize(Node* node);
   Reduction ReduceGetImportMetaObject(Node* node);
 
   Reduction Change(Node* node, const Operator* op);
@@ -82,6 +85,7 @@ class V8_EXPORT_PRIVATE JSIntrinsicLowering final
                    enum FrameStateFlag frame_state_flag = kNeedsFrameState);
 
   TFGraph* graph() const;
+  Zone* zone() const;
   JSGraph* jsgraph() const { return jsgraph_; }
   JSHeapBroker* broker() const { return broker_; }
   Isolate* isolate() const;

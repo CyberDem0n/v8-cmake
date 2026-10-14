@@ -5,7 +5,8 @@
 #include <unordered_set>
 
 #include "src/builtins/builtins-utils-inl.h"
-#include "src/objects/js-struct-inl.h"
+#include "src/objects/js-struct.h"
+#include "src/objects/object-conversions-inl.h"
 #include "src/objects/property-details.h"
 
 namespace v8 {
@@ -45,11 +46,10 @@ BUILTIN(SharedSpaceJSObjectHasInstance) {
   }
 
   bool result;
-  MAYBE_ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
-      isolate, result,
-      AlwaysSharedSpaceJSObject::HasInstance(isolate,
-                                             Cast<JSFunction>(constructor),
-                                             args.atOrUndefined(isolate, 1)));
+  ASSIGN_RETURN_FAILURE_ON_EXCEPTION(isolate, result,
+                                     AlwaysSharedSpaceJSObject::HasInstance(
+                                         isolate, Cast<JSFunction>(constructor),
+                                         args.atOrUndefined(isolate, 1)));
   return *isolate->factory()->ToBoolean(result);
 }
 
@@ -58,29 +58,31 @@ Maybe<bool> CollectFieldsAndElements(Isolate* isolate,
                                      DirectHandle<JSReceiver> property_names,
                                      int num_properties,
                                      DirectHandleVector<Name>& field_names,
-                                     std::set<uint32_t>& element_names) {
+                                     std::set<uint32_t>& element_names,
+                                     bool& has_interesting_properties) {
   Handle<Object> raw_property_name;
   Handle<Name> property_name;
   UniqueNameHandleSet field_names_set;
   for (int i = 0; i < num_properties; i++) {
-    ASSIGN_RETURN_ON_EXCEPTION_VALUE(
+    ASSIGN_RETURN_ON_EXCEPTION(
         isolate, raw_property_name,
-        JSReceiver::GetElement(isolate, property_names, i), Nothing<bool>());
-    ASSIGN_RETURN_ON_EXCEPTION_VALUE(isolate, property_name,
-                                     Object::ToName(isolate, raw_property_name),
-                                     Nothing<bool>());
+        JSReceiver::GetElement(isolate, property_names, i));
+    ASSIGN_RETURN_ON_EXCEPTION(isolate, property_name,
+                               Object::ToName(isolate, raw_property_name));
 
     bool is_duplicate;
     size_t index;
     if (!property_name->AsIntegerIndex(&index) ||
         index > JSObject::kMaxElementIndex) {
       property_name = isolate->factory()->InternalizeName(property_name);
+      if (property_name->IsInteresting(isolate)) {
+        has_interesting_properties = true;
+      }
 
       // TODO(v8:12547): Support Symbols?
       if (IsSymbol(*property_name)) {
-        THROW_NEW_ERROR_RETURN_VALUE(
-            isolate, NewTypeError(MessageTemplate::kSymbolToString),
-            Nothing<bool>());
+        THROW_NEW_ERROR(isolate,
+                        NewTypeError(MessageTemplate::kSymbolToString));
       }
 
       is_duplicate = !field_names_set.insert(property_name).second;
@@ -91,11 +93,9 @@ Maybe<bool> CollectFieldsAndElements(Isolate* isolate,
     }
 
     if (is_duplicate) {
-      THROW_NEW_ERROR_RETURN_VALUE(
-          isolate,
-          NewTypeError(MessageTemplate::kDuplicateTemplateProperty,
-                       property_name),
-          Nothing<bool>());
+      THROW_NEW_ERROR(isolate,
+                      NewTypeError(MessageTemplate::kDuplicateTemplateProperty,
+                                   property_name));
     }
   }
 
@@ -138,17 +138,19 @@ BUILTIN(SharedStructTypeConstructor) {
 
     DirectHandleVector<Name> field_names(isolate);
     std::set<uint32_t> element_names;
+    bool has_interesting_properties = false;
     if (num_properties != 0) {
-      MAYBE_RETURN(
-          CollectFieldsAndElements(isolate, property_names_arg, num_properties,
-                                   field_names, element_names),
-          ReadOnlyRoots(isolate).exception());
+      MAYBE_RETURN(CollectFieldsAndElements(
+                       isolate, property_names_arg, num_properties, field_names,
+                       element_names, has_interesting_properties),
+                   ReadOnlyRoots(isolate).exception());
     }
 
-    if (IsUndefined(*args.atOrUndefined(isolate, 2), isolate)) {
+    if (IsUndefined(*args.atOrUndefined(isolate, 2))) {
       // Create a new instance map if this type isn't registered.
       instance_map = JSSharedStruct::CreateInstanceMap(
-          isolate, base::VectorOf(field_names), element_names, {});
+          isolate, base::VectorOf(field_names), element_names, {},
+          has_interesting_properties);
     } else {
       // Otherwise, get the canonical map.
       if (!IsString(*args.atOrUndefined(isolate, 2))) {
@@ -161,7 +163,7 @@ BUILTIN(SharedStructTypeConstructor) {
           isolate, instance_map,
           isolate->shared_struct_type_registry()->Register(
               isolate, args.at<String>(2), base::VectorOf(field_names),
-              element_names));
+              element_names, has_interesting_properties));
     }
   }
 

@@ -42,14 +42,8 @@ class ZoneSnapshot;
 
 class V8_EXPORT_PRIVATE Zone final {
  public:
-  Zone(AccountingAllocator* allocator, const char* name,
-       bool support_compression = false);
+  Zone(AccountingAllocator* allocator, const char* name);
   ~Zone();
-
-  // Returns true if the zone supports zone pointer compression.
-  bool supports_compression() const {
-    return COMPRESS_ZONES_BOOL && supports_compression_;
-  }
 
   // Allocate 'size' bytes of uninitialized memory in the Zone; expands the Zone
   // by allocating new segments of memory on demand using AccountingAllocator
@@ -70,15 +64,9 @@ class V8_EXPORT_PRIVATE Zone final {
     allocation_size_for_tracing_ += size;
 #endif
     if (V8_UNLIKELY(size > limit_ - position_)) {
-      Expand(size);
+      return ExpandAndAllocate(size);
     }
-
-    DCHECK_LE(position_, limit_);
-    DCHECK_LE(size, limit_ - position_);
-    DCHECK_EQ(0, position_ % kAlignmentInBytes);
-    void* result = reinterpret_cast<void*>(position_);
-    position_ += size;
-    return result;
+    return AllocateUnchecked(size);
 #endif  // V8_USE_ADDRESS_SANITIZER
   }
 
@@ -126,7 +114,6 @@ class V8_EXPORT_PRIVATE Zone final {
   template <typename T, typename TypeTag = T[]>
   T* AllocateArray(size_t length) {
     static_assert(alignof(T) <= kAlignmentInBytes);
-    DCHECK_IMPLIES(is_compressed_pointer<T>::value, supports_compression());
     // Defense-in-depth: ensure that the multiplication does not overflow as
     // that would result in a too-small allocation and (likely) memory
     // corruption afterwards.
@@ -259,6 +246,15 @@ class V8_EXPORT_PRIVATE Zone final {
   // Expand the Zone to hold at least 'size' more bytes.
   // Should only be called if there is not enough room in the Zone already.
   V8_NOINLINE V8_PRESERVE_MOST void Expand(size_t size);
+  V8_NOINLINE V8_PRESERVE_MOST void* ExpandAndAllocate(size_t size);
+  V8_INLINE void* AllocateUnchecked(size_t size) {
+    DCHECK_LE(position_, limit_);
+    DCHECK_LE(size, limit_ - position_);
+    DCHECK_EQ(0, position_ % kAlignmentInBytes);
+    void* result = reinterpret_cast<void*>(position_);
+    position_ += size;
+    return result;
+  }
 
   // The free region in the current (front) segment is represented as
   // the half-open interval [position, limit). The 'position' variable
@@ -270,7 +266,6 @@ class V8_EXPORT_PRIVATE Zone final {
 
   Segment* segment_head_ = nullptr;
   const char* name_;
-  const bool supports_compression_;
   bool sealed_ = false;
 
 #ifdef V8_ENABLE_PRECISE_ZONE_STATS

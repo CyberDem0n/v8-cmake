@@ -6,6 +6,7 @@
 
 #include "include/v8-function-callback.h"
 #include "include/v8-function.h"
+#include "src/api/api.h"
 #include "src/base/strings.h"
 #include "test/cctest/cctest.h"
 
@@ -34,6 +35,9 @@ struct IncumbentTestExpectations {
   Local<Context> function_context;
   int call_count = 0;
 };
+// This tag value has been picked arbitrarily between 0 and
+// V8_EXTERNAL_POINTER_TAG_COUNT.
+constexpr v8::ExternalPointerTypeTag kIncumbentTestExpectationsTag = 13;
 
 // This callback checks that the incumbent context equals to the expected one
 // and returns the function's context ID (i.e. "globalThis.id").
@@ -44,7 +48,7 @@ void FunctionWithIncumbentCheck(
 
   IncumbentTestExpectations* expected =
       reinterpret_cast<IncumbentTestExpectations*>(
-          info.Data().As<External>()->Value());
+          info.Data().As<External>()->Value(kIncumbentTestExpectationsTag));
 
   expected->call_count++;
 
@@ -103,14 +107,14 @@ v8::LocalVector<Context> SetupCrossContextTest(
     {
       Context::Scope context_scope(context);
 
-      v8::base::ScopedVector<char> src(30);
-      v8::base::SNPrintF(src, "Object.prototype.id = %d", i);
+      auto src = v8::base::OwnedVector<char>::NewForOverwrite(30);
+      v8::base::SNPrintF(src.as_vector(), "Object.prototype.id = %d", i);
       CompileRun(src.begin());
     }
   }
 
   Local<External> expected_incumbent_context_ptr =
-      External::New(isolate, expected);
+      External::New(isolate, expected, kIncumbentTestExpectationsTag);
 
   // Create cross-realm references in every realm's global object and
   // a constructor function that also checks the incumbent context.
@@ -121,16 +125,16 @@ v8::LocalVector<Context> SetupCrossContextTest(
     // Add "realmX" properties referencing contextX->global.
     for (int j = 0; j < n; j++) {
       Local<Context> another_context = contexts[j];
-      v8::base::ScopedVector<char> name(30);
-      v8::base::SNPrintF(name, "realm%d", j);
+      auto name = v8::base::OwnedVector<char>::NewForOverwrite(30);
+      v8::base::SNPrintF(name.as_vector(), "realm%d", j);
 
       CHECK(context->Global()
                 ->Set(context, v8_str(name.begin()), another_context->Global())
                 .FromJust());
 
       // Check that 'id' property matches the realm index.
-      v8::base::ScopedVector<char> src(30);
-      v8::base::SNPrintF(src, "realm%d.id", j);
+      auto src = v8::base::OwnedVector<char>::NewForOverwrite(30);
+      v8::base::SNPrintF(src.as_vector(), "realm%d.id", j);
       Local<Value> value = CompileRun(src.begin());
       CHECK_EQ(j, value.As<Integer>()->Value());
     }
@@ -211,8 +215,8 @@ v8::LocalVector<Context> SetupCrossContextTest(
                                          expected_incumbent_context_ptr)
                                .ToLocalChecked();
 
-    v8::base::ScopedVector<char> name(30);
-    v8::base::SNPrintF(name, "realm%d.f", static_cast<int>(i));
+    auto name = v8::base::OwnedVector<char>::NewForOverwrite(30);
+    v8::base::SNPrintF(name.as_vector(), "realm%d.f", static_cast<int>(i));
     func->SetName(v8_str(name.begin()));
 
     CHECK(context->Global()->Set(context, v8_str("f"), func).FromJust());

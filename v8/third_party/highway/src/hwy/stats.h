@@ -38,23 +38,70 @@ class Bins {
     counts_[static_cast<int32_t>(bin)]++;
   }
 
+  uint32_t Bin(size_t bin_idx) const {
+    HWY_DASSERT(bin_idx < N);
+    return counts_[bin_idx];
+  }
+
+  void ResetBin(size_t bin_idx) {
+    HWY_DASSERT(bin_idx < N);
+    counts_[bin_idx] = 0;
+  }
+
   void Assimilate(const Bins<N>& other) {
     for (size_t i = 0; i < N; ++i) {
       counts_[i] += other.counts_[i];
     }
   }
 
-  void Print(const char* caption) const {
-    fprintf(stderr, "\n%s [%zu]\n", caption, N);
-    size_t last_nonzero = 0;
+  size_t FirstNonzero() const {
+    for (size_t i = 0; i < N; ++i) {
+      if (counts_[i] != 0) return i;
+    }
+    return N;
+  }
+
+  size_t LastNonzero() const {
     for (size_t i = N - 1; i < N; --i) {
-      if (counts_[i] != 0) {
-        last_nonzero = i;
-        break;
+      if (counts_[i] != 0) return i;
+    }
+    return 0;
+  }
+
+  size_t NumNonzero() const {
+    size_t num_nonzero = 0;
+    for (size_t i = 0; i < N; ++i) {
+      num_nonzero += (counts_[i] != 0);
+    }
+    return num_nonzero;
+  }
+
+  size_t ModalBinIdx() const {
+    size_t max = 0;
+    size_t idx_max = 0;
+    for (size_t i = 0; i < N; ++i) {
+      if (counts_[i] > max) {
+        max = counts_[i];
+        idx_max = i;
       }
     }
-    for (size_t i = 0; i <= last_nonzero; ++i) {
-      fprintf(stderr, "  %zu\n", counts_[i]);
+    return idx_max;
+  }
+
+  void Print(const char* caption, bool skip_zero = false) const {
+    fprintf(stderr, "\n%s [%zu, modal idx %zu]\n", caption, N, ModalBinIdx());
+    const size_t first_nonzero = FirstNonzero();
+    const size_t last_nonzero = LastNonzero();
+    if (skip_zero) {
+      for (size_t i = first_nonzero; i <= last_nonzero; ++i) {
+        if (counts_[i] != 0) {
+          fprintf(stderr, " %3zu: %zu\n", i, counts_[i]);
+        }
+      }
+    } else {
+      for (size_t i = first_nonzero; i <= last_nonzero; ++i) {
+        fprintf(stderr, " %3zu: %zu\n", i, counts_[i]);
+      }
     }
   }
 
@@ -65,7 +112,7 @@ class Bins {
   }
 
  private:
-  size_t counts_[N];
+  uint32_t counts_[N];
 };
 
 // Descriptive statistics of a variable (4 moments). Thread-compatible.
@@ -82,14 +129,17 @@ class Stats {
     // Logarithmic transform avoids/delays underflow and overflow.
     sum_log_ += std::log(static_cast<double>(x));
 
-    // Online moments. Reference: https://goo.gl/9ha694
+    // Online moments. Reference:
+    // https://www.thinkbrg.com/media/publication/720_McCrary_ImplementingAlgorithms_Whitepaper_20151119_WEB.pdf
     const double d = x - m1_;
-    const double d_div_n = d / n_;
-    const double d2n1_div_n = d * (n_ - 1) * d_div_n;
+    const double d_div_n = d / static_cast<double>(n_);
+    const double d2n1_div_n = d * (static_cast<double>(n_) - 1) * d_div_n;
     const int64_t n_poly = n_ * n_ - 3 * n_ + 3;
     m1_ += d_div_n;
-    m4_ += d_div_n * (d_div_n * (d2n1_div_n * n_poly + 6.0 * m2_) - 4.0 * m3_);
-    m3_ += d_div_n * (d2n1_div_n * (n_ - 2) - 3.0 * m2_);
+    m4_ += d_div_n *
+           (d_div_n * (d2n1_div_n * static_cast<double>(n_poly) + 6.0 * m2_) -
+            4.0 * m3_);
+    m3_ += d_div_n * (d2n1_div_n * (static_cast<double>(n_) - 2) - 3.0 * m2_);
     m2_ += d2n1_div_n;
   }
 
@@ -101,7 +151,7 @@ class Stats {
   float Max() const { return max_; }
 
   double GeometricMean() const {
-    return n_ == 0 ? 0.0 : std::exp(sum_log_ / n_);
+    return n_ == 0 ? 0.0 : std::exp(sum_log_ / static_cast<double>(n_));
   }
 
   double Mean() const { return m1_; }
@@ -126,20 +176,20 @@ class Stats {
   double Skewness() const {
     if (n_ == 0) return 0.0;
     const double biased = SampleSkewness();
-    const double r = (n_ - 1.0) / n_;
+    const double r = (static_cast<double>(n_) - 1.0) / static_cast<double>(n_);
     return biased * std::pow(r, 1.5);
   }
   // Near zero for normal distributions; smaller values indicate fewer/smaller
   // outliers and larger indicates more/larger outliers. Assumes n_ is large.
   double SampleKurtosis() const {
     if (ScalarAbs(m2_) < 1E-7) return 0.0;
-    return m4_ * n_ / (m2_ * m2_);
+    return m4_ * static_cast<double>(n_) / (m2_ * m2_);
   }
   // Corrected for bias (same as Wikipedia and Minitab but not Excel).
   double Kurtosis() const {
     if (n_ == 0) return 0.0;
     const double biased = SampleKurtosis();
-    const double r = (n_ - 1.0) / n_;
+    const double r = (static_cast<double>(n_) - 1.0) / static_cast<double>(n_);
     return biased * r * r;
   }
 

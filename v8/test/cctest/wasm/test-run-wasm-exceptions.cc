@@ -354,7 +354,7 @@ WASM_COMPILED_EXEC_TEST(TryCatchCallExternal) {
       Cast<JSFunction>(v8::Utils::OpenDirectHandle(
           *v8::Local<v8::Function>::Cast(CompileRun(source))));
   ManuallyImportedJSFunction import = {sigs.i_ii(), js_function};
-  WasmRunner<uint32_t, uint32_t> r(execution_tier, kWasmOrigin, &import);
+  WasmRunner<uint32_t, uint32_t> r(execution_tier, &import);
   constexpr uint32_t kResult0 = 23;
   constexpr uint32_t kResult1 = 42;
   constexpr uint32_t kJSFunc = 0;
@@ -382,7 +382,7 @@ WASM_COMPILED_EXEC_TEST(TryCatchAllCallExternal) {
       Cast<JSFunction>(v8::Utils::OpenDirectHandle(
           *v8::Local<v8::Function>::Cast(CompileRun(source))));
   ManuallyImportedJSFunction import = {sigs.i_ii(), js_function};
-  WasmRunner<uint32_t, uint32_t> r(execution_tier, kWasmOrigin, &import);
+  WasmRunner<uint32_t, uint32_t> r(execution_tier, &import);
   constexpr uint32_t kResult0 = 23;
   constexpr uint32_t kResult1 = 42;
   constexpr uint32_t kJSFunc = 0;
@@ -407,7 +407,7 @@ namespace {
 void TestTrapNotCaught(uint8_t* code, size_t code_size,
                        TestExecutionTier execution_tier) {
   TestSignatures sigs;
-  WasmRunner<uint32_t> r(execution_tier, kWasmOrigin, nullptr, "main");
+  WasmRunner<uint32_t> r(execution_tier, nullptr, "main");
   r.builder().AddMemory(kWasmPageSize);
   constexpr uint32_t kResultSuccess = 23;
   constexpr uint32_t kResultCaught = 47;
@@ -498,8 +498,7 @@ UNINITIALIZED_WASM_EXEC_TEST(TestStackOverflowNotCaught) {
   IsolateScope isolate_scope;
   LocalContext context(isolate_scope.isolate());
 
-  WasmRunner<uint32_t> r(execution_tier, kWasmOrigin, nullptr, "main",
-                         isolate_scope.i_isolate());
+  WasmRunner<uint32_t> r(isolate_scope.i_isolate(), execution_tier);
 
   // Build a function that calls itself until stack overflow.
   WasmFunctionCompiler& stack_overflow = r.NewFunction(sigs.v_v());

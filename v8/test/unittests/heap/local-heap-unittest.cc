@@ -27,25 +27,8 @@ TEST_F(LocalHeapTest, Initialize) {
 }
 
 TEST_F(LocalHeapTest, Current) {
-  Heap* heap = i_isolate()->heap();
-
-  CHECK_NULL(LocalHeap::Current());
-
-  {
-    LocalHeap lh(heap, ThreadKind::kMain);
-    lh.SetUpMainThreadForTesting();
-    CHECK_NULL(LocalHeap::Current());
-  }
-
-  CHECK_NULL(LocalHeap::Current());
-
-  {
-    LocalHeap lh(heap, ThreadKind::kMain);
-    lh.SetUpMainThreadForTesting();
-    CHECK_NULL(LocalHeap::Current());
-  }
-
-  CHECK_NULL(LocalHeap::Current());
+  CHECK_EQ(LocalHeap::Current(), i_isolate()->main_thread_local_heap());
+  CHECK(LocalHeap::Current()->is_main_thread());
 }
 
 namespace {
@@ -56,12 +39,12 @@ class BackgroundThread final : public v8::base::Thread {
         heap_(heap) {}
 
   void Run() override {
-    CHECK_NULL(LocalHeap::Current());
+    CHECK_NULL(LocalHeap::TryGetCurrent());
     {
       LocalHeap lh(heap_, ThreadKind::kBackground);
       CHECK_EQ(&lh, LocalHeap::Current());
     }
-    CHECK_NULL(LocalHeap::Current());
+    CHECK_NULL(LocalHeap::TryGetCurrent());
   }
 
   Heap* heap_;
@@ -70,17 +53,9 @@ class BackgroundThread final : public v8::base::Thread {
 
 TEST_F(LocalHeapTest, CurrentBackground) {
   Heap* heap = i_isolate()->heap();
-  CHECK_NULL(LocalHeap::Current());
-  {
-    LocalHeap lh(heap, ThreadKind::kMain);
-    lh.SetUpMainThreadForTesting();
-    auto thread = std::make_unique<BackgroundThread>(heap);
-    CHECK(thread->Start());
-    CHECK_NULL(LocalHeap::Current());
-    thread->Join();
-    CHECK_NULL(LocalHeap::Current());
-  }
-  CHECK_NULL(LocalHeap::Current());
+  auto thread = std::make_unique<BackgroundThread>(heap);
+  CHECK(thread->Start());
+  thread->Join();
 }
 
 namespace {
@@ -222,13 +197,13 @@ TEST_F(LocalHeapTest, RootsProvider) {
   InvokeMinorGC(i_isolate());
 
   Tagged<Object> value = data->array()->get(2, kRelaxedLoad);
-  Tagged<HeapNumber> number = Tagged<HeapNumber>::cast(value);
+  Tagged<HeapNumber> number = Cast<HeapNumber>(value);
   CHECK_EQ(number->value(), 101);
 
   InvokeMajorGC(i_isolate());
 
   value = data->array()->get(2, kRelaxedLoad);
-  number = Tagged<HeapNumber>::cast(value);
+  number = Cast<HeapNumber>(value);
   CHECK_EQ(number->value(), 101);
 }
 

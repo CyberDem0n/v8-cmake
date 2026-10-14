@@ -48,7 +48,6 @@ type StrongTagged extends Tagged
 type Smi extends StrongTagged generates 'TNode<Smi>' constexpr 'Smi';
 type WeakHeapObject extends Tagged;
 type Weak<T : type extends HeapObject> extends WeakHeapObject;
-type Uninitialized extends Tagged;
 type TaggedIndex extends StrongTagged;
 type TaggedZeroPattern extends TaggedIndex;
 
@@ -76,6 +75,7 @@ type int8 extends int16 generates 'TNode<Int8T>' constexpr 'int8_t';
 type uint8 extends uint16
     generates 'TNode<Uint8T>' constexpr 'uint8_t';
 type int64 generates 'TNode<Int64T>' constexpr 'int64_t';
+type uint64 generates 'TNode<UInt64T>' constexpr 'uint64_t';
 type intptr generates 'TNode<IntPtrT>' constexpr 'intptr_t';
 type uintptr generates 'TNode<UintPtrT>' constexpr 'uintptr_t';
 type float32 generates 'TNode<Float32T>' constexpr 'float';

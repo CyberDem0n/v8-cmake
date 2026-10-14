@@ -20,13 +20,12 @@ namespace compiler {
 // TODO(391750831): This needs to be ported to Turboshaft.
 #if 0
 InstructionSelectorTest::InstructionSelectorTest()
-    : TestWithNativeContextAndZone(kCompressGraphZone),
-      rng_(v8_flags.random_seed) {}
+    :  rng_(v8_flags.random_seed) {}
 
 InstructionSelectorTest::~InstructionSelectorTest() = default;
 
 InstructionSelectorTest::Stream InstructionSelectorTest::StreamBuilder::Build(
-    InstructionSelector::Features features,
+    CpuFeatureSet features,
     InstructionSelectorTest::StreamBuilderMode mode,
     InstructionSelector::SourcePositionMode source_position_mode) {
   Schedule* schedule = ExportForTest();
@@ -483,7 +482,7 @@ TARGET_TEST_F(InstructionSelectorTest, CallStubWithDeopt) {
   EXPECT_EQ(0, s.ToInt32(call_instr->InputAt(4)));  // This should be a context.
                                                     // We inserted 0 here.
   EXPECT_EQ(0.5, s.ToFloat64(call_instr->InputAt(5)));
-  EXPECT_TRUE(IsUndefined(*s.ToHeapObject(call_instr->InputAt(6)), isolate()));
+  EXPECT_TRUE(IsUndefined(*s.ToHeapObject(call_instr->InputAt(6))));
 
   // Function.
   EXPECT_EQ(s.ToVreg(function_node), s.ToVreg(call_instr->InputAt(7)));

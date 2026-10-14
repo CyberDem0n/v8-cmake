@@ -13,7 +13,7 @@
 #include "src/wasm/wasm-engine.h"
 #include "src/wasm/wasm-js.h"
 #include "src/wasm/wasm-module.h"
-#include "src/wasm/wasm-objects.h"
+#include "src/wasm/wasm-objects-inl.h"
 #include "src/wasm/wasm-opcodes.h"
 #include "src/wasm/wasm-result.h"
 
@@ -37,7 +37,7 @@ MaybeDirectHandle<WasmInstanceObject> CompileAndInstantiateForTesting(
       CompileForTesting(isolate, thrower, bytes);
   if (module.is_null()) return {};
   return GetWasmEngine()->SyncInstantiate(isolate, thrower,
-                                          module.ToHandleChecked(), {}, {});
+                                          module.ToHandleChecked(), {});
 }
 
 DirectHandleVector<Object> MakeDefaultArguments(Isolate* isolate,
@@ -160,7 +160,5 @@ int32_t CallWasmFunctionForTesting(
   }
   return -1;
 }
-
-void SetupIsolateForWasmModule(Isolate* isolate) { WasmJs::Install(isolate); }
 
 }  // namespace v8::internal::wasm::testing

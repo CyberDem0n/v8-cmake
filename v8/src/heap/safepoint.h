@@ -6,6 +6,7 @@
 #define V8_HEAP_SAFEPOINT_H_
 
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 #include "src/base/platform/condition-variable.h"
@@ -19,6 +20,8 @@ namespace v8 {
 namespace internal {
 
 class Heap;
+class IsolateGroup;
+class IsolateSafepointScope;
 class LocalHeap;
 class PerClientSafepointData;
 class RootVisitor;
@@ -46,15 +49,13 @@ class IsolateSafepoint final {
 
   V8_EXPORT_PRIVATE void AssertMainThreadIsOnlyThread();
 
- private:
-  struct RunningLocalHeap {
-    LocalHeap* local_heap;
-#if V8_OS_DARWIN
-    pthread_override_t qos_override;
-#endif
-  };
+  // This method ensures a safepoint for this Isolate but only if it can avoid a
+  // GC. This will always succeed without a shared heap but it might fail when a
+  // shared GC already locked this local_heaps_mutex_.
+  std::optional<IsolateSafepointScope> ReachSafepointWithoutTriggeringGC();
 
-  using RunningLocalHeaps = base::SmallVector<RunningLocalHeap, 4>;
+ private:
+  using RunningLocalHeaps = base::SmallVector<LocalHeap*, 4>;
 
   class Barrier {
     base::Mutex mutex_;
@@ -95,12 +96,8 @@ class IsolateSafepoint final {
   void LeaveLocalSafepointScope();
 
   // Methods for entering/leaving global safepoint scopes.
-  void TryInitiateGlobalSafepointScope(Isolate* initiator,
-                                       PerClientSafepointData* client_data);
   void InitiateGlobalSafepointScope(Isolate* initiator,
                                     PerClientSafepointData* client_data);
-  void InitiateGlobalSafepointScopeRaw(Isolate* initiator,
-                                       PerClientSafepointData* client_data);
   void LeaveGlobalSafepointScope(Isolate* initiator);
 
   // Blocks until all running threads reached a safepoint.
@@ -141,14 +138,14 @@ class IsolateSafepoint final {
 
     // Remove list from doubly-linked list
     if (local_heap->next_) local_heap->next_->prev_ = local_heap->prev_;
-    if (local_heap->prev_)
+    if (local_heap->prev_) {
       local_heap->prev_->next_ = local_heap->next_;
-    else
+    } else {
       local_heaps_head_ = local_heap->next_;
+    }
   }
 
   Isolate* isolate() const;
-  Isolate* shared_space_isolate() const;
 
   Barrier barrier_;
   Heap* heap_;
@@ -173,6 +170,12 @@ class V8_NODISCARD IsolateSafepointScope {
   V8_EXPORT_PRIVATE explicit IsolateSafepointScope(Heap* heap);
   V8_EXPORT_PRIVATE ~IsolateSafepointScope();
 
+  IsolateSafepointScope(const IsolateSafepointScope& other) = delete;
+  IsolateSafepointScope(IsolateSafepointScope&& other) V8_NOEXCEPT;
+
+  IsolateSafepointScope& operator=(IsolateSafepointScope& other) = delete;
+  IsolateSafepointScope& operator=(IsolateSafepointScope&& other) = delete;
+
  private:
   IsolateSafepoint* safepoint_;
 };
@@ -181,10 +184,12 @@ class V8_NODISCARD IsolateSafepointScope {
 // of the shared isolate.
 class GlobalSafepoint final {
  public:
-  explicit GlobalSafepoint(Isolate* isolate);
+  explicit GlobalSafepoint(IsolateGroup* group);
 
   void AppendClient(Isolate* client);
   void RemoveClient(Isolate* client);
+
+  V8_EXPORT_PRIVATE Isolate* shared_space_isolate() const;
 
   template <typename Callback>
   void IterateClientIsolates(Callback callback) {
@@ -199,7 +204,9 @@ class GlobalSafepoint final {
 
   template <typename Callback>
   void IterateSharedSpaceAndClientIsolates(Callback callback) {
-    callback(shared_space_isolate_);
+    Isolate* shared_isolate = shared_space_isolate();
+    DCHECK_NOT_NULL(shared_isolate);
+    callback(shared_isolate);
     IterateClientIsolates(callback);
   }
 
@@ -213,7 +220,7 @@ class GlobalSafepoint final {
   void EnterGlobalSafepointScope(Isolate* initiator);
   void LeaveGlobalSafepointScope(Isolate* initiator);
 
-  Isolate* const shared_space_isolate_;
+  IsolateGroup* const group_;
   // RecursiveMutex is needed since we need to support nested
   // GlobalSafepointScopes.
   base::RecursiveMutex clients_mutex_;
@@ -231,7 +238,6 @@ class V8_NODISCARD GlobalSafepointScope {
 
  private:
   Isolate* const initiator_;
-  Isolate* const shared_space_isolate_;
 };
 
 enum class SafepointKind { kIsolate, kGlobal };

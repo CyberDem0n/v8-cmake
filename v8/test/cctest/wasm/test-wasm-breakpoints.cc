@@ -10,7 +10,7 @@
 #include "src/wasm/wasm-debug.h"
 #include "src/wasm/wasm-objects-inl.h"
 #include "test/cctest/cctest.h"
-#include "test/cctest/wasm/wasm-run-utils.h"
+#include "test/cctest/wasm/wasm-runner.h"
 #include "test/common/value-helper.h"
 #include "test/common/wasm/test-signatures.h"
 #include "test/common/wasm/wasm-macro-gen.h"
@@ -32,8 +32,8 @@ debug::Location TranslateLocation(WasmRunnerBase* runner,
 }
 
 void CheckLocations(
-    WasmRunnerBase* runner, NativeModule* native_module, debug::Location start,
-    debug::Location end,
+    WasmRunnerBase* runner, const NativeModule* native_module,
+    debug::Location start, debug::Location end,
     std::initializer_list<debug::Location> expected_locations_init) {
   std::vector<debug::BreakLocation> locations;
   std::vector<debug::Location> expected_locations;
@@ -62,7 +62,8 @@ void CheckLocations(
   }
 }
 
-void CheckLocationsFail(WasmRunnerBase* runner, NativeModule* native_module,
+void CheckLocationsFail(WasmRunnerBase* runner,
+                        const NativeModule* native_module,
                         debug::Location start, debug::Location end) {
   std::vector<debug::BreakLocation> locations;
   bool success = WasmScript::GetPossibleBreakpoints(
@@ -117,7 +118,7 @@ class BreakHandler : public debug::DebugDelegate {
 
     // Check the current position.
     DebuggableStackFrameIterator frame_it(isolate_);
-    auto summ = FrameSummary::GetTop(frame_it.frame()).AsWasm();
+    auto summ = FrameSummary::GetInnermost(frame_it.frame()).AsWasm();
     CHECK_EQ(expected_breaks_[count_].position, summ.code_offset());
 
     expected_breaks_[count_].pre_action();
@@ -148,11 +149,10 @@ Handle<BreakPoint> SetBreakpoint(WasmRunnerBase* runner, int function_index,
   DirectHandle<WasmInstanceObject> instance =
       runner->builder().instance_object();
   DirectHandle<Script> script(instance->module_object()->script(),
-                              runner->main_isolate());
+                              runner->isolate());
   static int break_index = 0;
-  Handle<BreakPoint> break_point =
-      runner->main_isolate()->factory()->NewBreakPoint(
-          break_index++, runner->main_isolate()->factory()->empty_string());
+  Handle<BreakPoint> break_point = runner->isolate()->factory()->NewBreakPoint(
+      break_index++, runner->isolate()->factory()->empty_string());
   CHECK(WasmScript::SetBreakPoint(script, &code_offset, break_point));
   return break_point;
 }
@@ -165,7 +165,7 @@ void ClearBreakpoint(WasmRunnerBase* runner, int function_index,
   DirectHandle<WasmInstanceObject> instance =
       runner->builder().instance_object();
   DirectHandle<Script> script(instance->module_object()->script(),
-                              runner->main_isolate());
+                              runner->isolate());
   CHECK(WasmScript::ClearBreakPoint(script, code_offset, break_point));
 }
 
@@ -289,30 +289,32 @@ WASM_COMPILED_EXEC_TEST(WasmCollectPossibleBreakpoints) {
   runner.Build({WASM_NOP, WASM_I32_ADD(WASM_ZERO, WASM_ONE)});
 
   Tagged<WasmInstanceObject> instance = *runner.builder().instance_object();
-  NativeModule* native_module = instance->module_object()->native_module();
+  CppGCManaged<NativeModule>::Ptr native_module =
+      instance->module_object()->native_module();
 
   std::vector<debug::Location> locations;
   // Check all locations for function 0.
-  CheckLocations(&runner, native_module, {0, 0}, {0, 10},
+  CheckLocations(&runner, native_module.raw(), {0, 0}, {0, 10},
                  {{0, 1}, {0, 2}, {0, 4}, {0, 6}, {0, 7}});
   // Check a range ending at an instruction.
-  CheckLocations(&runner, native_module, {0, 2}, {0, 4}, {{0, 2}});
+  CheckLocations(&runner, native_module.raw(), {0, 2}, {0, 4}, {{0, 2}});
   // Check a range ending one behind an instruction.
-  CheckLocations(&runner, native_module, {0, 2}, {0, 5}, {{0, 2}, {0, 4}});
+  CheckLocations(&runner, native_module.raw(), {0, 2}, {0, 5},
+                 {{0, 2}, {0, 4}});
   // Check a range starting at an instruction.
-  CheckLocations(&runner, native_module, {0, 7}, {0, 8}, {{0, 7}});
+  CheckLocations(&runner, native_module.raw(), {0, 7}, {0, 8}, {{0, 7}});
   // Check from an instruction to beginning of next function.
-  CheckLocations(&runner, native_module, {0, 7}, {0, 10}, {{0, 7}});
+  CheckLocations(&runner, native_module.raw(), {0, 7}, {0, 10}, {{0, 7}});
   // Check from end of one function (no valid instruction position) to beginning
   // of next function. Must be empty, but not fail.
-  CheckLocations(&runner, native_module, {0, 8}, {0, 10}, {});
+  CheckLocations(&runner, native_module.raw(), {0, 8}, {0, 10}, {});
   // Check from one after the end of the function. Must fail.
-  CheckLocationsFail(&runner, native_module, {0, 9}, {0, 10});
+  CheckLocationsFail(&runner, native_module.raw(), {0, 9}, {0, 10});
 }
 
 WASM_COMPILED_EXEC_TEST(WasmSimpleBreak) {
   WasmRunner<int> runner(execution_tier);
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
 
   runner.Build({WASM_NOP, WASM_I32_ADD(WASM_I32V_1(11), WASM_I32V_1(3))});
 
@@ -330,7 +332,7 @@ WASM_COMPILED_EXEC_TEST(WasmSimpleBreak) {
 
 WASM_COMPILED_EXEC_TEST(WasmNonBreakablePosition) {
   WasmRunner<int> runner(execution_tier);
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
 
   runner.Build({WASM_RETURN(WASM_I32V_2(1024))});
 
@@ -350,7 +352,7 @@ WASM_COMPILED_EXEC_TEST(WasmSimpleStepping) {
   WasmRunner<int> runner(execution_tier);
   runner.Build({WASM_I32_ADD(WASM_I32V_1(11), WASM_I32V_1(3))});
 
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
   DirectHandle<JSFunction> main_fun_wrapper =
       runner.builder().WrapCode(runner.function_index());
 
@@ -390,7 +392,7 @@ WASM_COMPILED_EXEC_TEST(WasmStepInAndOut) {
       WASM_CALL_FUNCTION(runner.function_index(), WASM_LOCAL_GET(0)), WASM_DROP,
       WASM_BR(1))});
 
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
   DirectHandle<JSFunction> main_fun_wrapper =
       runner.builder().WrapCode(f2.function_index());
 
@@ -424,7 +426,7 @@ WASM_COMPILED_EXEC_TEST(WasmGetLocalsAndStack) {
        WASM_LOCAL_SET(3, WASM_F64_DIV(WASM_F64_SCONVERT_I64(WASM_LOCAL_GET(1)),
                                       WASM_F64(2)))});
 
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
   DirectHandle<JSFunction> main_fun_wrapper =
       runner.builder().WrapCode(runner.function_index());
 
@@ -458,7 +460,7 @@ WASM_COMPILED_EXEC_TEST(WasmGetLocalsAndStack) {
 
 WASM_COMPILED_EXEC_TEST(WasmRemoveBreakPoint) {
   WasmRunner<int> runner(execution_tier);
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
 
   runner.Build(
       {WASM_NOP, WASM_NOP, WASM_NOP, WASM_NOP, WASM_NOP, WASM_I32V_1(14)});
@@ -489,7 +491,7 @@ WASM_COMPILED_EXEC_TEST(WasmRemoveBreakPoint) {
 
 WASM_COMPILED_EXEC_TEST(WasmRemoveLastBreakPoint) {
   WasmRunner<int> runner(execution_tier);
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
 
   runner.Build(
       {WASM_NOP, WASM_NOP, WASM_NOP, WASM_NOP, WASM_NOP, WASM_I32V_1(14)});
@@ -517,7 +519,7 @@ WASM_COMPILED_EXEC_TEST(WasmRemoveLastBreakPoint) {
 
 WASM_COMPILED_EXEC_TEST(WasmRemoveAllBreakPoint) {
   WasmRunner<int> runner(execution_tier);
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
 
   runner.Build(
       {WASM_NOP, WASM_NOP, WASM_NOP, WASM_NOP, WASM_NOP, WASM_I32V_1(14)});
@@ -551,7 +553,7 @@ WASM_COMPILED_EXEC_TEST(WasmBreakInPostMVP) {
   // features set, but we were passing a nullptr when compiling with
   // breakpoints.
   WasmRunner<int> runner(execution_tier);
-  Isolate* isolate = runner.main_isolate();
+  Isolate* isolate = runner.isolate();
 
   // [] -> [i32, i32]
   ValueType sig_types[] = {kWasmI32, kWasmI32};

@@ -2,32 +2,34 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// Flags: --experimental-wasm-custom-descriptors --allow-natives-syntax
+// Flags: --wasm-custom-descriptors --allow-natives-syntax
+// Flags: --wasm-js-interop
 
 d8.file.execute("test/mjsunit/wasm/wasm-module-builder.js");
-
-function StringToArray(str) {
-  let result = [str.length];
-  for (let c of str) result.push(c.charCodeAt(0));
-  return result;
-}
+d8.file.execute("test/mjsunit/wasm/prototype-setup-builder.js");
 
 var builder = new WasmModuleBuilder();
 builder.startRecGroup();
 var $struct0 = builder.addStruct(
     {fields: [makeField(kWasmI32, true)], descriptor: 1});
-var $desc0 = builder.addStruct({describes: $struct0});
+var $desc0 = builder.addStruct(
+    {fields: [makeField(kWasmExternRef, false)], describes: $struct0});
 builder.endRecGroup();
 
+let proto_config = new WasmPrototypeSetupBuilder(builder);
+
+var $proto0 = builder.addImportedGlobal("p", "p0", kWasmExternRef);
+
 var $glob0 = builder.addGlobal(wasmRefType($desc0).exact(), false, false, [
-  kGCPrefix, kExprStructNewDefault, $desc0
+  kExprGlobalGet, $proto0,
+  kGCPrefix, kExprStructNew, $desc0,
 ]);
 
 let $make = builder.addFunction("make", makeSig([], [kWasmExternRef]))
     .exportFunc()
     .addBody([
       kExprGlobalGet, $glob0.index,
-      kGCPrefix, kExprStructNewDefault, $struct0,
+      kGCPrefix, kExprStructNewDefaultDesc, $struct0,
       kGCPrefix, kExprExternConvertAny,
     ]);
 
@@ -56,27 +58,25 @@ let $get_add = builder.addFunction("get_add",
       kExprI32Add,
     ]);
 
-let global_entries = [
-  1,  // 1 entry
-  $glob0.index,
-  0,  // no parent
-  2,  // 2 methods
-  0, ...StringToArray("get"), $get.index,
-  0, ...StringToArray("get_add"), $get_add.index,
-  1,  // constructor
-  ...StringToArray("Obj"), $make.index,
-  0,  // no statics
-];
-builder.addCustomSection("experimental-descriptors", [
-  0,  // version
-  0,  // module name
-  2,  // GlobalEntries subsection
-  ...wasmUnsignedLeb(global_entries.length),
-  ...global_entries,
-]);
+let $get_recv = builder.addFunction("get_recv", kSig_r_r)
+    .exportFunc()
+    .addBody([kExprLocalGet, 0]);
 
-let instance = builder.instantiate();
-let Obj = instance.exports.Obj;
+proto_config.addConfig($proto0)
+    .addConstructor("Obj", $make)
+    .addMethod("get", kWasmMethod, $get)
+    .addMethod("get_add", kWasmMethod, $get_add)
+    .addMethod("get_recv", kWasmMethod, $get_recv);
+
+proto_config.build();
+
+let constructors = {};
+let imports = {
+  p: {p0: {}},
+  c: {constructors},
+};
+let instance = builder.instantiate(imports, {builtins: ["js-prototypes"]});
+let Obj = constructors.Obj;
 
 let obj = new Obj();
 
@@ -100,3 +100,11 @@ assertEquals(0, InlineFunction(obj));
 console.log("Now optimizing 'InlineWrapper'");
 %OptimizeFunctionOnNextCall(InlineWrapper);
 assertEquals(1, InlineWrapper(obj));
+
+// Calling a method as a constructor may trap on cast but does not DCHECK-fail.
+let Method = imports.p.p0.get;
+assertTraps(kTrapIllegalCast, () => new Method());
+
+Method = imports.p.p0.get_recv;
+let o = new Method();
+assertEquals("[object Object]", o.toString());

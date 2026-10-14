@@ -159,152 +159,171 @@ HWY_NOINLINE void TestAllAverage() {
   ForIntegerTypes(ForPartialVectors<TestAverage>());
 }
 
-struct TestAbs {
-  template <typename T, class D>
+struct TestPairwiseAdd {
+  template <typename T, class D, HWY_IF_LANES_GT_D(D, 1)>
   HWY_NOINLINE void operator()(T /*unused*/, D d) {
-    const Vec<D> v0 = Zero(d);
-    const Vec<D> vp1 = Set(d, static_cast<T>(1));
-    const Vec<D> vn1 = Set(d, static_cast<T>(-1));
-    const Vec<D> vpm = Set(d, LimitsMax<T>());
-    const Vec<D> vnm = Set(d, LimitsMin<T>());
+    const Vec<D> a = Iota(d, 1);
+    const Vec<D> b = Iota(d, 2);
 
-    HWY_ASSERT_VEC_EQ(d, v0, Abs(v0));
-    HWY_ASSERT_VEC_EQ(d, vp1, Abs(vp1));
-    HWY_ASSERT_VEC_EQ(d, vp1, Abs(vn1));
-    HWY_ASSERT_VEC_EQ(d, vpm, Abs(vpm));
-    HWY_ASSERT_VEC_EQ(d, vnm, Abs(vnm));
-  }
-};
-
-struct TestFloatAbs {
-  template <typename T, class D>
-  HWY_NOINLINE void operator()(T /*unused*/, D d) {
-    const Vec<D> v0 = Zero(d);
-    const Vec<D> vp1 = Set(d, ConvertScalarTo<T>(1));
-    const Vec<D> vn1 = Set(d, ConvertScalarTo<T>(-1));
-    const Vec<D> vp2 = Set(d, ConvertScalarTo<T>(0.01));
-    const Vec<D> vn2 = Set(d, ConvertScalarTo<T>(-0.01));
-
-    HWY_ASSERT_VEC_EQ(d, v0, Abs(v0));
-    HWY_ASSERT_VEC_EQ(d, vp1, Abs(vp1));
-    HWY_ASSERT_VEC_EQ(d, vp1, Abs(vn1));
-    HWY_ASSERT_VEC_EQ(d, vp2, Abs(vp2));
-    HWY_ASSERT_VEC_EQ(d, vp2, Abs(vn2));
-  }
-};
-
-HWY_NOINLINE void TestAllAbs() {
-  ForSignedTypes(ForPartialVectors<TestAbs>());
-  ForFloatTypes(ForPartialVectors<TestFloatAbs>());
-}
-
-struct TestIntegerNeg {
-  template <typename T, class D>
-  HWY_NOINLINE void operator()(T /*unused*/, D d) {
-    const RebindToUnsigned<D> du;
-    using TU = TFromD<decltype(du)>;
-    const Vec<D> v0 = Zero(d);
-    const Vec<D> v1 = BitCast(d, Set(du, TU{1}));
-    const Vec<D> vp = BitCast(d, Set(du, TU{3}));
-    const Vec<D> vn = Add(Not(vp), v1);  // 2's complement
-    HWY_ASSERT_VEC_EQ(d, v0, Neg(v0));
-    HWY_ASSERT_VEC_EQ(d, vp, Neg(vn));
-    HWY_ASSERT_VEC_EQ(d, vn, Neg(vp));
-  }
-};
-
-struct TestFloatNeg {
-  // Must be inlined on aarch64 for bf16, else clang crashes.
-  template <typename T, class D>
-  HWY_INLINE void operator()(T /*unused*/, D d) {
-    const RebindToUnsigned<D> du;
-    using TU = TFromD<decltype(du)>;
-    // 1.25 in binary16.
-    const Vec<D> vp =
-        BitCast(d, Set(du, static_cast<TU>(Unpredictable1() * 0x3D00)));
-    // Flip sign bit in MSB
-    const Vec<D> vn = BitCast(d, Xor(BitCast(du, vp), SignBit(du)));
-    // Do not check negative zero - we do not yet have proper bfloat16_t Eq().
-    HWY_ASSERT_VEC_EQ(du, BitCast(du, vp), BitCast(du, Neg(vn)));
-    HWY_ASSERT_VEC_EQ(du, BitCast(du, vn), BitCast(du, Neg(vp)));
-  }
-};
-
-struct TestNegOverflow {
-  template <typename T, class D>
-  HWY_NOINLINE void operator()(T /*unused*/, D d) {
-    const auto vn = Set(d, LimitsMin<T>());
-    const auto vp = Set(d, LimitsMax<T>());
-    HWY_ASSERT_VEC_EQ(d, Neg(vn), Neg(vn));
-    HWY_ASSERT_VEC_EQ(d, Neg(vp), Neg(vp));
-  }
-};
-
-HWY_NOINLINE void TestAllNeg() {
-  ForFloatTypes(ForPartialVectors<TestFloatNeg>());
-  // Always supported, even if !HWY_HAVE_FLOAT16.
-  ForPartialVectors<TestFloatNeg>()(float16_t());
-
-  ForSignedTypes(ForPartialVectors<TestIntegerNeg>());
-
-  ForSignedTypes(ForPartialVectors<TestNegOverflow>());
-}
-
-struct TestIntegerAbsDiff {
-  template <typename T, HWY_IF_T_SIZE_ONE_OF(T, (1 << 1) | (1 << 2) | (1 << 4))>
-  static inline T ScalarAbsDiff(T a, T b) {
-    using TW = MakeSigned<MakeWide<T>>;
-    const TW diff = static_cast<TW>(static_cast<TW>(a) - static_cast<TW>(b));
-    return static_cast<T>((diff >= 0) ? diff : -diff);
-  }
-  template <typename T, HWY_IF_T_SIZE(T, 8)>
-  static inline T ScalarAbsDiff(T a, T b) {
-    if (a >= b) {
-      return static_cast<T>(static_cast<uint64_t>(a) -
-                            static_cast<uint64_t>(b));
-    } else {
-      return static_cast<T>(static_cast<uint64_t>(b) -
-                            static_cast<uint64_t>(a));
+    const size_t N = Lanes(d);
+    if (N < 2) {
+      return;
     }
+    T even_val_a, odd_val_a, even_val_b, odd_val_b;
+    auto expected = AllocateAligned<T>(N);
+    HWY_ASSERT(expected);
+
+    for (size_t i = 0; i < N; i += 2) {
+      // Results of a and b are interleaved
+      even_val_a = ConvertScalarTo<T>(i + 1);     // a[i]
+      odd_val_a = ConvertScalarTo<T>(i + 1 + 1);  // a[i+1]
+      even_val_b = ConvertScalarTo<T>(i + 2);     // b[i]
+      odd_val_b = ConvertScalarTo<T>(i + 2 + 1);  // b[i+1]
+
+      expected[i] = ConvertScalarTo<T>(even_val_a + odd_val_a);
+      expected[i + 1] = ConvertScalarTo<T>(even_val_b + odd_val_b);
+    }
+
+    HWY_ASSERT_VEC_EQ(d, expected.get(), PairwiseAdd(d, a, b));
   }
 
-  template <typename T, class D>
+  template <typename T, class D, HWY_IF_LANES_D(D, 1)>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    (void)d;
+  }
+};
+
+struct TestPairwiseSub {
+  template <typename T, class D, HWY_IF_LANES_GT_D(D, 1)>
   HWY_NOINLINE void operator()(T /*unused*/, D d) {
     const size_t N = Lanes(d);
-    auto in_lanes_a = AllocateAligned<T>(N);
-    auto in_lanes_b = AllocateAligned<T>(N);
-    auto out_lanes = AllocateAligned<T>(N);
-    HWY_ASSERT(in_lanes_a && in_lanes_b && out_lanes);
-    constexpr size_t shift_amt_mask = sizeof(T) * 8 - 1;
-    for (size_t i = 0; i < N; ++i) {
-      // Need to mask out shift_amt as i can be greater than or equal to
-      // the number of bits in T if T is int8_t, uint8_t, int16_t, or uint16_t.
-      const auto shift_amt = i & shift_amt_mask;
-      in_lanes_a[i] =
-          static_cast<T>((static_cast<uint64_t>(i) ^ 1u) << shift_amt);
-      in_lanes_b[i] = static_cast<T>(static_cast<uint64_t>(i) << shift_amt);
-      out_lanes[i] = ScalarAbsDiff(in_lanes_a[i], in_lanes_b[i]);
+    if (N < 2) {
+      return;
     }
-    const auto a = Load(d, in_lanes_a.get());
-    const auto b = Load(d, in_lanes_b.get());
-    const auto expected = Load(d, out_lanes.get());
-    HWY_ASSERT_VEC_EQ(d, expected, AbsDiff(a, b));
-    HWY_ASSERT_VEC_EQ(d, expected, AbsDiff(b, a));
+
+    auto a_lanes = AllocateAligned<T>(N);
+    auto b_lanes = AllocateAligned<T>(N);
+    HWY_ASSERT(a_lanes && b_lanes);
+
+    T even_val_a, odd_val_a, even_val_b, odd_val_b;
+    auto expected = AllocateAligned<T>(N);
+    HWY_ASSERT(expected);
+
+    for (size_t i = 0; i < N; i += 2) {
+      // Results of a and are interleaved
+      even_val_a = ConvertScalarTo<T>(i);         // a[i]
+      odd_val_a = ConvertScalarTo<T>(i * i);      // a[i+1]
+      even_val_b = ConvertScalarTo<T>(i);         // b[i]
+      odd_val_b = ConvertScalarTo<T>(i * i + 2);  // b[i+1]
+
+      a_lanes[i] = even_val_a;     // a[i]
+      a_lanes[i + 1] = odd_val_a;  // a[i+1]
+      b_lanes[i] = even_val_b;     // b[i]
+      b_lanes[i + 1] = odd_val_b;  // b[i+1]
+
+      expected[i] = ConvertScalarTo<T>(odd_val_a - even_val_a);
+      expected[i + 1] = ConvertScalarTo<T>(odd_val_b - even_val_b);
+    }
+
+    const auto a = Load(d, a_lanes.get());
+    const auto b = Load(d, b_lanes.get());
+
+    HWY_ASSERT_VEC_EQ(d, expected.get(), PairwiseSub(d, a, b));
+  }
+
+  template <typename T, class D, HWY_IF_LANES_D(D, 1)>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    (void)d;
   }
 };
 
-HWY_NOINLINE void TestAllIntegerAbsDiff() {
-  ForPartialVectors<TestIntegerAbsDiff>()(int8_t());
-  ForPartialVectors<TestIntegerAbsDiff>()(uint8_t());
-  ForPartialVectors<TestIntegerAbsDiff>()(int16_t());
-  ForPartialVectors<TestIntegerAbsDiff>()(uint16_t());
-  ForPartialVectors<TestIntegerAbsDiff>()(int32_t());
-  ForPartialVectors<TestIntegerAbsDiff>()(uint32_t());
-#if HWY_HAVE_INTEGER64
-  ForPartialVectors<TestIntegerAbsDiff>()(int64_t());
-  ForPartialVectors<TestIntegerAbsDiff>()(uint64_t());
-#endif
+struct TestPairwiseAdd128 {
+  template <typename T, class D, HWY_IF_LANES_GT_D(D, 1)>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    auto a = Iota(d, 1);
+    auto b = Iota(d, 2);
+    T even_val_a, odd_val_a, even_val_b, odd_val_b;
+    const size_t N = Lanes(d);
+    auto expected = AllocateAligned<T>(N);
+
+    const size_t vec_bytes = sizeof(T) * N;
+    const size_t blocks_of_128 = (vec_bytes >= 16) ? vec_bytes / 16 : 1;
+    const size_t lanes_in_128 = (vec_bytes >= 16) ? 16 / sizeof(T) : N;
+
+    for (size_t block = 0; block < blocks_of_128; ++block) {
+      for (size_t i = 0; i < lanes_in_128 / 2; ++i) {
+        size_t j = 2 * (block * lanes_in_128 / 2 + i);
+
+        even_val_a = ConvertScalarTo<T>(j + 1);
+        odd_val_a = ConvertScalarTo<T>(j + 2);
+        even_val_b = ConvertScalarTo<T>(j + 2);
+        odd_val_b = ConvertScalarTo<T>(j + 3);
+
+        expected[block * lanes_in_128 + i] =
+            ConvertScalarTo<T>(even_val_a + odd_val_a);
+        expected[block * lanes_in_128 + lanes_in_128 / 2 + i] =
+            ConvertScalarTo<T>(even_val_b + odd_val_b);
+      }
+    }
+    const auto expected_v = Load(d, expected.get());
+    auto res = PairwiseAdd128(d, a, b);
+    HWY_ASSERT_VEC_EQ(d, expected_v, res);
+  }
+
+  template <typename T, class D, HWY_IF_LANES_D(D, 1)>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    (void)d;
+  }
+};
+
+struct TestPairwiseSub128 {
+  template <typename T, class D, HWY_IF_LANES_GT_D(D, 1)>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    const auto iota0 = Iota(d, 0);
+
+    auto a = Add(Iota(d, 1), OddEven(Zero(d), iota0));
+    auto b = Add(Iota(d, 2), OddEven(iota0, Zero(d)));
+    T even_val_a, odd_val_a, even_val_b, odd_val_b;
+    const size_t N = Lanes(d);
+    auto expected = AllocateAligned<T>(N);
+
+    const size_t vec_bytes = sizeof(T) * N;
+    const size_t blocks_of_128 = (vec_bytes >= 16) ? vec_bytes / 16 : 1;
+    const size_t lanes_in_128 = (vec_bytes >= 16) ? 16 / sizeof(T) : N;
+
+    for (size_t block = 0; block < blocks_of_128; ++block) {
+      for (size_t i = 0; i < lanes_in_128 / 2; ++i) {
+        size_t j = 2 * (block * lanes_in_128 / 2 + i);
+
+        even_val_a = ConvertScalarTo<T>(2 * j + 1);
+        odd_val_a = ConvertScalarTo<T>(j + 2);
+        even_val_b = ConvertScalarTo<T>(j + 2);
+        odd_val_b = ConvertScalarTo<T>(2 * j + 4);
+
+        expected[block * lanes_in_128 + i] =
+            ConvertScalarTo<T>(odd_val_a - even_val_a);
+        expected[block * lanes_in_128 + lanes_in_128 / 2 + i] =
+            ConvertScalarTo<T>(odd_val_b - even_val_b);
+      }
+    }
+    const auto expected_v = Load(d, expected.get());
+    auto res = PairwiseSub128(d, a, b);
+    HWY_ASSERT_VEC_EQ(d, expected_v, res);
+  }
+
+  template <typename T, class D, HWY_IF_LANES_D(D, 1)>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    (void)d;
+  }
+};
+
+HWY_NOINLINE void TestAllPairwise() {
+  ForAllTypes(ForPartialVectors<TestPairwiseAdd>());
+  ForAllTypes(ForPartialVectors<TestPairwiseSub>());
+  ForAllTypes(ForGEVectors<128, TestPairwiseAdd128>());
+  ForAllTypes(ForGEVectors<128, TestPairwiseSub128>());
 }
+
 
 }  // namespace
 // NOLINTNEXTLINE(google-readability-namespace-comments)
@@ -319,9 +338,7 @@ HWY_BEFORE_TEST(HwyArithmeticTest);
 HWY_EXPORT_AND_TEST_P(HwyArithmeticTest, TestAllPlusMinus);
 HWY_EXPORT_AND_TEST_P(HwyArithmeticTest, TestAllAddSub);
 HWY_EXPORT_AND_TEST_P(HwyArithmeticTest, TestAllAverage);
-HWY_EXPORT_AND_TEST_P(HwyArithmeticTest, TestAllAbs);
-HWY_EXPORT_AND_TEST_P(HwyArithmeticTest, TestAllNeg);
-HWY_EXPORT_AND_TEST_P(HwyArithmeticTest, TestAllIntegerAbsDiff);
+HWY_EXPORT_AND_TEST_P(HwyArithmeticTest, TestAllPairwise);
 HWY_AFTER_TEST();
 }  // namespace
 }  // namespace hwy

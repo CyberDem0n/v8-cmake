@@ -83,32 +83,43 @@ struct TestLogical {
     HWY_ASSERT_VEC_EQ(d, v0, AndNot(vi, v0));
     HWY_ASSERT_VEC_EQ(d, v0, AndNot(vi, vi));
 
+    // The truth table or x86 TernaryLogic constant can be read from the
+    // expected values, because arguments can be interpreted as 3-bit numbers.
     HWY_ASSERT_VEC_EQ(d, v0, Or3(v0, v0, v0));
-    HWY_ASSERT_VEC_EQ(d, vi, Or3(v0, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, Or3(v0, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, vi, Or3(v0, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, Or3(v0, vi, vi));
     HWY_ASSERT_VEC_EQ(d, vi, Or3(vi, v0, v0));
-    HWY_ASSERT_VEC_EQ(d, vi, Or3(vi, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, Or3(vi, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, vi, Or3(vi, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, Or3(vi, vi, vi));
 
     HWY_ASSERT_VEC_EQ(d, v0, Xor3(v0, v0, v0));
-    HWY_ASSERT_VEC_EQ(d, vi, Xor3(v0, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, Xor3(v0, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, vi, Xor3(v0, vi, v0));
     HWY_ASSERT_VEC_EQ(d, v0, Xor3(v0, vi, vi));
     HWY_ASSERT_VEC_EQ(d, vi, Xor3(vi, v0, v0));
-    HWY_ASSERT_VEC_EQ(d, v0, Xor3(vi, vi, v0));
     HWY_ASSERT_VEC_EQ(d, v0, Xor3(vi, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, v0, Xor3(vi, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, Xor3(vi, vi, vi));
 
     HWY_ASSERT_VEC_EQ(d, v0, OrAnd(v0, v0, v0));
-    HWY_ASSERT_VEC_EQ(d, v0, OrAnd(v0, vi, v0));
     HWY_ASSERT_VEC_EQ(d, v0, OrAnd(v0, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, v0, OrAnd(v0, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, OrAnd(v0, vi, vi));
     HWY_ASSERT_VEC_EQ(d, vi, OrAnd(vi, v0, v0));
-    HWY_ASSERT_VEC_EQ(d, vi, OrAnd(vi, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, OrAnd(vi, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, vi, OrAnd(vi, vi, v0));
     HWY_ASSERT_VEC_EQ(d, vi, OrAnd(vi, vi, vi));
+
+    HWY_ASSERT_VEC_EQ(d, v0, XorAndNot(v0, v0, v0));
+    HWY_ASSERT_VEC_EQ(d, vi, XorAndNot(v0, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, v0, XorAndNot(v0, vi, v0));
+    HWY_ASSERT_VEC_EQ(d, v0, XorAndNot(v0, vi, vi));
+    HWY_ASSERT_VEC_EQ(d, vi, XorAndNot(vi, v0, v0));
+    HWY_ASSERT_VEC_EQ(d, v0, XorAndNot(vi, v0, vi));
+    HWY_ASSERT_VEC_EQ(d, vi, XorAndNot(vi, vi, v0));
+    HWY_ASSERT_VEC_EQ(d, vi, XorAndNot(vi, vi, vi));
   }
 };
 
@@ -146,6 +157,54 @@ HWY_NOINLINE void TestAllTestBit() {
   ForIntegerTypes(ForPartialVectors<TestTestBit>());
 }
 
+struct TestMaskedOr {
+  template <typename T, class D>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    const MFromD<D> all_true = MaskTrue(d);
+    const auto v1 = Iota(d, 1);
+    const auto v2 = Iota(d, 2);
+
+    HWY_ASSERT_VEC_EQ(d, Or(v2, v1), MaskedOr(all_true, v1, v2));
+
+    const MFromD<D> first_five = FirstN(d, 5);
+    const Vec<D> v0 = Zero(d);
+
+    const Vec<D> v1_exp = IfThenElse(first_five, Or(v2, v1), v0);
+
+    HWY_ASSERT_VEC_EQ(d, v1_exp, MaskedOr(first_five, v1, v2));
+  }
+};
+
+HWY_NOINLINE void TestAllMaskedLogical() {
+  ForAllTypes(ForPartialVectors<TestMaskedOr>());
+}
+
+struct TestAllBits {
+  template <class T, class D>
+  HWY_NOINLINE void operator()(T /*unused*/, D d) {
+    auto v0s = Zero(d);
+    HWY_ASSERT(AllBits0(d, v0s));
+    auto v1s = Not(v0s);
+    HWY_ASSERT(AllBits1(d, v1s));
+    const size_t kNumBits = sizeof(T) * 8;
+    for (size_t i = 0; i < kNumBits; ++i) {
+      const Vec<D> bit1 = Set(d, static_cast<T>(1ull << i));
+      const Vec<D> bit2 = Set(d, static_cast<T>(1ull << ((i + 1) % kNumBits)));
+      const Vec<D> bits12 = Or(bit1, bit2);
+      HWY_ASSERT(!AllBits1(d, bit1));
+      HWY_ASSERT(!AllBits0(d, bit1));
+      HWY_ASSERT(!AllBits1(d, bit2));
+      HWY_ASSERT(!AllBits0(d, bit2));
+      HWY_ASSERT(!AllBits1(d, bits12));
+      HWY_ASSERT(!AllBits0(d, bits12));
+    }
+  }
+};
+
+HWY_NOINLINE void TestAllAllBits() {
+  ForIntegerTypes(ForPartialVectors<TestAllBits>());
+}
+
 }  // namespace
 // NOLINTNEXTLINE(google-readability-namespace-comments)
 }  // namespace HWY_NAMESPACE
@@ -159,6 +218,9 @@ HWY_BEFORE_TEST(HwyLogicalTest);
 HWY_EXPORT_AND_TEST_P(HwyLogicalTest, TestAllNot);
 HWY_EXPORT_AND_TEST_P(HwyLogicalTest, TestAllLogical);
 HWY_EXPORT_AND_TEST_P(HwyLogicalTest, TestAllTestBit);
+HWY_EXPORT_AND_TEST_P(HwyLogicalTest, TestAllMaskedLogical);
+HWY_EXPORT_AND_TEST_P(HwyLogicalTest, TestAllAllBits);
+
 HWY_AFTER_TEST();
 }  // namespace
 }  // namespace hwy

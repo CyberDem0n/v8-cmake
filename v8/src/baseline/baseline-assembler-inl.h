@@ -57,6 +57,11 @@ void BaselineAssembler::RecordComment(const char* string) {
 }
 void BaselineAssembler::Trap() { __ Trap(); }
 void BaselineAssembler::DebugBreak() { __ DebugBreak(); }
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+void BaselineAssembler::AssertInSandboxedExecutionMode() {
+  __ AssertInSandboxedExecutionMode();
+}
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
 void BaselineAssembler::CallRuntime(Runtime::FunctionId function, int nargs) {
   __ CallRuntime(function, nargs);
 }
@@ -117,7 +122,7 @@ void BaselineAssembler::LoadFixedArrayElement(Register output, Register array,
 
 void BaselineAssembler::LoadPrototype(Register prototype, Register object) {
   __ LoadMap(prototype, object);
-  LoadTaggedField(prototype, prototype, Map::kPrototypeOffset);
+  LoadTaggedField(prototype, prototype, offsetof(Map, prototype_));
 }
 void BaselineAssembler::LoadContext(Register output) {
   LoadRegister(output, interpreter::Register::current_context());

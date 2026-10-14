@@ -52,6 +52,7 @@ using std::map;
 using std::pair;
 using std::string;
 
+using v8::Boolean;
 using v8::Context;
 using v8::EscapableHandleScope;
 using v8::External;
@@ -153,7 +154,7 @@ class JsHttpRequestProcessor : public HttpRequestProcessor {
   static v8::Intercepted MapGet(Local<Name> name,
                                 const PropertyCallbackInfo<Value>& info);
   static v8::Intercepted MapSet(Local<Name> name, Local<Value> value,
-                                const PropertyCallbackInfo<void>& info);
+                                const PropertyCallbackInfo<Boolean>& info);
 
   // Utility methods for wrapping C++ objects as JavaScript objects,
   // and going back again.
@@ -341,14 +342,18 @@ JsHttpRequestProcessor::~JsHttpRequestProcessor() {
   process_.Reset();
 }
 
-
 Global<ObjectTemplate> JsHttpRequestProcessor::request_template_;
 Global<ObjectTemplate> JsHttpRequestProcessor::map_template_;
-
 
 // -----------------------------------
 // --- A c c e s s i n g   M a p s ---
 // -----------------------------------
+
+namespace {
+// This tag value has been picked arbitrarily between 0 and
+// V8_EXTERNAL_POINTER_TAG_COUNT.
+constexpr v8::ExternalPointerTypeTag kMapTag = 6;
+}  // namespace
 
 // Utility function that wraps a C++ http request object in a
 // JavaScript object.
@@ -371,7 +376,7 @@ Local<Object> JsHttpRequestProcessor::WrapMap(map<string, string>* obj) {
 
   // Wrap the raw C++ pointer in an External so it can be referenced
   // from within JavaScript.
-  Local<External> map_ptr = External::New(GetIsolate(), obj);
+  Local<External> map_ptr = External::New(GetIsolate(), obj, kMapTag);
 
   // Store the map pointer in the JavaScript wrapper.
   result->SetInternalField(0, map_ptr);
@@ -383,15 +388,13 @@ Local<Object> JsHttpRequestProcessor::WrapMap(map<string, string>* obj) {
   return handle_scope.Escape(result);
 }
 
-
 // Utility function that extracts the C++ map pointer from a wrapper
 // object.
 map<string, string>* JsHttpRequestProcessor::UnwrapMap(Local<Object> obj) {
   Local<External> field = obj->GetInternalField(0).As<Value>().As<External>();
-  void* ptr = field->Value();
+  void* ptr = field->Value(kMapTag);
   return static_cast<map<string, string>*>(ptr);
 }
-
 
 // Convert a JavaScript string to a std::string.  To not bother too
 // much with string encodings we just use ascii.
@@ -405,7 +408,7 @@ v8::Intercepted JsHttpRequestProcessor::MapGet(
   if (name->IsSymbol()) return v8::Intercepted::kNo;
 
   // Fetch the map wrapped by this object.
-  map<string, string>* obj = UnwrapMap(info.HolderV2());
+  map<string, string>* obj = UnwrapMap(info.Holder());
 
   // Convert the JavaScript string to a std::string.
   string key = ObjectToString(info.GetIsolate(), name.As<String>());
@@ -427,11 +430,11 @@ v8::Intercepted JsHttpRequestProcessor::MapGet(
 
 v8::Intercepted JsHttpRequestProcessor::MapSet(
     Local<Name> name, Local<Value> value_obj,
-    const PropertyCallbackInfo<void>& info) {
+    const PropertyCallbackInfo<Boolean>& info) {
   if (name->IsSymbol()) return v8::Intercepted::kNo;
 
   // Fetch the map wrapped by this object.
-  map<string, string>* obj = UnwrapMap(info.HolderV2());
+  map<string, string>* obj = UnwrapMap(info.Holder());
 
   // Convert the key and value to std::strings.
   string key = ObjectToString(info.GetIsolate(), name.As<String>());
@@ -454,10 +457,13 @@ Local<ObjectTemplate> JsHttpRequestProcessor::MakeMapTemplate(
   return handle_scope.Escape(result);
 }
 
-
 // -------------------------------------------
 // --- A c c e s s i n g   R e q u e s t s ---
 // -------------------------------------------
+
+namespace {
+constexpr v8::ExternalPointerTypeTag kHttpRequestTag = 7;
+}  // namespace
 
 /**
  * Utility function that wraps a C++ http request object in a
@@ -482,7 +488,8 @@ Local<Object> JsHttpRequestProcessor::WrapRequest(HttpRequest* request) {
 
   // Wrap the raw C++ pointer in an External so it can be referenced
   // from within JavaScript.
-  Local<External> request_ptr = External::New(GetIsolate(), request);
+  Local<External> request_ptr =
+      External::New(GetIsolate(), request, kHttpRequestTag);
 
   // Store the request pointer in the JavaScript wrapper.
   result->SetInternalField(0, request_ptr);
@@ -494,21 +501,20 @@ Local<Object> JsHttpRequestProcessor::WrapRequest(HttpRequest* request) {
   return handle_scope.Escape(result);
 }
 
-
 /**
  * Utility function that extracts the C++ http request object from a
  * wrapper object.
  */
 HttpRequest* JsHttpRequestProcessor::UnwrapRequest(Local<Object> obj) {
   Local<External> field = obj->GetInternalField(0).As<Value>().As<External>();
-  void* ptr = field->Value();
+  void* ptr = field->Value(kHttpRequestTag);
   return static_cast<HttpRequest*>(ptr);
 }
 
 void JsHttpRequestProcessor::GetPath(Local<Name> name,
                                      const PropertyCallbackInfo<Value>& info) {
   // Extract the C++ request object from the JavaScript wrapper.
-  HttpRequest* request = UnwrapRequest(info.HolderV2());
+  HttpRequest* request = UnwrapRequest(info.Holder());
 
   // Fetch the path.
   const string& path = request->Path();
@@ -522,7 +528,7 @@ void JsHttpRequestProcessor::GetPath(Local<Name> name,
 
 void JsHttpRequestProcessor::GetReferrer(
     Local<Name> name, const PropertyCallbackInfo<Value>& info) {
-  HttpRequest* request = UnwrapRequest(info.HolderV2());
+  HttpRequest* request = UnwrapRequest(info.Holder());
   const string& path = request->Referrer();
   info.GetReturnValue().Set(
       String::NewFromUtf8(info.GetIsolate(), path.c_str(),
@@ -532,7 +538,7 @@ void JsHttpRequestProcessor::GetReferrer(
 
 void JsHttpRequestProcessor::GetHost(Local<Name> name,
                                      const PropertyCallbackInfo<Value>& info) {
-  HttpRequest* request = UnwrapRequest(info.HolderV2());
+  HttpRequest* request = UnwrapRequest(info.Holder());
   const string& path = request->Host();
   info.GetReturnValue().Set(
       String::NewFromUtf8(info.GetIsolate(), path.c_str(),
@@ -542,7 +548,7 @@ void JsHttpRequestProcessor::GetHost(Local<Name> name,
 
 void JsHttpRequestProcessor::GetUserAgent(
     Local<Name> name, const PropertyCallbackInfo<Value>& info) {
-  HttpRequest* request = UnwrapRequest(info.HolderV2());
+  HttpRequest* request = UnwrapRequest(info.Holder());
   const string& path = request->UserAgent();
   info.GetReturnValue().Set(
       String::NewFromUtf8(info.GetIsolate(), path.c_str(),
@@ -690,7 +696,10 @@ void PrintMap(map<string, string>* m) {
 
 
 int main(int argc, char* argv[]) {
-  v8::V8::InitializeICUDefaultLocation(argv[0]);
+  if (!v8::V8::InitializeICUDefaultLocation(argv[0])) {
+    fprintf(stderr, "Failed to initialize ICU\n");
+    return 1;
+  }
   v8::V8::InitializeExternalStartupData(argv[0]);
   std::unique_ptr<v8::Platform> platform = v8::platform::NewDefaultPlatform();
   v8::V8::InitializePlatform(platform.get());

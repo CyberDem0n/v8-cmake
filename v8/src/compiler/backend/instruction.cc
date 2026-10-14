@@ -8,6 +8,7 @@
 #include <iomanip>
 
 #include "src/base/iterator.h"
+#include "src/base/logging.h"
 #include "src/codegen/aligned-slot-allocator.h"
 #include "src/codegen/interface-descriptors.h"
 #include "src/codegen/machine-type.h"
@@ -196,6 +197,7 @@ std::ostream& operator<<(std::ostream& os, const InstructionOperand& op) {
         case UnallocatedOperand::REGISTER_OR_SLOT_OR_CONSTANT:
           return os << "(*)";
       }
+      UNREACHABLE();
     }
     case InstructionOperand::CONSTANT:
       return os << "[constant:v" << ConstantOperand::cast(op).virtual_register()
@@ -212,6 +214,7 @@ std::ostream& operator<<(std::ostream& os, const InstructionOperand& op) {
         case ImmediateOperand::INDEXED_IMM:
           return os << "[immediate:" << imm.indexed_value() << "]";
       }
+      UNREACHABLE();
     }
     case InstructionOperand::PENDING:
       return os << "[pending: " << PendingOperand::cast(op).next() << "]";
@@ -489,8 +492,8 @@ std::ostream& operator<<(std::ostream& os, const FlagsMode& fm) {
       return os << "trap";
     case kFlags_select:
       return os << "select";
-    case kFlags_conditional_set:
-      return os << "conditional set";
+    case kFlags_conditional_trap:
+      return os << "conditional trap";
     case kFlags_conditional_branch:
       return os << "conditional branch";
   }
@@ -674,8 +677,9 @@ InstructionBlock::InstructionBlock(Zone* zone, RpoNumber rpo_number,
       deferred_(deferred),
       handler_(handler),
       table_switch_target_(false),
-      code_target_alignment_(false),
-      loop_header_alignment_(false),
+      align_switch_targets_(false),
+      align_branch_targets_(false),
+      align_loop_headers_(false),
       needs_frame_(!v8_flags.turbo_elide_frames),
       must_construct_frame_(false),
       must_deconstruct_frame_(false),
@@ -757,6 +761,9 @@ static InstructionBlock* InstructionBlockFor(
   }
   std::reverse(instr_block->predecessors().begin(),
                instr_block->predecessors().end());
+#ifdef BUILTIN_BLOCK_POSITION
+  instr_block->set_pgo_execution_count(block->pgo_execution_count());
+#endif
   return instr_block;
 }
 
@@ -931,15 +938,29 @@ void InstructionSequence::ComputeAssemblyOrder() {
           ao_blocks_->push_back(loop_end);
           // This block will be the new machine-level loop header, so align
           // this block instead of the loop header block.
-          loop_end->set_loop_header_alignment(true);
+          loop_end->set_align_loop_headers(true);
           header_align = false;
         }
       }
-      block->set_loop_header_alignment(header_align);
+      block->set_align_loop_headers(header_align);
     }
-    if (block->loop_header().IsValid() && block->IsTableSwitchTarget()) {
-      block->set_code_target_alignment(true);
+    if (block->loop_header().IsValid()) {
+      if (block->IsTableSwitchTarget()) {
+        block->set_align_switch_targets(true);
+      } else {
+        // If this block has no fallthrough predecessors then it can only be
+        // accessed via a jump.
+        RpoNumber ao_pred_block = ao_blocks_->back()->rpo_number();
+        if (std::none_of(block->predecessors().begin(),
+                         block->predecessors().end(),
+                         [&ao_pred_block](RpoNumber pred) {
+                           return pred == ao_pred_block;
+                         })) {
+          block->set_align_branch_targets(true);
+        }
+      }
     }
+
     block->set_ao_number(RpoNumber::FromInt(ao++));
     ao_blocks_->push_back(block);
   }
@@ -977,6 +998,9 @@ InstructionSequence::InstructionSequence(Isolate* isolate,
       immediates_(zone()),
       rpo_immediates_(instruction_blocks->size(), zone()),
       instructions_(zone()),
+#ifdef BUILTIN_BLOCK_POSITION
+      instruction_permutation_(zone()),
+#endif
       next_virtual_register_(0),
       reference_maps_(zone()),
       representations_(zone()),
@@ -1011,6 +1035,11 @@ void InstructionSequence::EndBlock(RpoNumber rpo) {
         current_block_->code_start() < end);
   current_block_->set_code_end(end);
   current_block_ = nullptr;
+}
+
+void InstructionSequence::EndBlock(RpoNumber rpo, Instruction* terminator) {
+  AddInstruction(terminator);
+  EndBlock(rpo);
 }
 
 int InstructionSequence::AddInstruction(Instruction* instr) {
@@ -1056,6 +1085,7 @@ static MachineRepresentation FilterRepresentation(MachineRepresentation rep) {
     case MachineRepresentation::kFloat16RawBits:
       UNREACHABLE();
   }
+  UNREACHABLE();
 }
 
 MachineRepresentation InstructionSequence::GetRepresentation(
@@ -1358,6 +1388,7 @@ std::ostream& operator<<(std::ostream& os, StateValueKind kind) {
     case StateValueKind::kStringConcat:
       return os << "StringConcat";
   }
+  UNREACHABLE();
 }
 
 void StateValueDescriptor::Print(std::ostream& os) const {

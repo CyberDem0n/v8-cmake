@@ -5,7 +5,6 @@
 #ifndef V8_SANDBOX_ISOLATE_H_
 #define V8_SANDBOX_ISOLATE_H_
 
-#include "src/sandbox/code-pointer-table.h"
 #include "src/sandbox/cppheap-pointer-table.h"
 #include "src/sandbox/external-pointer-table.h"
 #include "src/sandbox/indirect-pointer-tag.h"
@@ -32,15 +31,14 @@ class V8_EXPORT_PRIVATE IsolateForSandbox final {
   inline ExternalPointerTable::Space* GetExternalPointerTableSpaceFor(
       ExternalPointerTagRange tag_range, Address host);
 
-  inline CodePointerTable::Space* GetCodePointerTableSpaceFor(
-      Address owning_slot);
-
-  inline TrustedPointerTable& GetTrustedPointerTableFor(IndirectPointerTag tag);
+  inline TrustedPointerTable& GetTrustedPointerTableFor(
+      IndirectPointerTagRange tag_range);
   inline TrustedPointerTable::Space* GetTrustedPointerTableSpaceFor(
-      IndirectPointerTag tag);
+      IndirectPointerTagRange tag_range, Address host);
 
-  // Object is needed as a witness that this handle does not come from the
-  // shared space.
+  inline JSDispatchTable& GetJSDispatchTable();
+
+  // Object is needed in case it comes from shared space.
   inline ExternalPointerTag GetExternalPointerTableTagFor(
       Tagged<HeapObject> witness, ExternalPointerHandle handle);
 
@@ -48,17 +46,12 @@ class V8_EXPORT_PRIVATE IsolateForSandbox final {
   // are the same.
   inline bool SharesPointerTablesWith(IsolateForSandbox other) const;
 
+  inline Isolate* GetIsolate() const { return isolate_; }
+
  private:
+  friend class IsolateForPointerCompression;
   Isolate* const isolate_;
 };
-
-// Use this function instead of `Internals::GetIsolateForSandbox` for internal
-// code, as this function is fully inlinable.
-// Note that this method might return an isolate which is not the "current" one
-// as returned by `Isolate::Current()`. Use `GetCurrentIsolateForSandbox`
-// instead where possible.
-// TODO(396607238): Replace all callers with `GetCurrentIsolateForSandbox()`.
-V8_INLINE IsolateForSandbox GetIsolateForSandbox(Tagged<HeapObject> object);
 
 V8_INLINE IsolateForSandbox GetCurrentIsolateForSandbox();
 
@@ -72,9 +65,6 @@ class V8_EXPORT_PRIVATE IsolateForSandbox final {
   constexpr IsolateForSandbox() = default;
 };
 
-V8_INLINE IsolateForSandbox GetIsolateForSandbox(Tagged<HeapObject>) {
-  return {};
-}
 V8_INLINE IsolateForSandbox GetCurrentIsolateForSandbox() { return {}; }
 
 #endif  // V8_ENABLE_SANDBOX
@@ -85,6 +75,15 @@ class V8_EXPORT_PRIVATE IsolateForPointerCompression final {
   template <typename IsolateT>
   IsolateForPointerCompression(IsolateT* isolate)  // NOLINT(runtime/explicit)
       : isolate_(isolate->ForSandbox()) {}
+#ifdef V8_ENABLE_SANDBOX
+  IsolateForPointerCompression(
+      IsolateForSandbox isolate)  // NOLINT(runtime/explicit)
+      : isolate_(isolate.isolate_) {}
+#else
+  constexpr IsolateForPointerCompression(
+      IsolateForSandbox)  // NOLINT(runtime/explicit)
+      : isolate_(nullptr) {}
+#endif
 
   inline ExternalPointerTable& GetExternalPointerTableFor(
       ExternalPointerTagRange tag_range);
@@ -94,6 +93,8 @@ class V8_EXPORT_PRIVATE IsolateForPointerCompression final {
   inline CppHeapPointerTable& GetCppHeapPointerTable();
   inline CppHeapPointerTable::Space* GetCppHeapPointerTableSpace();
 
+  inline Isolate* GetIsolate() const { return isolate_; }
+
  private:
   Isolate* const isolate_;
 };
@@ -102,6 +103,9 @@ class V8_EXPORT_PRIVATE IsolateForPointerCompression final {
  public:
   template <typename IsolateT>
   constexpr IsolateForPointerCompression(IsolateT*)  // NOLINT(runtime/explicit)
+  {}
+  constexpr IsolateForPointerCompression(
+      IsolateForSandbox)  // NOLINT(runtime/explicit)
   {}
 };
 #endif  // V8_COMPRESS_POINTERS

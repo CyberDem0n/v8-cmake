@@ -8,10 +8,10 @@
 #include "src/execution/isolate.h"
 // Include the non-inl header before the rest of the headers.
 
+#include "src/execution/microtask-queue.h"
 #include "src/objects/contexts-inl.h"
 #include "src/objects/js-function.h"
 #include "src/objects/lookup-inl.h"
-#include "src/objects/objects-inl.h"
 #include "src/objects/oddball.h"
 #include "src/objects/property-cell.h"
 #include "src/objects/regexp-match-info.h"
@@ -29,13 +29,6 @@ namespace v8::internal {
 V8_INLINE Isolate::PerIsolateThreadData*
 Isolate::CurrentPerIsolateThreadData() {
   return g_current_per_isolate_thread_data_;
-}
-
-// static
-V8_INLINE Isolate* Isolate::Current() {
-  Isolate* isolate = TryGetCurrent();
-  DCHECK_NOT_NULL(isolate);
-  return isolate;
 }
 
 bool Isolate::IsCurrent() const { return this == TryGetCurrent(); }
@@ -62,7 +55,7 @@ void Isolate::set_topmost_script_having_context(Tagged<Context> context) {
 
 void Isolate::clear_topmost_script_having_context() {
   static_assert(Context::kNoContext == 0);
-  thread_local_top()->topmost_script_having_context_ = Context();
+  thread_local_top()->topmost_script_having_context_ = {};
 }
 
 DirectHandle<NativeContext> Isolate::GetIncumbentContext() {
@@ -85,7 +78,7 @@ DirectHandle<NativeContext> Isolate::GetIncumbentContext() {
 }
 
 void Isolate::set_pending_message(Tagged<Object> message_obj) {
-  DCHECK(IsTheHole(message_obj, this) || IsJSMessageObject(message_obj));
+  DCHECK(IsTheHole(message_obj) || IsJSMessageObject(message_obj));
   thread_local_top()->pending_message_ = message_obj;
 }
 
@@ -97,23 +90,21 @@ void Isolate::clear_pending_message() {
   set_pending_message(ReadOnlyRoots(this).the_hole_value());
 }
 
-bool Isolate::has_pending_message() {
-  return !IsTheHole(pending_message(), this);
-}
+bool Isolate::has_pending_message() { return !IsTheHole(pending_message()); }
 
 Tagged<Object> Isolate::exception() {
   CHECK(has_exception());
-  DCHECK(!IsException(thread_local_top()->exception_, this));
+  DCHECK(!IsExceptionHole(thread_local_top()->exception_));
   return thread_local_top()->exception_;
 }
 
 void Isolate::set_exception(Tagged<Object> exception_obj) {
-  DCHECK(!IsException(exception_obj, this));
+  DCHECK(!IsExceptionHole(exception_obj));
   thread_local_top()->exception_ = exception_obj;
 }
 
 void Isolate::clear_internal_exception() {
-  DCHECK(!IsException(thread_local_top()->exception_, this));
+  DCHECK(!IsExceptionHole(thread_local_top()->exception_));
   thread_local_top()->exception_ = ReadOnlyRoots(this).the_hole_value();
 }
 
@@ -124,13 +115,18 @@ void Isolate::clear_exception() {
 
 bool Isolate::has_exception() {
   ThreadLocalTop* top = thread_local_top();
-  DCHECK(!IsException(top->exception_, this));
-  return !IsTheHole(top->exception_, this);
+  DCHECK(!IsExceptionHole(top->exception_));
+  return !IsTheHole(top->exception_);
 }
 
 bool Isolate::is_execution_terminating() {
   return thread_local_top()->exception_ ==
          i::ReadOnlyRoots(this).termination_exception();
+}
+
+bool Isolate::is_javascript_execution_allowed() const {
+  return javascript_execution_assert() && javascript_execution_throws() &&
+         javascript_execution_dump();
 }
 
 #ifdef DEBUG
@@ -191,10 +187,6 @@ bool Isolate::is_catchable_by_javascript(Tagged<Object> exception) {
   return exception != ReadOnlyRoots(heap()).termination_exception();
 }
 
-bool Isolate::InFastCCall() const {
-  return isolate_data()->fast_c_call_caller_fp() != kNullAddress;
-}
-
 bool Isolate::is_catchable_by_wasm(Tagged<Object> exception) {
   if (!is_catchable_by_javascript(exception)) return false;
   if (!IsJSObject(exception)) return true;
@@ -206,6 +198,14 @@ void Isolate::FireBeforeCallEnteredCallback() {
   for (auto& callback : before_call_entered_callbacks_) {
     callback(reinterpret_cast<v8::Isolate*>(this));
   }
+}
+
+MicrotaskQueue* Isolate::default_microtask_queue() const {
+  return default_microtask_queue_;
+}
+
+void Isolate::set_default_microtask_queue(MicrotaskQueue* value) {
+  default_microtask_queue_ = value;
 }
 
 Handle<JSGlobalObject> Isolate::global_object() {
@@ -222,6 +222,8 @@ Isolate::ExceptionScope::ExceptionScope(Isolate* isolate)
 }
 
 Isolate::ExceptionScope::~ExceptionScope() {
+  // Do not interrupt termination.
+  if (isolate_->is_execution_terminating()) return;
   isolate_->set_exception(*exception_);
 }
 
@@ -232,9 +234,11 @@ bool Isolate::IsInitialArrayPrototype(Tagged<JSArray> array) {
 
 #define NATIVE_CONTEXT_FIELD_ACCESSOR(index, type, name)              \
   Handle<UNPAREN(type)> Isolate::name() {                             \
+    DCHECK(!raw_native_context().is_null());                          \
     return Handle<UNPAREN(type)>(raw_native_context()->name(), this); \
   }                                                                   \
   bool Isolate::is_##name(Tagged<UNPAREN(type)> value) {              \
+    DCHECK(!raw_native_context().is_null());                          \
     return raw_native_context()->is_##name(value);                    \
   }
 NATIVE_CONTEXT_FIELDS(NATIVE_CONTEXT_FIELD_ACCESSOR)

@@ -28,8 +28,6 @@ class IntlBuiltinsAssembler : public CodeStubAssembler {
                         Runtime::FunctionId format_func_id,
                         const char* method_name);
 
-  TNode<JSArray> AllocateEmptyJSArray(TNode<Context> context);
-
   TNode<IntPtrT> PointerToSeqStringData(TNode<String> seq_string) {
     CSA_DCHECK(this,
                IsSequentialStringInstanceType(LoadInstanceType(seq_string)));
@@ -82,21 +80,24 @@ class IntlBuiltinsAssembler : public CodeStubAssembler {
 };
 
 TF_BUILTIN(StringToLowerCaseIntl, IntlBuiltinsAssembler) {
-  const auto string = Parameter<String>(Descriptor::kString);
-  ToLowerCaseImpl(string, TNode<Object>() /*maybe_locales*/, TNode<Context>(),
+  auto context = Parameter<Context>(Descriptor::kContext);
+  auto string = Parameter<String>(Descriptor::kString);
+  ToLowerCaseImpl(string, TNode<Object>() /*maybe_locales*/, context,
                   ToLowerCaseKind::kToLowerCase,
                   [this](TNode<Object> ret) { Return(ret); });
 }
 
 #if V8_ENABLE_WEBASSEMBLY
 TF_BUILTIN(WasmStringToLowerCaseIntl, IntlBuiltinsAssembler) {
-  const auto string = Parameter<String>(Descriptor::kString);
-  ToLowerCaseImpl(string, TNode<Object>() /*maybe_locales*/, TNode<Context>(),
+  auto context = Parameter<Context>(Descriptor::kContext);
+  auto string = Parameter<String>(Descriptor::kString);
+  ToLowerCaseImpl(string, TNode<Object>() /*maybe_locales*/, context,
                   ToLowerCaseKind::kToLowerCase,
                   [this](TNode<Object> ret) { Return(ret); });
 }
 #endif
 
+// https://tc39.es/ecma262/#sec-string.prototype.tolowercase
 TF_BUILTIN(StringPrototypeToLowerCaseIntl, IntlBuiltinsAssembler) {
   auto maybe_string = Parameter<Object>(Descriptor::kReceiver);
   auto context = Parameter<Context>(Descriptor::kContext);
@@ -107,6 +108,7 @@ TF_BUILTIN(StringPrototypeToLowerCaseIntl, IntlBuiltinsAssembler) {
   Return(CallBuiltin(Builtin::kStringToLowerCaseIntl, context, string));
 }
 
+// https://tc39.es/ecma402/#sup-string.prototype.tolocalelowercase
 TF_BUILTIN(StringPrototypeToLocaleLowerCase, IntlBuiltinsAssembler) {
   TNode<Int32T> argc =
       UncheckedParameter<Int32T>(Descriptor::kJSActualArgumentsCount);
@@ -121,6 +123,8 @@ TF_BUILTIN(StringPrototypeToLocaleLowerCase, IntlBuiltinsAssembler) {
                   [&args](TNode<JSAny> ret) { args.PopAndReturn(ret); });
 }
 
+// This needs a Context because it can throw, because there is one case where
+// it can grow the string's length: "\u0130".toLowerCase().length == 2.
 void IntlBuiltinsAssembler::ToLowerCaseImpl(
     TNode<String> string, TNode<Object> maybe_locales, TNode<Context> context,
     ToLowerCaseKind kind, std::function<void(TNode<JSAny>)> ReturnFct) {
@@ -180,6 +184,12 @@ void IntlBuiltinsAssembler::ToLowerCaseImpl(
          &call_c);
 
   {
+    // The allocation above may have internalized a shared source, forwarding
+    // it to a ThinString or freeing an external resource. The loop below would
+    // read that through a stale raw pointer, so bail out instead. {call_c}
+    // re-resolves the source and needs no such check.
+    to_direct.BailIfTransitioned(&runtime);
+
     const TNode<IntPtrT> dst_ptr = PointerToSeqStringData(dst);
     TVARIABLE(IntPtrT, var_cursor, IntPtrConstant(0));
 
@@ -208,7 +218,7 @@ void IntlBuiltinsAssembler::ToLowerCaseImpl(
 
           Increment(&var_cursor);
         },
-        kCharSize, LoopUnrollingMode::kNo, IndexAdvanceMode::kPost);
+        kCharSize, kNoLoopUnrolling, IndexAdvanceMode::kPost);
 
     // Return the original string if it remained unchanged in order to preserve
     // e.g. internalization and private symbols (such as the preserved object
@@ -245,8 +255,8 @@ void IntlBuiltinsAssembler::ToLowerCaseImpl(
                                  string, maybe_locales));
   } else {
     DCHECK_EQ(kind, ToLowerCaseKind::kToLowerCase);
-    ReturnFct(CallRuntime<JSAny>(Runtime::kStringToLowerCaseIntl,
-                                 NoContextConstant(), string));
+    ReturnFct(
+        CallRuntime<JSAny>(Runtime::kStringToLowerCaseIntl, context, string));
   }
 }
 
@@ -278,14 +288,7 @@ void IntlBuiltinsAssembler::ListFormatCommon(TNode<Context> context,
   }
 }
 
-TNode<JSArray> IntlBuiltinsAssembler::AllocateEmptyJSArray(
-    TNode<Context> context) {
-  return CodeStubAssembler::AllocateJSArray(
-      PACKED_ELEMENTS,
-      LoadJSArrayElementsMap(PACKED_ELEMENTS, LoadNativeContext(context)),
-      IntPtrConstant(0), SmiConstant(0));
-}
-
+// https://tc39.es/ecma402/#sec-intl-list-format.prototype.format
 TF_BUILTIN(ListFormatPrototypeFormat, IntlBuiltinsAssembler) {
   ListFormatCommon(
       Parameter<Context>(Descriptor::kContext),
@@ -293,6 +296,7 @@ TF_BUILTIN(ListFormatPrototypeFormat, IntlBuiltinsAssembler) {
       Runtime::kFormatList, "Intl.ListFormat.prototype.format");
 }
 
+// https://tc39.es/ecma402/#sec-intl-list-format.prototype.formattoparts
 TF_BUILTIN(ListFormatPrototypeFormatToParts, IntlBuiltinsAssembler) {
   ListFormatCommon(
       Parameter<Context>(Descriptor::kContext),

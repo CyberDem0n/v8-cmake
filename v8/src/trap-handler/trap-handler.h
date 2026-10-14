@@ -39,13 +39,6 @@ namespace v8::internal::trap_handler {
     (!defined(_MSC_VER) || defined(__clang__))
 #define V8_TRAP_HANDLER_VIA_SIMULATOR
 #define V8_TRAP_HANDLER_SUPPORTED true
-// Loong64 (non-simulator) on Linux.
-#elif V8_TARGET_ARCH_LOONG64 && V8_HOST_ARCH_LOONG64 && V8_OS_LINUX
-#define V8_TRAP_HANDLER_SUPPORTED true
-// Loong64 simulator on x64 on Linux
-#elif V8_TARGET_ARCH_LOONG64 && V8_HOST_ARCH_X64 && V8_OS_LINUX
-#define V8_TRAP_HANDLER_VIA_SIMULATOR
-#define V8_TRAP_HANDLER_SUPPORTED true
 // RISCV64 (non-simulator) on Linux.
 #elif V8_TARGET_ARCH_RISCV64 && V8_HOST_ARCH_RISCV64 && V8_OS_LINUX && \
     !V8_OS_ANDROID
@@ -106,7 +99,7 @@ namespace v8::internal::trap_handler {
 #define TH_DISABLE_ASAN
 #endif
 
-struct ProtectedInstructionData {
+struct TrappingInstructionData {
   // The offset of this instruction from the start of its code object.
   // Wasm code never grows larger than 2GB, so uint32_t is sufficient.
   uint32_t instr_offset;
@@ -119,8 +112,8 @@ const int kInvalidIndex = -1;
 /// This returns a number that can be used to identify the handler data to
 /// ReleaseHandlerData, or -1 on failure.
 int TH_EXPORT_PRIVATE RegisterHandlerData(
-    uintptr_t base, size_t size, size_t num_protected_instructions,
-    const ProtectedInstructionData* protected_instructions);
+    uintptr_t base, size_t size, size_t num_trapping_instructions,
+    const TrappingInstructionData* trapping_instructions);
 
 /// Removes the data from the master list and frees any memory, if necessary.
 /// TODO(mtrofin): We can switch to using size_t for index and not need
@@ -137,6 +130,16 @@ bool TH_EXPORT_PRIVATE RegisterV8Sandbox(uintptr_t base, size_t size);
 /// Unregisters the base and size of the V8 sandbox region decribed by base and
 /// size.
 void TH_EXPORT_PRIVATE UnregisterV8Sandbox(uintptr_t base, size_t size);
+
+/// Registers a memory region that should be covered by the trap handler.
+/// This currently includes Wasm memories (including guard regions) and the
+/// inaccessible WasmNull payload.
+bool TH_EXPORT_PRIVATE RegisterCoveredMemory(uintptr_t base,
+                                             size_t reserved_size);
+
+/// Unregisters a memory region.
+void TH_EXPORT_PRIVATE UnregisterCoveredMemory(uintptr_t base,
+                                               size_t reserved_size);
 
 // Initially false, set to true if when trap handlers are enabled. Never goes
 // back to false then.
@@ -171,56 +174,10 @@ inline bool IsTrapHandlerEnabled() {
   return g_is_trap_handler_enabled;
 }
 
-#if defined(V8_OS_AIX)
-// `thread_local` does not link on AIX:
-// https://gcc.gnu.org/bugzilla/show_bug.cgi?id=100641
-extern __thread int g_thread_in_wasm_code;
-#else
-extern thread_local int g_thread_in_wasm_code;
-#endif
-
-// Return the address of the thread-local {g_thread_in_wasm_code} variable. This
-// pointer can be accessed and modified as long as the thread calling this
-// function exists. Only use if from the same thread do avoid race conditions.
-V8_NOINLINE TH_EXPORT_PRIVATE int* GetThreadInWasmThreadLocalAddress();
-
-// On Windows, asan installs its own exception handler which maps shadow
-// memory. Since our exception handler may be executed before the asan exception
-// handler, we have to make sure that asan shadow memory is not accessed here.
-TH_DISABLE_ASAN inline bool IsThreadInWasm() { return g_thread_in_wasm_code; }
-
-inline void SetThreadInWasm() {
-  if (IsTrapHandlerEnabled()) {
-    TH_DCHECK(!IsThreadInWasm());
-    g_thread_in_wasm_code = true;
-  }
-}
-
-inline void ClearThreadInWasm() {
-  if (IsTrapHandlerEnabled()) {
-    TH_DCHECK(IsThreadInWasm());
-    g_thread_in_wasm_code = false;
-  }
-}
-
 bool RegisterDefaultTrapHandler();
 TH_EXPORT_PRIVATE void RemoveTrapHandler();
 
 TH_EXPORT_PRIVATE size_t GetRecoveredTrapCount();
-
-// Check that the current thread does not have the "in wasm" flag set, without
-// any other side effects. Note that e.g. "!IsTrapHandlerEnabled() ||
-// !IsThreadInWasm()" has the side effect of disabling later
-// EnableTrapHandler(). We need to allow later enabling though, because
-// allocations can happen *before* initializing the trap handler, and we want to
-// execute this check there.
-#if defined(BUILDING_V8_SHARED_PRIVATE) || defined(USING_V8_SHARED_PRIVATE)
-TH_EXPORT_PRIVATE void AssertThreadNotInWasm();
-#else
-inline void AssertThreadNotInWasm() {
-  TH_DCHECK(!g_is_trap_handler_enabled || !g_thread_in_wasm_code);
-}
-#endif
 
 }  // namespace v8::internal::trap_handler
 

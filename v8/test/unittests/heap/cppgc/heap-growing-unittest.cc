@@ -2,13 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "src/heap/cppgc/heap-growing.h"
+#include "src/heap/cppgc-internal/heap-growing.h"
 
 #include <optional>
 
 #include "include/cppgc/platform.h"
-#include "src/heap/cppgc/heap.h"
-#include "src/heap/cppgc/stats-collector.h"
+#include "src/heap/cppgc-internal/heap.h"
+#include "src/heap/cppgc-internal/stats-collector.h"
 #include "testing/gmock/include/gmock/gmock.h"
 #include "testing/gtest/include/gtest/gtest.h"
 
@@ -36,6 +36,10 @@ class FakeGarbageCollector : public GarbageCollector {
     UNREACHABLE();
   }
 
+  bool RetryAllocate(v8::base::FunctionRef<bool()> allocate) override {
+    UNREACHABLE();
+  }
+
   size_t epoch() const override { return callcount_; }
   std::optional<EmbedderStackState> overridden_stack_state() const override {
     return {};
@@ -56,6 +60,7 @@ class MockGarbageCollector : public GarbageCollector {
  public:
   MOCK_METHOD(void, CollectGarbage, (GCConfig), (override));
   MOCK_METHOD(void, StartIncrementalGarbageCollection, (GCConfig), (override));
+  MOCK_METHOD(bool, RetryAllocate, (v8::base::FunctionRef<bool()>), (override));
   MOCK_METHOD(size_t, epoch, (), (const, override));
   MOCK_METHOD(std::optional<EmbedderStackState>, overridden_stack_state, (),
               (const, override));

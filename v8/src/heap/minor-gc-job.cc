@@ -10,7 +10,7 @@
 #include "src/execution/vm-state-inl.h"
 #include "src/flags/flags.h"
 #include "src/heap/heap-inl.h"
-#include "src/heap/heap.h"
+#include "src/heap/local-heap-inl.h"
 #include "src/init/v8.h"
 #include "src/tasks/cancelable-task.h"
 
@@ -170,6 +170,7 @@ void MinorGCJob::Task::RunInternal() {
   // Set the current isolate such that trusted pointer tables etc are
   // available and the cage base is set correctly for multi-cage mode.
   SetCurrentIsolateScope isolate_scope(isolate());
+  SetCurrentLocalHeapScope local_heap_scope(isolate());
 
   Heap* heap = isolate()->heap();
 
@@ -178,7 +179,8 @@ void MinorGCJob::Task::RunInternal() {
     return;
   }
 
-  heap->CollectGarbage(NEW_SPACE, GarbageCollectionReason::kTask);
+  heap->CollectGarbageWithRetry(heap->main_thread_local_heap(), NEW_SPACE,
+                                GarbageCollectionReason::kAllocationFailure);
 }
 
 }  // namespace v8::internal

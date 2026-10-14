@@ -19,11 +19,13 @@
 #include "src/compiler/node-matchers.h"
 #include "src/compiler/node-properties.h"
 #include "src/compiler/simplified-operator.h"
+#include "src/compiler/turboshaft/utils.h"
 #include "src/execution/isolate-inl.h"
 #include "src/objects/feedback-cell-inl.h"
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/compiler/wasm-compiler.h"
+#include "src/wasm/canonical-types.h"
 #include "src/wasm/names-provider.h"
 #include "src/wasm/string-builder.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
@@ -89,10 +91,9 @@ Reduction JSInliner::InlineJSWasmCall(Node* call, Node* new_target,
                                       Node* exception_target,
                                       const NodeVector& uncaught_subcalls) {
   JSWasmCallNode n(call);
-  return InlineCall(
-      call, new_target, context, frame_state, start, end, exception_target,
-      uncaught_subcalls,
-      static_cast<int>(n.Parameters().signature()->parameter_count()));
+  return InlineCall(call, new_target, context, frame_state, start, end,
+                    exception_target, uncaught_subcalls,
+                    n.Parameters().arity_without_implicit_args());
 }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
@@ -425,12 +426,12 @@ JSInliner::WasmInlineResult JSInliner::TryWasmInlining(
   const JSWasmCallParameters& wasm_call_params = call_node.Parameters();
   wasm::NativeModule* native_module = wasm_call_params.native_module();
   const int fct_index = wasm_call_params.function_index();
-  TRACE("Considering wasm function ["
+  TRACE("Considering Wasm function ["
         << fct_index << "] "
         << WasmFunctionNameForTrace(native_module, fct_index) << " of module "
-        << wasm_call_params.module() << " for inlining");
+        << wasm_call_params.native_module() << " for inlining");
 
-  if (native_module->module() != wasm_module_) {
+  if (native_module != wasm_native_module_) {
     // Inlining of multiple wasm modules into the same JS function is not
     // supported.
     TRACE("- not inlining: another wasm module is already used for inlining");
@@ -445,7 +446,8 @@ JSInliner::WasmInlineResult JSInliner::TryWasmInlining(
     return {};
   }
 
-  const wasm::FunctionSig* sig = wasm_module_->functions[fct_index].sig;
+  const wasm::WasmModule* module = native_module->module();
+  const wasm::FunctionSig* sig = module->functions[fct_index].sig;
   TFGraph::SubgraphScope graph_scope(graph());
   WasmGraphBuilder builder(nullptr, zone(), jsgraph(), sig, source_positions_,
                            WasmGraphBuilder::kJSFunctionAbiMode, isolate(),
@@ -469,16 +471,16 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
   JSWasmCallNode call_node(node);
   const JSWasmCallParameters& wasm_call_params = call_node.Parameters();
   int fct_index = wasm_call_params.function_index();
-  wasm::NativeModule* native_module = wasm_call_params.native_module();
-  const wasm::CanonicalSig* sig = wasm_call_params.signature();
+  const wasm::NativeModule* native_module = wasm_call_params.native_module();
+  const wasm::WasmModule* module = native_module->module();
+  const wasm::CanonicalSig* sig =
+      wasm::GetTypeCanonicalizer()->LookupFunctionSignature(
+          module->canonical_sig_id(module->functions[fct_index].sig_index));
 
   // Try "full" inlining of very simple wasm functions (mainly getters / setters
   // for wasm gc objects).
   WasmInlineResult inline_result;
-  if (inline_wasm_fct_if_supported_ && fct_index != -1 && native_module &&
-      // Disable inlining for asm.js functions because we haven't tested it
-      // and most asm.js opcodes aren't supported anyway.
-      !is_asmjs_module(native_module->module())) {
+  if (inline_wasm_fct_if_supported_ && fct_index != -1 && native_module) {
     inline_result = TryWasmInlining(call_node);
   }
 
@@ -503,15 +505,8 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
     // surrounding exception handler, if present.
     subgraph_min_node_id = graph()->NodeCount();
 
-    // If we inline the body with Turboshaft later (instead of with TurboFan
-    // here), we don't know yet whether we can inline the body or not. Hence,
-    // don't set the thread-in-wasm flag now, and instead do that if _not_
-    // inlining later in Turboshaft.
-    bool set_in_wasm_flag = !(inline_result.can_inline_body ||
-                              v8_flags.turboshaft_wasm_in_js_inlining);
     BuildInlinedJSToWasmWrapper(graph()->zone(), jsgraph(), sig, isolate(),
-                                source_positions_, continuation_frame_state,
-                                set_in_wasm_flag);
+                                source_positions_, continuation_frame_state);
 
     // Extract the inlinee start/end nodes.
     wrapper_start_node = graph()->start();
@@ -548,8 +543,7 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
   // given JavaScript function (due to the WasmGCLowering being dependent on
   // module-specific type indices).
   Node* wasm_fct_call = nullptr;
-  if (inline_result.can_inline_body ||
-      v8_flags.turboshaft_wasm_in_js_inlining) {
+  if (inline_result.can_inline_body) {
     AllNodes inlined_nodes(local_zone_, wrapper_end_node, graph());
     for (Node* subnode : inlined_nodes.reachable) {
       // Ignore nodes that are not part of the inlinee.
@@ -561,16 +555,7 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
         break;
       }
     }
-    DCHECK_IMPLIES(inline_result.can_inline_body, wasm_fct_call != nullptr);
-
-    // Attach information about Wasm call target for Turboshaft Wasm-in-JS-
-    // inlining (see https://crbug.com/353475584) in sidetable.
-    if (v8_flags.turboshaft_wasm_in_js_inlining && wasm_fct_call) {
-      auto [it, inserted] = js_wasm_calls_sidetable_->insert(
-          {wasm_fct_call->id(), &wasm_call_params});
-      USE(it);
-      DCHECK(inserted);
-    }
+    DCHECK(wasm_fct_call != nullptr);
   }
 
   Node* context = NodeProperties::GetContextInput(node);
@@ -684,6 +669,18 @@ Reduction JSInliner::ReduceJSCall(Node* node) {
 #endif  // V8_ENABLE_WEBASSEMBLY
   JSCallAccessor call(node);
 
+  constexpr int kMaxArgumentsSafetyBuffer = 10;
+  if (node->InputCount() > Code::kMaxArguments - kMaxArgumentsSafetyBuffer) {
+    // We don't attempt to inline calls with too many inputs (note that we
+    // subtract this {kMaxArgumentsSafetyBuffer} so that we still have some
+    // place left to add FrameState, receiver and whatever other input is
+    // necessary), since a lot of things can go wrong when doing this, including
+    // CreateArtificialFrameState having too many inputs, Turboshaft needing to
+    // bail out because the max input count for a node in Turboshaft is lower as
+    // in Turbofan, and other assumptions about max input count being broken.
+    return NoChange();
+  }
+
   // Determine the call target.
   OptionalSharedFunctionInfoRef shared_info(DetermineCallTarget(node));
   if (!shared_info.has_value()) return NoChange();
@@ -697,9 +694,12 @@ Reduction JSInliner::ReduceJSCall(Node* node) {
     // The function is no longer inlineable. The only way this can happen is if
     // the function had its optimization disabled in the meantime, e.g. because
     // another optimization job failed too often.
-    CHECK_EQ(inlineability, SharedFunctionInfo::kHasOptimizationDisabled);
+    CHECK_EQ(inlineability,
+             turboshaft::any_of(SharedFunctionInfo::kHasOptimizationDisabled,
+                                SharedFunctionInfo::kMayContainBreakPoints));
     TRACE("Not inlining " << *shared_info << " into " << outer_shared_info
-                          << " because it had its optimization disabled.");
+                          << " because it had its optimization disabled or may "
+                             "contain breakpoints.");
     return NoChange();
   }
   // NOTE: Even though we bailout in the kHasOptimizationDisabled case above, we

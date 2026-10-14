@@ -10,20 +10,26 @@
 namespace v8 {
 namespace internal {
 
+// TODO(olivf, 420433007): We should have a custom BuiltinOutOfBounds reason
+// which is only used when needed for builtin speculation. Currently this is
+// not done since it would mean quite a major refactoring in Turbofan.
+#define DEOPTIMIZE_IN_BUILTIN_REASON_LIST(V) \
+  V(OutOfBounds, "out of bounds",            \
+    SpeculationMode::kDisallowBoundsCheckSpeculation)
+
 #define DEOPTIMIZE_REASON_LIST(V)                                              \
-  V(ArrayBufferWasDetached, "array buffer was detached")                       \
+  DEOPTIMIZE_IN_BUILTIN_REASON_LIST(V)                                         \
+  V(ArrayBufferWasDetached, "array buffer was detached or immutable")          \
   V(ArrayLengthChanged, "the array length changed")                            \
   V(BigIntTooBig, "BigInt too big")                                            \
-  V(ConstTrackingLet, "const tracking let constness invalidated")              \
   V(CouldNotGrowElements, "failed to grow elements store")                     \
   V(CowArrayElementsChanged, "copy-on-write array's elements changed")         \
   V(DeoptimizeNow, "%_DeoptimizeNow")                                          \
-  V(DeprecatedMap, "deprecated map")                                           \
   V(DivisionByZero, "division by zero")                                        \
-  V(Float16NotYetSupported, "float16 is not supported as machine operation")   \
   V(GreaterThanMaxFastElementArray,                                            \
     "length is greater than the maximum for fast elements array")              \
   V(Hole, "hole")                                                              \
+  V(HoleOrUndefined, "hole or undefined")                                      \
   V(InstanceMigrationFailed, "instance migration failed")                      \
   V(InsufficientTypeFeedbackForArrayLiteral,                                   \
     "Insufficient type feedback for array literal")                            \
@@ -50,11 +56,10 @@ namespace internal {
   V(InsufficientTypeFeedbackForUnaryOperation,                                 \
     "Insufficient type feedback for unary operation")                          \
   V(KeyedAccessChanged, "unexpected name in keyed access")                     \
+  V(LoopSpeculationFailed, "loop speculation failed")                          \
   V(LostPrecision, "lost precision")                                           \
   V(LostPrecisionOrNaN, "lost precision or NaN")                               \
   V(MinusZero, "minus zero")                                                   \
-  V(NaN, "NaN")                                                                \
-  V(NoCache, "no cache")                                                       \
   V(NoInitialElement, "no initial element")                                    \
   V(NotABigInt, "not a BigInt")                                                \
   V(NotABigInt64, "not a BigInt64")                                            \
@@ -64,12 +69,12 @@ namespace internal {
     "not a JavaScript object, Null or Undefined")                              \
   V(NotANumber, "not a Number")                                                \
   V(NotANumberOrBoolean, "not a Number or Boolean")                            \
+  V(NotANumberOrUndefined, "not a Number or Undefined")                        \
   V(NotANumberOrOddball, "not a Number or Oddball")                            \
   V(NotASmi, "not a Smi")                                                      \
   V(NotAString, "not a String")                                                \
-  V(NotASeqOneByteString, "not a sequential one-byte String")                  \
   V(NotAStringOrStringWrapper, "not a String or a string wrapper")             \
-  V(NotAStringWrapper, "not a string wrapper")                                 \
+  V(NotAStringOrOddball, "not a String or oddball")                            \
   V(NotASymbol, "not a Symbol")                                                \
   V(NotAdditiveSafeInteger, "not AdditiveSafeInteger")                         \
   V(NotAnArrayIndex, "not an array index")                                     \
@@ -77,16 +82,13 @@ namespace internal {
   V(NotInt32, "not int32")                                                     \
   V(NotUint32, "not unsigned int32")                                           \
   V(OSREarlyExit, "exit from OSR'd inner loop")                                \
-  V(OutOfBounds, "out of bounds")                                              \
   V(Overflow, "overflow")                                                      \
   V(PrepareForOnStackReplacement, "prepare for on stack replacement (OSR)")    \
   V(Smi, "Smi")                                                                \
   V(StoreToConstant, "Storing to a constant field")                            \
   V(StringTooLarge, "Result string larger than String::kMaxLength")            \
-  V(SuspendGeneratorIsDead, "SuspendGenerator is in a dead branch")            \
   V(UnexpectedContextExtension, "unexpected context extension")                \
   V(Unknown, "(unknown)")                                                      \
-  V(UnoptimizedCatch, "First use of catch block")                              \
   V(ValueMismatch, "value mismatch")                                           \
   V(WrongCallTarget, "wrong call target")                                      \
   V(WrongConstructor, "wrong call target constructor")                         \
@@ -99,7 +101,7 @@ namespace internal {
   V(WrongValue, "wrong value")
 
 enum class DeoptimizeReason : uint8_t {
-#define DEOPTIMIZE_REASON(Name, message) k##Name,
+#define DEOPTIMIZE_REASON(Name, ...) k##Name,
   DEOPTIMIZE_REASON_LIST(DEOPTIMIZE_REASON)
 #undef DEOPTIMIZE_REASON
 };
@@ -133,7 +135,7 @@ enum class LazyDeoptimizeReason : uint8_t {
 
 constexpr DeoptimizeReason kFirstDeoptimizeReason =
     static_cast<DeoptimizeReason>(0);
-#define SUM(_1, _2) +1
+#define SUM(...) +1
 constexpr int kDeoptimizeReasonCount = 0 DEOPTIMIZE_REASON_LIST(SUM);
 #undef SUM
 constexpr DeoptimizeReason kLastDeoptimizeReason =
@@ -155,6 +157,20 @@ constexpr bool IsDeoptimizationWithoutCodeInvalidation(
   // not be invalidated s.t. we may reenter it in the future.
   return reason == DeoptimizeReason::kPrepareForOnStackReplacement ||
          reason == DeoptimizeReason::kOSREarlyExit;
+}
+
+constexpr bool AlwaysPreserveDeoptReason(DeoptimizeReason reason) {
+  switch (reason) {
+#define CASE(name, ...) case DeoptimizeReason::k##name:
+    DEOPTIMIZE_IN_BUILTIN_REASON_LIST(CASE)
+#undef CASE
+    return true;
+    default:
+      // OSR related deopt handling (e.g., not discarding optimized code on OSR
+      // deopt) relies on checking the deoptimization reason, so we need to
+      // preserve the OSR related deopt reasons.
+      return IsDeoptimizationWithoutCodeInvalidation(reason);
+  }
 }
 
 }  // namespace internal

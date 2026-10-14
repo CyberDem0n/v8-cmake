@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: v8-cmake <v8-cmake@local>
+Date: Wed, 15 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Include arm64 assembler -inl.h in regexp macro assembler header
+
+The default argument `Operand(0)` instantiates the inline template
+constructor Operand::Operand<int>, which is defined only in
+assembler-arm64-inl.h. GCC warns "used but never defined" in every
+translation unit that includes this header without the -inl.h.
+---
+ v8/src/regexp/arm64/regexp-macro-assembler-arm64.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/v8/src/regexp/arm64/regexp-macro-assembler-arm64.h b/v8/src/regexp/arm64/regexp-macro-assembler-arm64.h
+index f1a7460a8..12378e6a4 100644
+--- a/v8/src/regexp/arm64/regexp-macro-assembler-arm64.h
++++ b/v8/src/regexp/arm64/regexp-macro-assembler-arm64.h
+@@ -7,7 +7,7 @@
+ 
+ #include "src/base/functional/function-ref.h"
+ #include "src/base/strings.h"
+-#include "src/codegen/arm64/assembler-arm64.h"
++#include "src/codegen/arm64/assembler-arm64-inl.h"
+ #include "src/codegen/macro-assembler.h"
+ #include "src/regexp/regexp-macro-assembler.h"
+ 

@@ -112,8 +112,15 @@ class AsAtomicImpl {
   template <typename T>
   static T SeqCst_Swap(T* addr, std::remove_reference_t<T> new_value) {
     static_assert(sizeof(T) <= sizeof(AtomicStorageType));
-    return base::SeqCst_AtomicExchange(
-        to_storage_addr(addr), cast_helper<T>::to_storage_type(new_value));
+    return cast_helper<T>::to_return_type(base::SeqCst_AtomicExchange(
+        to_storage_addr(addr), cast_helper<T>::to_storage_type(new_value)));
+  }
+
+  template <typename T>
+  static T Relaxed_Swap(T* addr, std::remove_reference_t<T> new_value) {
+    static_assert(sizeof(T) <= sizeof(AtomicStorageType));
+    return cast_helper<T>::to_return_type(base::Relaxed_AtomicExchange(
+        to_storage_addr(addr), cast_helper<T>::to_storage_type(new_value)));
   }
 
   template <typename T>
@@ -132,6 +139,13 @@ class AsAtomicImpl {
     return cast_helper<T>::to_return_type(base::Relaxed_CompareAndSwap(
         to_storage_addr(addr), cast_helper<T>::to_storage_type(old_value),
         cast_helper<T>::to_storage_type(new_value)));
+  }
+
+  template <typename T>
+  static T Relaxed_FetchOr(T* addr, std::remove_reference_t<T> bits) {
+    static_assert(sizeof(T) <= sizeof(AtomicStorageType));
+    return cast_helper<T>::to_return_type(base::Relaxed_FetchOr(
+        to_storage_addr(addr), cast_helper<T>::to_storage_type(bits)));
   }
 
   template <typename T>
@@ -185,6 +199,18 @@ class AsAtomicImpl {
       old_value = Relaxed_CompareAndSwap(addr, old_value, new_value);
     } while (old_value != old_value_before_cas);
     return true;
+  }
+
+  // Atomically sets bits selected by the mask to 1. Returns false if the bits
+  // are already set as needed.
+  template <typename T>
+  static bool Relaxed_SetBits(T* addr, T mask) {
+    static_assert(sizeof(T) <= sizeof(AtomicStorageType));
+    T old_value = Relaxed_Load(addr);
+    if ((old_value & mask) == mask) return false;
+
+    T old_value_before_fo = Relaxed_FetchOr(addr, mask);
+    return (old_value_before_fo | mask) != old_value_before_fo;
   }
 
  private:
@@ -286,6 +312,7 @@ inline void CheckedDecrement(
   USE(old);
 }
 
+// Prefer using `std::atomic_ref<T>`.
 template <typename T>
 V8_INLINE std::atomic<T>* AsAtomicPtr(T* t) {
   static_assert(sizeof(T) == sizeof(std::atomic<T>));
@@ -293,6 +320,10 @@ V8_INLINE std::atomic<T>* AsAtomicPtr(T* t) {
   return reinterpret_cast<std::atomic<T>*>(t);
 }
 
+// Prefer using `std::atomic_ref<T>`. This may require a `const_cast()` to get
+// rid of the const qualifier as `std::atomic_ref<T>` deliberately wants to
+// support all operations (including stores, or read-modify-write) on all
+// instances.
 template <typename T>
 V8_INLINE const std::atomic<T>* AsAtomicPtr(const T* t) {
   static_assert(sizeof(T) == sizeof(std::atomic<T>));

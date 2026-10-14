@@ -80,7 +80,7 @@ class LogEventListener {
                                int column) = 0;
 #if V8_ENABLE_WEBASSEMBLY
   virtual void CodeCreateEvent(CodeTag tag, const wasm::WasmCode* code,
-                               wasm::WasmName name, const char* source_url,
+                               wasm::WasmName name, std::string_view source_url,
                                int code_offset, int script_id) = 0;
 #endif  // V8_ENABLE_WEBASSEMBLY
 
@@ -90,8 +90,8 @@ class LogEventListener {
   virtual void SetterCallbackEvent(DirectHandle<Name> name,
                                    Address entry_point) = 0;
   virtual void RegExpCodeCreateEvent(DirectHandle<AbstractCode> code,
-                                     DirectHandle<String> source,
-                                     RegExpFlags flags) = 0;
+                                     DirectHandle<String> escaped_source,
+                                     regexp::Flags flags) = 0;
   // Not handlified as this happens during GC. No allocation allowed.
   virtual void CodeMoveEvent(Tagged<InstructionStream> from,
                              Tagged<InstructionStream> to) = 0;
@@ -228,10 +228,11 @@ class Logger {
   }
 
   void RegExpCodeCreateEvent(DirectHandle<AbstractCode> code,
-                             DirectHandle<String> source, RegExpFlags flags) {
+                             DirectHandle<String> escaped_source,
+                             regexp::Flags flags) {
     base::RecursiveMutexGuard guard(&mutex_);
     for (auto listener : listeners_) {
-      listener->RegExpCodeCreateEvent(code, source, flags);
+      listener->RegExpCodeCreateEvent(code, escaped_source, flags);
     }
   }
 

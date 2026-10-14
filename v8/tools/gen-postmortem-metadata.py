@@ -384,7 +384,7 @@ consts_misc = [
     },
     {
         'name': 'class_Map__instance_descriptors_offset',
-        'value': 'Map::kInstanceDescriptorsOffset'
+        'value': 'offsetof(Map, instance_descriptors_)'
     },
     {
         'name': 'off_fp_context_or_frame_type',
@@ -509,9 +509,7 @@ extras_accessors = [
     'JSArrayBufferView, byte_length, size_t, kRawByteLengthOffset',
     'JSArrayBufferView, byte_offset, size_t, kRawByteOffsetOffset',
     'JSDate, value, Object, kValueOffset',
-    'JSRegExp, source, Object, kSourceOffset',
     'JSTypedArray, external_pointer, uintptr_t, kExternalPointerOffset',
-    'JSTypedArray, length, Object, kRawLengthOffset',
     'Map, instance_size_in_words, char, kInstanceSizeInWordsOffset',
     'Map, inobject_properties_start_or_constructor_function_index, char, kInobjectPropertiesStartOrConstructorFunctionIndexOffset',
     'Map, instance_type, uint16_t, kInstanceTypeOffset',
@@ -524,9 +522,9 @@ extras_accessors = [
     'ExternalString, resource, Object, offsetof(ExternalString, resource_)',
     'SeqOneByteString, chars, char, OFFSET_OF_DATA_START(SeqOneByteString)',
     'SeqTwoByteString, chars, char, OFFSET_OF_DATA_START(SeqTwoByteString)',
-    'UncompiledData, inferred_name, String, kInferredNameOffset',
-    'UncompiledData, start_position, int32_t, kStartPositionOffset',
-    'UncompiledData, end_position, int32_t, kEndPositionOffset',
+    'UncompiledData, inferred_name, String, offsetof(UncompiledData, inferred_name_)',
+    'UncompiledData, start_position, int32_t, offsetof(UncompiledData, start_position_)',
+    'UncompiledData, end_position, int32_t, offsetof(UncompiledData, end_position_)',
     'Script, source, Object, kSourceOffset',
     'Script, name, Object, kNameOffset',
     'Script, line_ends, Object, kLineEndsOffset',
@@ -547,7 +545,7 @@ extras_accessors = [
     'SlicedString, offset, SMI, offsetof(SlicedString, offset_)',
     'ThinString, actual, String, offsetof(ThinString, actual_)',
     'Symbol, name, Object, offsetof(Symbol, description_)',
-    'FixedArrayBase, length, SMI, kLengthOffset',
+    'FixedArrayBase, length, uint32_t, kLengthOffset',
 ]
 
 #
@@ -674,7 +672,7 @@ def load_objects_from_file(objfilename, checktypes):
       in_torque_insttype = True
       continue
 
-    if (line.startswith('#define TORQUE_INSTANCE_CHECKERS_SINGLE_FULLY_DEFINED')):
+    if (line.startswith('#define TORQUE_DEBUG_READER_CLASSES_SINGLE')):
       in_torque_fulldef = True
       continue
 

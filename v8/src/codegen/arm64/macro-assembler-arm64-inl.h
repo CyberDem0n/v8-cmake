@@ -36,6 +36,11 @@ MemOperand ExitFrameCallerStackSlotOperand(int index) {
                             kSystemPointerSize);
 }
 
+MemOperand MacroAssembler::AsMemOperand(IsolateFieldId id) {
+  DCHECK(root_array_available());
+  return MemOperand(kRootRegister, IsolateData::GetOffset(id));
+}
+
 void MacroAssembler::And(const Register& rd, const Register& rn,
                          const Operand& operand) {
   DCHECK(allow_macro_instructions());
@@ -464,12 +469,14 @@ void MacroAssembler::BindJumpOrCallTarget(Label* label) {
 #endif
 }
 
-void MacroAssembler::Bl(Label* label) {
+void MacroAssembler::Call(Label* label) {
+  Assembler::BlockPoolsScope block_pools(this);
   DCHECK(allow_macro_instructions());
   bl(label);
 }
 
-void MacroAssembler::Blr(const Register& xn) {
+void MacroAssembler::Call(const Register& xn) {
+  Assembler::BlockPoolsScope block_pools(this);
   DCHECK(allow_macro_instructions());
   DCHECK(!xn.IsZero());
   blr(xn);
@@ -603,6 +610,38 @@ void MacroAssembler::Csneg(const Register& rd, const Register& rn,
   DCHECK(!rd.IsZero());
   DCHECK((cond != al) && (cond != nv));
   csneg(rd, rn, rm, cond);
+}
+
+void MacroAssembler::Cpy(const Register& rd, const Register& rs,
+                         const Register& rn) {
+  DCHECK(allow_macro_instructions());
+  DCHECK(rd.Is64Bits());
+  DCHECK(rs.Is64Bits());
+  DCHECK(rn.Is64Bits());
+  DCHECK(!rd.IsZero());
+  DCHECK(!rs.IsZero());
+  DCHECK(!rn.IsZero());
+
+  // TODO(sparker): Check whether forward copies, ones that either don't
+  // overlap or where the source address is greater than the destination, could
+  // be faster.
+  cpyp(rd, rs, rn);
+  cpym(rd, rs, rn);
+  cpye(rd, rs, rn);
+}
+
+void MacroAssembler::Set(const Register& rd, const Register& rn,
+                         const Register& rs) {
+  DCHECK(allow_macro_instructions());
+  DCHECK(rd.Is64Bits());
+  DCHECK(rn.Is64Bits());
+  DCHECK(rs.Is64Bits());
+  DCHECK(!rd.IsZero());
+  DCHECK(!rn.IsZero());
+
+  setp(rd, rn, rs);
+  setm(rd, rn, rs);
+  sete(rd, rn, rs);
 }
 
 void MacroAssembler::Dmb(BarrierDomain domain, BarrierType type) {
@@ -768,13 +807,7 @@ void MacroAssembler::Fminnm(const VRegister& fd, const VRegister& fn,
 
 void MacroAssembler::Fmov(VRegister fd, VRegister fn) {
   DCHECK(allow_macro_instructions());
-  // Only emit an instruction if fd and fn are different, and they are both D
-  // registers. fmov(s0, s0) is not a no-op because it clears the top word of
-  // d0. Technically, fmov(d0, d0) is not a no-op either because it clears the
-  // top of q0, but VRegister does not currently support Q registers.
-  if (fd != fn || !fd.Is64Bits()) {
-    fmov(fd, fn);
-  }
+  fmov(fd, fn);
 }
 
 void MacroAssembler::Fmov(VRegister fd, Register rn) {
@@ -1210,6 +1243,48 @@ void MacroAssembler::SmiUntag(Register dst, const MemOperand& src) {
 
 void MacroAssembler::SmiUntag(Register smi) { SmiUntag(smi, smi); }
 
+void MacroAssembler::SmiUntagUnsigned(Register dst, Register src) {
+  DCHECK(dst.Is64Bits() && src.Is64Bits());
+  if (v8_flags.enable_slow_asserts) {
+    AssertSmi(src);
+  }
+  DCHECK(SmiValuesAre32Bits() || SmiValuesAre31Bits());
+  if (COMPRESS_POINTERS_BOOL) {
+    Ubfx(dst.W(), src.W(), kSmiShift, kSmiValueSize);
+  } else {
+    Lsr(dst, src, kSmiShift);
+  }
+}
+
+void MacroAssembler::SmiUntagUnsigned(Register dst, const MemOperand& src) {
+  DCHECK(dst.Is64Bits());
+  if (SmiValuesAre32Bits()) {
+    if (src.IsImmediateOffset() && src.shift_amount() == 0) {
+      // Load value directly from the upper half-word.
+      // Assumes that Smis are shifted by 32 bits and little endianness.
+      DCHECK_EQ(kSmiShift, 32);
+      Ldr(dst.W(),
+          MemOperand(src.base(), src.offset() + (kSmiShift / kBitsPerByte),
+                     src.addrmode()));
+    } else {
+      Ldr(dst, src);
+      SmiUntagUnsigned(dst);
+    }
+  } else {
+    DCHECK(SmiValuesAre31Bits());
+    if (COMPRESS_POINTERS_BOOL) {
+      Ldr(dst.W(), src);
+    } else {
+      Ldr(dst, src);
+    }
+    SmiUntagUnsigned(dst);
+  }
+}
+
+void MacroAssembler::SmiUntagUnsigned(Register smi) {
+  SmiUntagUnsigned(smi, smi);
+}
+
 void MacroAssembler::SmiToInt32(Register smi) { SmiToInt32(smi, smi); }
 
 void MacroAssembler::SmiToInt32(Register dst, Register smi) {
@@ -1545,6 +1620,33 @@ void MacroAssembler::TestAndBranchIfAllClear(const Register& reg,
     B(eq, label);
   }
 }
+
+#define MINMAX(V)         \
+  V(Smax, smax, is_int8)  \
+  V(Smin, smin, is_int8)  \
+  V(Umax, umax, is_uint8) \
+  V(Umin, umin, is_uint8)
+
+#define DEFINE_MASM_FUNC(MASM, ASM, RANGE)                          \
+  void MacroAssembler::MASM(const Register& rd, const Register& rn, \
+                            const Operand& op) {                    \
+    DCHECK(allow_macro_instructions());                             \
+    DCHECK(!rd.IsZero());                                           \
+    if (op.IsImmediate()) {                                         \
+      int64_t imm = op.ImmediateValue();                            \
+      if (!RANGE(imm)) {                                            \
+        UseScratchRegisterScope temps(this);                        \
+        Register temp = temps.AcquireSameSizeAs(rd);                \
+        Mov(temp, imm);                                             \
+        MASM(rd, rn, temp);                                         \
+        return;                                                     \
+      }                                                             \
+    }                                                               \
+    ASM(rd, rn, op);                                                \
+  }
+MINMAX(DEFINE_MASM_FUNC)
+#undef DEFINE_MASM_FUNC
+#undef MINMAX
 
 }  // namespace internal
 }  // namespace v8

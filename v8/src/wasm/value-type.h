@@ -12,6 +12,7 @@
 #include <optional>
 
 #include "src/base/bit-field.h"
+#include "src/base/logging.h"
 #include "src/base/template-utils.h"
 #include "src/codegen/machine-type.h"
 #include "src/codegen/signature.h"
@@ -103,8 +104,6 @@ enum Nullability : bool { kNonNullable = false, kNullable = true };
 
 enum Exactness : bool { kAnySubtype, kExact };
 
-static constexpr bool kNotShared = false;
-
 enum ValueKind : uint8_t {
 #define DEF_ENUM(kind, ...) k##kind,
   FOREACH_VALUE_TYPE(DEF_ENUM)
@@ -172,21 +171,26 @@ using HasIndexOrSentinelField = IsRefField::Next<bool, 1>;
   V(NoExn, NoExn, REF, "noexn")                                                \
   V(NoExtern, NoExtern, REF, "noextern")                                       \
   V(NoFunc, NoFunc, REF | FUNC, "nofunc")                                      \
+  V(NoWaitqueue, NoWaitqueue, REF, "nowaitqueue")                              \
   V(None, None, REF, "none")
 
-#define FOREACH_ABSTRACT_TYPE(V) /*                           force 80 cols */ \
-  FOREACH_NONE_TYPE(V)                                                         \
-  /* Established (non-proposal) types. */                                      \
+#define FOREACH_TOP_TYPE(V) /*                                force 80 cols */ \
   V(Func, FuncRef, REF | FUNC, "func")                                         \
   V(Any, AnyRef, REF, "any")                                                   \
-  V(Eq, EqRef, REF, "eq")                                                      \
-  V(I31, I31Ref, REF, "i31")                                                   \
-  V(Struct, StructRef, REF | STRUCT, "struct")                                 \
-  V(Array, ArrayRef, REF | ARRAY, "array")                                     \
   V(Extern, ExternRef, REF, "extern")                                          \
   V(Exn, ExnRef, REF, "exn")                                                   \
   /* WasmFX aka Core Stack Switching. */                                       \
   V(Cont, ContRef, REF | CONT, "cont")                                         \
+  V(Waitqueue, WaitqueueRef, REF, "waitqueue")
+
+#define FOREACH_ABSTRACT_TYPE(V) /*                           force 80 cols */ \
+  FOREACH_NONE_TYPE(V)                                                         \
+  FOREACH_TOP_TYPE(V)                                                          \
+  /* Established (non-proposal) types. */                                      \
+  V(Eq, EqRef, REF, "eq")                                                      \
+  V(I31, I31Ref, REF, "i31")                                                   \
+  V(Struct, StructRef, REF | STRUCT, "struct")                                 \
+  V(Array, ArrayRef, REF | ARRAY, "array")                                     \
   /* Stringref proposal. */                                                    \
   V(String, StringRef, REF, "string")                                          \
   V(StringViewWtf8, StringViewWtf8, REF, "stringview_wtf8")                    \
@@ -232,15 +236,15 @@ using IsNullableField = TypeKindField::Next<Nullability, 1>;
 using IsExactField = IsNullableField::Next<Exactness, 1>;
 // For reference types, we cache some information about the referenced type.
 // Non-reference types don't use these bits.
-using IsSharedField = IsExactField::Next<bool, 1>;
+using IsSharedField = IsExactField::Next<SharedFlag, 1>;
 using RefTypeKindField = IsSharedField::Next<RefTypeKind, 3>;
 static_assert(RefTypeKindField::is_valid(RefTypeKind::kLastValue));
 
 // Stores the index if {has_index()}, or the {StandardType} otherwise.
-using PayloadField = RefTypeKindField::Next<uint32_t, 20>;
+using PayloadField = RefTypeKindField::Next<uint32_t, 21>;
 
 // Reserved for future use.
-using ReservedField = PayloadField::Next<uint32_t, 4>;
+using ReservedField = PayloadField::Next<uint32_t, 3>;
 static_assert(ReservedField::kShift + ReservedField::kSize == 32);
 
 // Useful for HeapTypes, whose "shared" bit is orthogonal to their kind.
@@ -249,7 +253,8 @@ static constexpr uint32_t kGenericKindMask =
 // Useful for numeric types which are always considered "shared".
 static constexpr uint32_t kNumericKindMask =
     kGenericKindMask | IsSharedField::kMask;
-static constexpr uint32_t kNumericExtraBits = IsSharedField::encode(true);
+static constexpr uint32_t kNumericExtraBits =
+    IsSharedField::encode(SharedFlag{true});
 
 #define COUNT(...) +1
 static constexpr uint32_t kNumberOfGenericKinds = 0 FOREACH_GENERIC_TYPE(COUNT);
@@ -308,12 +313,8 @@ constexpr uint32_t ToZeroBasedIndex(NumericKind kind) {
                 kNumberOfGenericKinds);
   uint32_t raw = PayloadField::decode(static_cast<uint32_t>(kind));
   DCHECK_GE(raw, kNumberOfGenericKinds);
-  // As an additional safety net, as long as we happen to have exactly 8
-  // numeric types, we can conveniently apply a mask here. If we need to
-  // accommodate a different number of numeric kinds in the future, we should
-  // consider adding bounds checks at use sites.
-  static_assert(kNumberOfNumericKinds == 8);
-  return (raw - kNumberOfGenericKinds) & 0x7;
+  // TODO(manoskouk): We should consider adding bounds checks at use sites.
+  return raw - kNumberOfGenericKinds;
 }
 
 }  // namespace value_type_impl
@@ -351,13 +352,13 @@ class ValueTypeBase {
   static const uint32_t kIndexShift = value_type_impl::PayloadField::kShift;
 
   constexpr ValueTypeBase()
-      : ValueTypeBase(GenericKind::kVoid, kNonNullable, false) {}
+      : ValueTypeBase(GenericKind::kVoid, kNonNullable, SharedFlag{false}) {}
 
   // This is specifically for the needs of the decoder: sometimes we need to
   // create the ValueType instance when we still only know the type index.
   // Once we know more about the referenced type, this function updates those
   // bits to their correct values.
-  void Populate(bool shared, RefTypeKind kind) {
+  void Populate(SharedFlag shared, RefTypeKind kind) {
     uint32_t bits = value_type_impl::IsSharedField::update(bit_field_, shared);
     bit_field_ = value_type_impl::RefTypeKindField::update(bits, kind);
   }
@@ -401,7 +402,7 @@ class ValueTypeBase {
     return value_type_impl::IsExactField::decode(bit_field_);
   }
   constexpr bool is_exact() const { return exactness() == Exactness::kExact; }
-  constexpr bool is_shared() const {
+  constexpr SharedFlag is_shared() const {
     return value_type_impl::IsSharedField::decode(bit_field_);
   }
   constexpr RefTypeKind ref_type_kind() const {
@@ -435,6 +436,11 @@ class ValueTypeBase {
   constexpr bool is_void() const {
     uint32_t bits = bit_field_ & value_type_impl::kGenericKindMask;
     return bits == static_cast<uint32_t>(GenericKind::kVoid);
+  }
+  constexpr bool is_none_or_bottom() const {
+    uint32_t bits = bit_field_ & value_type_impl::kGenericKindMask;
+    return bits == static_cast<uint32_t>(GenericKind::kNone) ||
+           bits == static_cast<uint32_t>(GenericKind::kBottom);
   }
   constexpr bool is_string_view() const {
     uint32_t bits = bit_field_ & value_type_impl::kGenericKindMask;
@@ -471,7 +477,13 @@ class ValueTypeBase {
     return true;
   }
 
-  constexpr int value_kind_size_log2() const {
+  constexpr bool is_none_type() const {
+    DCHECK(!is_numeric());
+    if (!is_abstract_ref()) return false;
+    return IsNullKind(generic_kind());
+  }
+
+  constexpr uint8_t value_kind_size_log2() const {
     DCHECK(!is_sentinel());  // Caller's responsibility.
     if (is_ref()) return kTaggedSizeLog2;
     constexpr uint8_t kValueKindSizeLog2[] = {
@@ -483,7 +495,7 @@ class ValueTypeBase {
     return kValueKindSizeLog2[index];
   }
 
-  constexpr int value_kind_size() const {
+  constexpr uint8_t value_kind_size() const {
     DCHECK(!is_sentinel());  // Caller's responsibility.
     if (is_ref()) return kTaggedSize;
     constexpr uint8_t kValueKindSize[] = {
@@ -553,9 +565,14 @@ class ValueTypeBase {
 
   /****************************** Pretty-printing *****************************/
   constexpr char short_name() const {
-    DCHECK(!is_sentinel());  // Caller's responsibility.
     if (is_ref()) {
       return is_nullable() ? 'n' : 'r';
+    }
+    if (is_sentinel()) {
+      if (is_void()) return 'v';
+      if (is_top()) return '\\';
+      if (is_bottom()) return '*';
+      // Otherwise fall through to the DCHECK in {numeric_kind()}.
     }
     constexpr const char kNumericShortName[] = {
 #define SHORT_NAME(kind, log2, code, mtype, shortName, ...) shortName,
@@ -582,6 +599,7 @@ class ValueTypeBase {
       return payload >= value_type_impl::kNumberOfGenericKinds &&
              payload < value_type_impl::kNumberOfStandardTypes;
     }
+    if (ref_type_kind() > RefTypeKind::kLastValue) return false;
     if (!has_index()) {
       // Generic types must be part of the predefined set.
       if (payload >= value_type_impl::kNumberOfGenericKinds) return false;
@@ -598,9 +616,6 @@ class ValueTypeBase {
 
   /************************* Incremental transition ***************************/
   // The following methods are deprecated. Their usage should be replaced.
-  constexpr bool is_reference() const { return is_ref(); }
-  constexpr bool is_object_reference() const { return is_ref(); }
-
   static constexpr ValueTypeBase Primitive(ValueKind kind) {
     switch (kind) {
       case kI32:
@@ -620,13 +635,18 @@ class ValueTypeBase {
       case kF16:
         return ValueTypeBase(NumericKind::kF16);
       case kVoid:
-        return ValueTypeBase(GenericKind::kVoid, kNonNullable, false);
+        return ValueTypeBase(GenericKind::kVoid, kNonNullable,
+                             SharedFlag{false});
       case kRef:
       case kRefNull:
       case kTop:
       case kBottom:
         UNREACHABLE();
     }
+    // The input value of the switch is untrusted, so even if it's exhaustive,
+    // it can skip all cases and end up here, triggering UB since there's no
+    // return.
+    UNREACHABLE();
   }
 
   constexpr ValueKind kind() const {
@@ -657,8 +677,6 @@ class ValueTypeBase {
     return is_nullable() ? kRefNull : kRef;
   }
 
-  constexpr uint32_t raw_heap_representation(bool distinguish_shared) const;
-
  protected:
   friend class CanonicalValueType;
   friend class HeapType;
@@ -675,7 +693,7 @@ class ValueTypeBase {
   }
 
   explicit constexpr ValueTypeBase(GenericKind kind, Nullability nullable,
-                                   bool is_shared)
+                                   SharedFlag is_shared)
       : bit_field_(static_cast<uint32_t>(kind) |
                    value_type_impl::IsNullableField::encode(nullable) |
                    value_type_impl::IsSharedField::encode(is_shared)) {
@@ -683,7 +701,7 @@ class ValueTypeBase {
   }
 
   explicit constexpr ValueTypeBase(TypeIndex index, Nullability nullable,
-                                   Exactness exact, bool shared,
+                                   Exactness exact, SharedFlag shared,
                                    RefTypeKind ref_type_kind)
       : bit_field_(
             value_type_impl::TypeKindField::encode(TypeKind::kIndexedRef) |
@@ -711,10 +729,10 @@ ASSERT_TRIVIALLY_COPYABLE(ValueTypeBase);
 // Uses module-specific type indices.
 class HeapType : public ValueTypeBase {
  public:
-  static constexpr HeapType Generic(GenericKind kind, bool shared) {
+  static constexpr HeapType Generic(GenericKind kind, SharedFlag shared) {
     return HeapType{ValueTypeBase(kind, kNullable, shared)};
   }
-  static constexpr HeapType Index(ModuleTypeIndex index, bool shared,
+  static constexpr HeapType Index(ModuleTypeIndex index, SharedFlag shared,
                                   RefTypeKind kind,
                                   Exactness exact = Exactness::kAnySubtype) {
     return HeapType{ValueTypeBase(index, kNullable, exact, shared, kind)};
@@ -725,11 +743,11 @@ class HeapType : public ValueTypeBase {
     return type;
   }
 
-  static constexpr HeapType from_code(uint8_t code, bool is_shared) {
+  static constexpr HeapType from_code(uint8_t code, SharedFlag is_shared) {
     constexpr uint8_t kFirst = ValueTypeCode::kFirstHeapTypeCode;
     constexpr uint8_t kLast = ValueTypeCode::kLastHeapTypeCode;
     if (code < kFirst || code > kLast) {
-      return Generic(GenericKind::kBottom, false);
+      return Generic(GenericKind::kBottom, SharedFlag{false});
     }
     constexpr size_t kNumCases = kLast - kFirst + 1;
     constexpr std::array<GenericKind, kNumCases> kLookupTable =
@@ -780,99 +798,12 @@ class HeapType : public ValueTypeBase {
     return generic_heaptype_name();
   }
 
-  /************************* Incremental transition ***************************/
-  // The following methods are deprecated. Their usage should be replaced.
-  enum Representation : uint32_t {
-    kFunc = kV8MaxWasmTypes,  // shorthand: c
-    kEq,                      // shorthand: q
-    kI31,                     // shorthand: j
-    kStruct,                  // shorthand: o
-    kArray,                   // shorthand: g
-    kAny,                     //
-    kExtern,                  // shorthand: a.
-    kExternString,            // Internal type for optimization purposes.
-                              // Subtype of extern.
-                              // Used by the js-builtin-strings proposal.
-    kExn,                     //
-    kString,                  // shorthand: w.
-    kStringViewWtf8,          // shorthand: x.
-    kStringViewWtf16,         // shorthand: y.
-    kStringViewIter,          // shorthand: z.
-    kNone,                    //
-    kNoFunc,                  //
-    kNoExtern,                //
-    kNoExn,                   //
-    kCont,                    // shorthand: k.
-    kContShared,
-    kNoCont,  // bottom continuation type
-    kFuncShared,
-    kEqShared,
-    kI31Shared,
-    kStructShared,
-    kArrayShared,
-    kAnyShared,
-    kExternShared,
-    kExternStringShared,
-    kExnShared,
-    kStringShared,
-    kStringViewWtf8Shared,
-    kStringViewWtf16Shared,
-    kStringViewIterShared,
-    kNoneShared,
-    kNoFuncShared,
-    kNoExternShared,
-    kNoExnShared,
-    kNoContShared,
-    // This value is an internal type (not part of the Wasm spec) that
-    // is the common supertype across all type hierarchies.  It should never
-    // appear in validated Wasm programs, but is used to signify that we don't
-    // have any information about a particular value and to prevent bugs in our
-    // typed optimizations, see crbug.com/361652141. Note: kTop is the neutral
-    // element wrt. to intersection (whereas kBottom is for union), and kBottom
-    // is indicating unreachable code, which might be used for subsequent
-    // optimizations, e.g., DCE.
-    kTop,
-    // This value is used to represent failures in the parsing of heap types and
-    // does not correspond to a Wasm heap type. It has to be last in this list.
-    kBottom
-  };
-  constexpr Representation representation() const {
-    return static_cast<Representation>(raw_heap_representation(true));
-  }
-  constexpr bool is_index() const { return has_index(); }
-
  private:
   // Hide inherited methods that don't make sense for HeapTypes.
   constexpr bool is_nullable() const;
   constexpr bool is_non_nullable() const;
   constexpr Nullability nullability() const;
 };
-
-// Deprecated.
-constexpr uint32_t ValueTypeBase::raw_heap_representation(
-    bool distinguish_shared) const {
-  DCHECK(!is_numeric());
-  if (has_index()) return raw_index().index;
-  switch (generic_kind()) {
-    case GenericKind::kTop:
-      return HeapType::kTop;
-    case GenericKind::kBottom:
-      return HeapType::kBottom;
-
-#define CASE(name, ...)                                                  \
-  case GenericKind::k##name:                                             \
-    return distinguish_shared && is_shared() ? HeapType::k##name##Shared \
-                                             : HeapType::k##name;
-      FOREACH_ABSTRACT_TYPE(CASE)
-#undef CASE
-
-    case GenericKind::kExternString:
-      return distinguish_shared && is_shared() ? HeapType::kExternStringShared
-                                               : HeapType::kExternString;
-    case GenericKind::kVoid:
-      UNREACHABLE();
-  }
-}
 
 class CanonicalValueType;
 
@@ -883,10 +814,10 @@ class ValueType : public ValueTypeBase {
     return ValueType{ValueTypeBase(kind)};
   }
   static constexpr ValueType Generic(GenericKind kind, Nullability nullable,
-                                     bool shared) {
+                                     SharedFlag shared) {
     return ValueType{ValueTypeBase(kind, nullable, shared)};
   }
-  static constexpr ValueType Ref(ModuleTypeIndex index, bool shared,
+  static constexpr ValueType Ref(ModuleTypeIndex index, SharedFlag shared,
                                  RefTypeKind kind) {
     return ValueType{ValueTypeBase(index, kNonNullable, Exactness::kAnySubtype,
                                    shared, kind)};
@@ -894,7 +825,7 @@ class ValueType : public ValueTypeBase {
   static constexpr ValueType Ref(HeapType type) {
     return ValueType{type}.AsNonNull();
   }
-  static constexpr ValueType RefNull(ModuleTypeIndex index, bool shared,
+  static constexpr ValueType RefNull(ModuleTypeIndex index, SharedFlag shared,
                                      RefTypeKind kind) {
     return ValueType{
         ValueTypeBase(index, kNullable, Exactness::kAnySubtype, shared, kind)};
@@ -903,8 +834,8 @@ class ValueType : public ValueTypeBase {
     return ValueType{type}.AsNullable(kNullable);
   }
   static constexpr ValueType RefMaybeNull(ModuleTypeIndex index,
-                                          Nullability nullable, bool shared,
-                                          RefTypeKind kind) {
+                                          Nullability nullable,
+                                          SharedFlag shared, RefTypeKind kind) {
     return ValueType{
         ValueTypeBase(index, nullable, Exactness::kAnySubtype, shared, kind)};
   }
@@ -944,8 +875,8 @@ class ValueType : public ValueTypeBase {
 
   constexpr ValueType AsNonShared() const {
     if (!is_ref()) return *this;
-    return ValueType{ValueTypeBase(
-        value_type_impl::IsSharedField::update(raw_bit_field(), false))};
+    return ValueType{ValueTypeBase(value_type_impl::IsSharedField::update(
+        raw_bit_field(), SharedFlag{false}))};
   }
 
   constexpr ValueType Unpacked() const {
@@ -966,20 +897,6 @@ class ValueType : public ValueTypeBase {
     return ValueType{ValueTypeBase::Primitive(kind)};
   }
 
-  // For incremental transition:
-  constexpr HeapType::Representation heap_representation() const {
-    return static_cast<HeapType::Representation>(raw_heap_representation(true));
-  }
-
-  // For incremental transition:
-  constexpr bool is_reference_to(HeapType::Representation repr) const {
-    return is_ref() && heap_representation() == repr;
-  }
-  // Un-hide the superclass method (which is here to stay):
-  constexpr bool is_reference_to(GenericKind kind) const {
-    return ValueTypeBase::is_reference_to(kind);
-  }
-
   static ValueType For(MachineType type) {
     switch (type.representation()) {
       case MachineRepresentation::kWord8:
@@ -993,7 +910,7 @@ class ValueType : public ValueTypeBase {
       case MachineRepresentation::kFloat64:
         return Primitive(NumericKind::kF64);
       case MachineRepresentation::kTaggedPointer:
-        return Generic(GenericKind::kAny, kNullable, kNotShared);
+        return Generic(GenericKind::kAny, kNullable, SharedFlag{false});
       case MachineRepresentation::kSimd128:
         return Primitive(NumericKind::kS128);
       default:
@@ -1022,13 +939,14 @@ class CanonicalValueType : public ValueTypeBase {
   static constexpr CanonicalValueType Primitive(NumericKind kind) {
     return CanonicalValueType{ValueTypeBase(kind)};
   }
-  static constexpr CanonicalValueType Ref(CanonicalTypeIndex index, bool shared,
-                                          RefTypeKind kind) {
+  static constexpr CanonicalValueType Ref(CanonicalTypeIndex index,
+                                          SharedFlag shared, RefTypeKind kind) {
     return CanonicalValueType{ValueTypeBase(
         index, kNonNullable, Exactness::kAnySubtype, shared, kind)};
   }
   static constexpr CanonicalValueType RefNull(CanonicalTypeIndex index,
-                                              bool shared, RefTypeKind kind) {
+                                              SharedFlag shared,
+                                              RefTypeKind kind) {
     return CanonicalValueType{
         ValueTypeBase(index, kNullable, Exactness::kAnySubtype, shared, kind)};
   }
@@ -1068,28 +986,19 @@ class CanonicalValueType : public ValueTypeBase {
     return bit_field_ == other.bit_field_;
   }
 
+  // For hashing everything except the index.
+  constexpr uint32_t all_bits_without_index() const {
+    static_assert(std::is_same_v<uint32_t, decltype(bit_field_)>);
+    return bit_field_ & ~kIndexBits;
+  }
+
+  // For checking equality of everything except the index.
   constexpr bool is_equal_except_index(CanonicalValueType other) const {
-    return (bit_field_ & ~kIndexBits) == (other.bit_field_ & ~kIndexBits);
+    return all_bits_without_index() == other.all_bits_without_index();
   }
 
   constexpr bool IsFunctionType() const {
     return ref_type_kind() == RefTypeKind::kFunction;
-  }
-
-  // For incremental transition.
-  constexpr HeapType::Representation heap_representation() const {
-    return static_cast<HeapType::Representation>(raw_heap_representation(true));
-  }
-
-  // For incremental transition.
-  constexpr HeapType::Representation heap_representation_non_shared() const {
-    return static_cast<HeapType::Representation>(
-        raw_heap_representation(false));
-  }
-
-  // For incremental transition:
-  constexpr bool is_reference_to(HeapType::Representation repr) const {
-    return is_ref() && heap_representation() == repr;
   }
 };
 ASSERT_TRIVIALLY_COPYABLE(CanonicalValueType);
@@ -1125,14 +1034,15 @@ class IndependentValueType : public ValueTypeBase {
 
  protected:
   explicit constexpr IndependentValueType(GenericKind kind,
-                                          Nullability nullable, bool shared)
+                                          Nullability nullable,
+                                          SharedFlag shared)
       : ValueTypeBase(kind, nullable, shared) {}
 };
 class IndependentHeapType : public IndependentValueType {
  public:
   explicit constexpr IndependentHeapType(GenericKind kind,
                                          Nullability nullable = kNullable,
-                                         bool shared = false)
+                                         SharedFlag shared = SharedFlag{false})
       : IndependentValueType(kind, nullable, shared) {}
 
   constexpr IndependentHeapType AsNonNull() const {
@@ -1147,10 +1057,6 @@ class IndependentHeapType : public IndependentValueType {
 // replace with ValueType methods.
 
 constexpr bool is_reference(ValueKind kind) {
-  return kind == kRef || kind == kRefNull;
-}
-
-constexpr bool is_object_reference(ValueKind kind) {
   return kind == kRef || kind == kRefNull;
 }
 
@@ -1251,16 +1157,26 @@ constexpr IndependentHeapType kWasmBottom{GenericKind::kBottom, kNonNullable};
 constexpr IndependentHeapType kWasmFuncRef{GenericKind::kFunc};
 constexpr IndependentHeapType kWasmAnyRef{GenericKind::kAny};
 constexpr IndependentHeapType kWasmSharedAnyRef{GenericKind::kAny, kNullable,
-                                                true};
+                                                SharedFlag{true}};
 constexpr IndependentHeapType kWasmExternRef{GenericKind::kExtern};
 constexpr IndependentHeapType kWasmRefExtern{GenericKind::kExtern,
                                              kNonNullable};
+constexpr IndependentHeapType kWasmSharedExternRef{GenericKind::kExtern,
+                                                   kNullable, SharedFlag{true}};
 constexpr IndependentHeapType kWasmExnRef{GenericKind::kExn};
+constexpr IndependentHeapType kWasmSharedExnRef{GenericKind::kExn, kNullable,
+                                                SharedFlag{true}};
 constexpr IndependentHeapType kWasmEqRef{GenericKind::kEq};
 constexpr IndependentHeapType kWasmI31Ref{GenericKind::kI31};
 constexpr IndependentHeapType kWasmRefI31{GenericKind::kI31, kNonNullable};
 constexpr IndependentHeapType kWasmStructRef{GenericKind::kStruct};
 constexpr IndependentHeapType kWasmArrayRef{GenericKind::kArray};
+// Exceptionally, the default waitqueue type is shared, because unshared
+// waitqueues do not exist.
+constexpr IndependentHeapType kWasmWaitqueueRef{GenericKind::kWaitqueue,
+                                                kNullable, SharedFlag{true}};
+constexpr IndependentHeapType kWasmNullWaitqueueRef{
+    GenericKind::kNoWaitqueue, kNullable, SharedFlag{true}};
 constexpr IndependentHeapType kWasmStringRef{GenericKind::kString};
 constexpr IndependentHeapType kWasmRefString{GenericKind::kString,
                                              kNonNullable};
@@ -1268,6 +1184,11 @@ constexpr IndependentHeapType kWasmRefNullExternString{
     GenericKind::kExternString};
 constexpr IndependentHeapType kWasmRefExternString{GenericKind::kExternString,
                                                    kNonNullable};
+constexpr IndependentHeapType kWasmRefNullSharedExternString{
+    GenericKind::kExternString, kNullable, SharedFlag{true}};
+constexpr IndependentHeapType kWasmRefSharedExternString{
+    GenericKind::kExternString, kNonNullable, SharedFlag{true}};
+
 constexpr IndependentHeapType kWasmStringViewWtf8{GenericKind::kStringViewWtf8,
                                                   kNonNullable};
 constexpr IndependentHeapType kWasmStringViewWtf16{
@@ -1275,6 +1196,9 @@ constexpr IndependentHeapType kWasmStringViewWtf16{
 constexpr IndependentHeapType kWasmStringViewIter{GenericKind::kStringViewIter,
                                                   kNonNullable};
 constexpr IndependentHeapType kWasmNullRef{GenericKind::kNone};
+constexpr IndependentHeapType kWasmSharedNullRef{GenericKind::kNone, kNullable,
+                                                 SharedFlag{true}};
+constexpr IndependentHeapType kWasmRefNone{GenericKind::kNone, kNonNullable};
 constexpr IndependentHeapType kWasmNullExternRef{GenericKind::kNoExtern};
 constexpr IndependentHeapType kWasmNullExnRef{GenericKind::kNoExn};
 constexpr IndependentHeapType kWasmNullFuncRef{GenericKind::kNoFunc};
@@ -1296,18 +1220,29 @@ class CanonicalSig : public Signature<CanonicalValueType> {
                const CanonicalValueType* reps)
       : Signature<CanonicalValueType>(return_count, parameter_count, reps) {}
 
+  // For predefined signatures, where we know what we're doing.
+  CanonicalSig(size_t return_count, size_t parameter_count,
+               const CanonicalValueType* reps, CanonicalTypeIndex index);
+
   class Builder : public SignatureBuilder<CanonicalSig, CanonicalValueType> {
    public:
     Builder(Zone* zone, size_t return_count, size_t parameter_count)
         : SignatureBuilder<CanonicalSig, CanonicalValueType>(zone, return_count,
                                                              parameter_count) {}
-    CanonicalSig* Get() const;
+    const CanonicalSig* Get(CanonicalTypeIndex index) const;
   };
 
   uint64_t signature_hash() const { return signature_hash_; }
 
+  CanonicalTypeIndex index() const { return index_; }
+
  private:
+  // These fields are initialized by `Builder::Get()` and never modified
+  // afterwards. We cannot make them `const` for technical reasons (this would
+  // require a `const_cast` which would be UB).
   uint64_t signature_hash_;
+
+  CanonicalTypeIndex index_;
 };
 
 // This is the special case where comparing module-specific to canonical
@@ -1369,9 +1304,14 @@ class LoadType {
         return is_signed ? kI32Load16S : kI32Load16U;
       case kF16:
         return kF32LoadF16;
-      default:
+      case kVoid:
+      case kRef:
+      case kRefNull:
+      case kTop:
+      case kBottom:
         UNREACHABLE();
     }
+    UNREACHABLE();
   }
 
  private:
@@ -1457,9 +1397,14 @@ class StoreType {
         return kI32Store16;
       case kF16:
         return kF32StoreF16;
-      default:
+      case kVoid:
+      case kRef:
+      case kRefNull:
+      case kTop:
+      case kBottom:
         UNREACHABLE();
     }
+    UNREACHABLE();
   }
 
  private:

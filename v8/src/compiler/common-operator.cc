@@ -626,6 +626,7 @@ const ExitMachineGraphParameters& ExitMachineGraphParametersOf(
   V(TrapRemByZero)                 \
   V(TrapFloatUnrepresentable)      \
   V(TrapTableOutOfBounds)          \
+  V(TrapNullFunc)                  \
   V(TrapFuncSigMismatch)
 
 #define CACHED_PARAMETER_LIST(V) \
@@ -756,12 +757,12 @@ struct CommonOperatorGlobalCache final {
       kBeginRegionNotObservableOperator;
 
   template <size_t kInputCount>
-  struct LoopOperator final : public Operator {
+  struct LoopOperator final : public Operator1<FeedbackSource> {
     LoopOperator()
-        : Operator(                                 // --
+        : Operator1<FeedbackSource>(                // --
               IrOpcode::kLoop, Operator::kKontrol,  // opcode
               "Loop",                               // name
-              0, 0, kInputCount, 0, 0, 1) {}        // counts
+              0, 0, kInputCount, 0, 0, 1, {}) {}    // counts
   };
 #define CACHED_LOOP(input_count) \
   LoopOperator<input_count> kLoop##input_count##Operator;
@@ -1014,6 +1015,15 @@ const Operator* CommonOperatorBuilder::Return(int value_input_count) {
       value_input_count + 1, 1, 1, 0, 0, 1);  // counts
 }
 
+const Operator* CommonOperatorBuilder::MajorGCForCompilerTesting() {
+  // We put MajorGCForCompilerTesting on both the effect and the control chain
+  // so that it doesn't get hoisted out of (or pushed in) branches or move
+  // before/after various loads/stores.
+  return zone()->New<Operator>(IrOpcode::kMajorGCForCompilerTesting,
+                               Operator::kFoldable, "MajorGCForCompilerTesting",
+                               0, 1, 1, 0, 1, 1);
+}
+
 const Operator* CommonOperatorBuilder::StaticAssert(const char* source) {
   return zone()->New<Operator1<const char*>>(
       IrOpcode::kStaticAssert, Operator::kFoldable, "StaticAssert", 1, 1, 0, 0,
@@ -1187,24 +1197,26 @@ const Operator* CommonOperatorBuilder::Start(int value_output_count) {
       0, 0, 0, value_output_count, 1, 1);                          // counts
 }
 
-
-const Operator* CommonOperatorBuilder::Loop(int control_input_count) {
-  switch (control_input_count) {
+const Operator* CommonOperatorBuilder::Loop(int control_input_count,
+                                            const FeedbackSource& feedback) {
+  if (!feedback.IsValid()) {
+    switch (control_input_count) {
 #define CACHED_LOOP(input_count) \
   case input_count:              \
     return &cache_.kLoop##input_count##Operator;
-    CACHED_LOOP_LIST(CACHED_LOOP)
+      CACHED_LOOP_LIST(CACHED_LOOP)
 #undef CACHED_LOOP
-    default:
-      break;
+      default:
+        break;
+    }
   }
   // Uncached.
-  return zone()->New<Operator>(             // --
-      IrOpcode::kLoop, Operator::kKontrol,  // opcode
-      "Loop",                               // name
-      0, 0, control_input_count, 0, 0, 1);  // counts
+  return zone()->New<Operator1<FeedbackSource>>(  // --
+      IrOpcode::kLoop, Operator::kKontrol,        // opcode
+      "Loop",                                     // name
+      0, 0, control_input_count, 0, 0, 1,         // counts
+      feedback);                                  // parameter
 }
-
 
 const Operator* CommonOperatorBuilder::Merge(int control_input_count) {
   switch (control_input_count) {
@@ -1304,15 +1316,17 @@ const Operator* CommonOperatorBuilder::Float32Constant(float value) {
       value);                                       // parameter
 }
 
-
 const Operator* CommonOperatorBuilder::Float64Constant(double value) {
-  return zone()->New<Operator1<double>>(            // --
+  return Float64Constant(Float64::FromBits(base::bit_cast<uint64_t>(value)));
+}
+
+const Operator* CommonOperatorBuilder::Float64Constant(Float64 value) {
+  return zone()->New<Operator1<Float64>>(           // --
       IrOpcode::kFloat64Constant, Operator::kPure,  // opcode
       "Float64Constant",                            // name
       0, 0, 0, 1, 0, 0,                             // counts
       value);                                       // parameter
 }
-
 
 const Operator* CommonOperatorBuilder::ExternalConstant(
     const ExternalReference& value) {
@@ -1712,34 +1726,12 @@ CommonOperatorBuilder::CreateJSToWasmFrameStateFunctionInfo(
 }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
-const Operator* CommonOperatorBuilder::Chained(const Operator* op) {
-  // Use Chained only for operators that are not on the effect chain already.
-  DCHECK_EQ(op->EffectInputCount(), 0);
-  DCHECK_EQ(op->ControlInputCount(), 0);
-  const char* mnemonic;
-  switch (op->opcode()) {
-    case IrOpcode::kChangeInt64ToBigInt:
-      mnemonic = "Chained[ChangeInt64ToBigInt]";
-      break;
-    case IrOpcode::kChangeUint64ToBigInt:
-      mnemonic = "Chained[ChangeUint64ToBigInt]";
-      break;
-    default:
-      UNREACHABLE();
-  }
-  // TODO(nicohartmann@): Need to store operator properties once we have to
-  // support Operator1 operators.
-  Operator::Properties properties = op->properties();
-  return zone()->New<Operator>(op->opcode(), properties, mnemonic,
-                               op->ValueInputCount(), 1, 1,
-                               op->ValueOutputCount(), 1, 0);
-}
-
-const Operator* CommonOperatorBuilder::DeadValue(MachineRepresentation rep) {
+const Operator* CommonOperatorBuilder::DeadValue(MachineRepresentation rep,
+                                                 int value_input_count) {
   return zone()->New<Operator1<MachineRepresentation>>(  // --
       IrOpcode::kDeadValue, Operator::kPure,             // opcode
       "DeadValue",                                       // name
-      1, 0, 0, 1, 0, 0,                                  // counts
+      value_input_count, 0, 0, 1, 0, 0,                  // counts
       rep);                                              // parameter
 }
 

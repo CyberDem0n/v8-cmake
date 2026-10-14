@@ -2,14 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "src/api/api-arguments-inl.h"
 #include "src/execution/arguments-inl.h"
 #include "src/execution/isolate-inl.h"
 #include "src/execution/protectors-inl.h"
 #include "src/heap/factory.h"
-#include "src/heap/heap-inl.h"  // For ToBoolean. TODO(jkummerow): Drop.
 #include "src/objects/allocation-site-inl.h"
 #include "src/objects/elements.h"
 #include "src/objects/js-array-inl.h"
+#include "src/objects/object-conversions-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -61,22 +62,33 @@ RUNTIME_FUNCTION(Runtime_NewArray) {
   bool holey = false;
   bool can_use_type_feedback = !site.is_null();
   bool can_inline_array_constructor = true;
+
+  // For arity 1, the constructor call  is treated as `Array(length)` if it is a
+  // number, and `Array(single_element_value)` otherwise. For the length call,
+  // check various bounds.
   if (argv.length() == 1) {
-    DirectHandle<Object> argument_one = argv.at<Object>(0);
-    if (IsSmi(*argument_one)) {
-      int value = Cast<Smi>(*argument_one).value();
-      if (value < 0 ||
-          JSArray::SetLengthWouldNormalize(isolate->heap(), value)) {
-        // the array is a dictionary in this case.
+    // Keep in sync with: `ArrayConstructInitializeElements`.
+    DirectHandle<Object> arg0 = argv.at<Object>(0);
+    if (IsNumber(*arg0)) {
+      uint32_t length;
+      if (!Object::ToArrayLength(*arg0, &length)) {
+        // The array is a dictionary in this case.
         can_use_type_feedback = false;
-      } else if (value != 0) {
+      } else if (JSArray::SetLengthWouldNormalize(isolate->heap(), length)) {
+        // The array is a dictionary in this case.
+        can_use_type_feedback = false;
+      } else if (length != 0) {
         holey = true;
-        if (value >= JSArray::kInitialMaxFastElementArray) {
+        if (length >= JSArray::kInitialMaxFastElementArray) {
           can_inline_array_constructor = false;
         }
       }
     } else {
-      // Non-smi length argument produces a dictionary
+      // TODO(jgruber): There's no fundamental reason to disable speculation
+      // here. Currently, we have to do so to avoid deopt loops when the
+      // constructor is sometimes called with a single Number, sometimes with
+      // a single non-number. We could track the variant instead, and disable
+      // speculation only when it changes.
       can_use_type_feedback = false;
     }
   }
@@ -86,10 +98,19 @@ RUNTIME_FUNCTION(Runtime_NewArray) {
       isolate, initial_map,
       JSFunction::GetDerivedMap(isolate, constructor, new_target));
 
-  ElementsKind to_kind = can_use_type_feedback ? site->GetElementsKind()
-                                               : initial_map->elements_kind();
-  if (holey && !IsHoleyElementsKind(to_kind)) {
-    to_kind = GetHoleyElementsKind(to_kind);
+  ElementsKind initial_kind = can_use_type_feedback
+                                  ? site->GetElementsKind()
+                                  : initial_map->elements_kind();
+  ElementsKind to_kind =
+      holey ? GetHoleyElementsKind(initial_kind) : initial_kind;
+
+  if (argv.length() > 1 || (argv.length() == 1 && !IsNumber(argv[0]))) {
+    to_kind = JSObject::GetTransitionedElementsKind(
+        isolate, initial_kind, FullObjectSlot(argv.address_of_arg_at(0)),
+        argv.length(), ALLOW_CONVERTED_DOUBLE_ELEMENTS);
+  }
+
+  if (to_kind != initial_kind) {
     // Update the allocation site info to reflect the advice alteration.
     if (!site.is_null()) site->SetElementsKind(to_kind);
   }
@@ -115,25 +136,16 @@ RUNTIME_FUNCTION(Runtime_NewArray) {
   ElementsKind old_kind = array->GetElementsKind();
   RETURN_FAILURE_ON_EXCEPTION(
       isolate, ArrayConstructInitializeElements(isolate, array, &argv));
-  if (!site.is_null()) {
-    if ((old_kind != array->GetElementsKind() || !can_use_type_feedback ||
-         !can_inline_array_constructor)) {
-      // The arguments passed in caused a transition. This kind of complexity
-      // can't be dealt with in the inlined optimized array constructor case.
-      // We must mark the allocationsite as un-inlinable.
-      site->SetDoNotInlineCall();
-    }
-  } else {
-    if (old_kind != array->GetElementsKind() || !can_inline_array_constructor) {
-      // We don't have an AllocationSite for this Array constructor invocation,
-      // i.e. it might a call from Array#map or from an Array subclass, so we
-      // just flip the bit on the global protector cell instead.
-      // TODO(bmeurer): Find a better way to mark this. Global protectors
-      // tend to back-fire over time...
-      if (Protectors::IsArrayConstructorIntact(isolate)) {
-        Protectors::InvalidateArrayConstructor(isolate);
-      }
-    }
+
+  if (!site.is_null() &&
+      (old_kind != array->GetElementsKind() || !can_use_type_feedback ||
+       !can_inline_array_constructor)) {
+    // Protect against deopt loops by disabling speculating optimizations in
+    // some cases.  If there's no allocation site yet, the optimized code will
+    // eventually optimistically try to inline and worst case will deopt and
+    // set the allocation site itself, or set the CallIC disable speculation
+    // bit.
+    site->SetSpeculationDisabled();
   }
 
   return *array;
@@ -172,11 +184,11 @@ RUNTIME_FUNCTION(Runtime_GrowArrayElements) {
     index = static_cast<uint32_t>(value);
   }
 
-  uint32_t capacity = static_cast<uint32_t>(object->elements()->length());
+  uint32_t capacity = object->elements()->ulength().value();
 
   if (index >= capacity) {
     bool has_grown;
-    MAYBE_ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
         isolate, has_grown,
         object->GetElementsAccessor()->GrowCapacity(isolate, object, index));
     if (!has_grown) {
@@ -194,14 +206,14 @@ RUNTIME_FUNCTION(Runtime_ArrayIsArray) {
   DirectHandle<Object> object = args.at(0);
   Maybe<bool> result = Object::IsArray(object);
   MAYBE_RETURN(result, ReadOnlyRoots(isolate).exception());
-  return isolate->heap()->ToBoolean(result.FromJust());
+  return ReadOnlyRoots(isolate).boolean_value(result.FromJust());
 }
 
 RUNTIME_FUNCTION(Runtime_IsArray) {
   SealHandleScope shs(isolate);
   DCHECK_EQ(1, args.length());
   Tagged<Object> obj = args[0];
-  return isolate->heap()->ToBoolean(IsJSArray(obj));
+  return ReadOnlyRoots(isolate).boolean_value(IsJSArray(obj));
 }
 
 RUNTIME_FUNCTION(Runtime_ArraySpeciesConstructor) {
@@ -254,9 +266,9 @@ RUNTIME_FUNCTION(Runtime_ArrayIncludes_Slow) {
   // Let n be ? ToInteger(fromIndex). (If fromIndex is undefined, this step
   // produces the value 0.)
   int64_t index = 0;
-  if (!IsUndefined(*from_index, isolate)) {
+  if (!IsUndefined(*from_index)) {
     double start_from;
-    MAYBE_ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
         isolate, start_from, Object::IntegerValue(isolate, from_index));
 
     if (start_from >= len) return ReadOnlyRoots(isolate).false_value();
@@ -348,7 +360,7 @@ RUNTIME_FUNCTION(Runtime_ArrayIndexOf) {
   int64_t start_from;
   {
     double fp;
-    MAYBE_ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
+    ASSIGN_RETURN_FAILURE_ON_EXCEPTION(
         isolate, fp, Object::IntegerValue(isolate, from_index));
     if (fp > len) return Smi::FromInt(-1);
     if (V8_LIKELY(fp >=
@@ -381,6 +393,38 @@ RUNTIME_FUNCTION(Runtime_ArrayIndexOf) {
                                                    static_cast<uint32_t>(len));
     MAYBE_RETURN(result, ReadOnlyRoots(isolate).exception());
     return *isolate->factory()->NewNumberFromInt64(result.FromJust());
+  }
+
+  if (V8_UNLIKELY(v8_flags.fast_api_indexof &&
+                  object->map()->has_indexed_interceptor() &&
+                  len <= kMaxUInt32)) {
+    DirectHandle<InterceptorInfo> interceptor(
+        object->map()->GetIndexedInterceptor(), isolate);
+
+    if (!interceptor->non_masking() && interceptor->has_index_of()) {
+      PropertyCallbackArguments arguments(isolate, Cast<JSObject>(*object));
+      uint32_t actual_length = static_cast<uint32_t>(len);
+      uint32_t result = arguments.CallIndexedIndexOf(
+          isolate, interceptor, search_element, static_cast<uint32_t>(index),
+          actual_length, &actual_length);
+      // An exception was thrown in the interceptor. Propagate.
+      RETURN_FAILURE_IF_EXCEPTION_DETECTOR(isolate, arguments);
+      if (result != kMaxUInt32) {
+        return *isolate->factory()->NewNumberFromUint(result);
+      }
+      // The needle was not found in the indexed interceptor, however,
+      // we might still need to keep on searching in case the length value
+      // is bigger than the number of elements in the indexed interceptor.
+      if (len <= actual_length) {
+        // The interceptor covers the whole range.
+        return Smi::FromInt(-1);
+      }
+      if (JSObject::PrototypeHasNoElements(isolate, Cast<JSObject>(*object))) {
+        return Smi::FromInt(-1);
+      }
+      // Keep on searching.
+      index = actual_length;
+    }
   }
 
   // Otherwise, perform slow lookups for special receiver types.

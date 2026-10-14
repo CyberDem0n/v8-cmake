@@ -31,6 +31,7 @@ class BasicBlock {
         state_(state) {}
 
   NodeIdT first_id() const {
+    DCHECK(!is_dead());
     if (has_phi()) return phis()->first()->id();
     return first_non_phi_id();
   }
@@ -57,7 +58,14 @@ class BasicBlock {
     return control_node()->id();
   }
 
-  ZoneVector<Node*>& nodes() { return nodes_; }
+  ZoneVector<Node*>& nodes() {
+    DCHECK(!is_dead());
+    return nodes_;
+  }
+  const ZoneVector<Node*>& nodes() const {
+    DCHECK(!is_dead());
+    return nodes_;
+  }
 
   ControlNode* control_node() const { return control_node_; }
   void set_control_node(ControlNode* control_node) {
@@ -73,17 +81,16 @@ class BasicBlock {
   }
 
   // Moves all nodes after |node| to the resulting ZoneVector, while keeping all
-  // nodes before |node| in the basic block. |node| itself is dropped.
+  // nodes before |node| (inclusive) in the basic block.
   ZoneVector<Node*> Split(Node* node, Zone* zone) {
     size_t split = 0;
     for (; split < nodes_.size(); split++) {
       if (nodes_[split] == node) break;
     }
     DCHECK_NE(split, nodes_.size());
-    size_t after_split = split + 1;
-    ZoneVector<Node*> result(nodes_.size() - after_split, zone);
+    ZoneVector<Node*> result(nodes_.size() - split, zone);
     for (size_t i = 0; i < result.size(); i++) {
-      result[i] = nodes_[i + after_split];
+      result[i] = nodes_[i + split];
     }
     nodes_.resize(split);
     return result;
@@ -150,17 +157,19 @@ class BasicBlock {
     state_->phis()->Add(phi);
   }
 
-  ExceptionHandlerInfo::List& exception_handlers() {
-    return exception_handlers_;
-  }
-
-  void AddExceptionHandler(ExceptionHandlerInfo* handler) {
-    exception_handlers_.Add(handler);
-  }
-
   int predecessor_count() const {
-    DCHECK(has_state());
-    return state()->predecessor_count();
+    if (type_ == kEdgeSplit || type_ == kOther) {
+      DCHECK_NOT_NULL(predecessor());
+      return 1;
+    } else {
+      DCHECK(has_state());
+      return state()->predecessor_count();
+    }
+  }
+
+  bool IsUnreachable() const {
+    if (has_state()) return state()->IsUnreachable();
+    return predecessor_ == nullptr && id_ != 0;
   }
 
   BasicBlock* predecessor_at(int i) const {
@@ -168,9 +177,27 @@ class BasicBlock {
     return state_->predecessor_at(i);
   }
 
+  // Only loop headers of non-resumable loops are guaranteed to have a forward
+  // edge; a resumable loop can be entered through its resume edges alone.
+  BasicBlock* forward_predecessor() const {
+    DCHECK(is_loop());
+    DCHECK_EQ(predecessor_count(), 2);
+    return predecessor_at(0);
+  }
+
   BasicBlock* backedge_predecessor() const {
     DCHECK(is_loop());
     return predecessor_at(predecessor_count() - 1);
+  }
+
+  int get_predecessor_index(BasicBlock* pred) const {
+    DCHECK(has_state());
+    for (int i = 0; i < predecessor_count(); ++i) {
+      if (predecessor_at(i) == pred) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   int predecessor_id() const {
@@ -197,6 +224,25 @@ class BasicBlock {
   }
 
   template <typename Func>
+  bool ForAllPredecessors(Func&& functor) const {
+    if (type_ == kEdgeSplit || type_ == kOther) {
+      BasicBlock* predecessor_block = predecessor();
+      if (predecessor_block) {
+        if (!functor(predecessor_block)) {
+          return false;
+        }
+      }
+    } else {
+      for (int i = 0; i < predecessor_count(); i++) {
+        if (!functor(predecessor_at(i))) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  template <typename Func>
   static void ForEachSuccessorFollowing(ControlNode* control, Func&& functor) {
     if (auto unconditional_control =
             control->TryCast<UnconditionalControlNode>()) {
@@ -220,6 +266,21 @@ class BasicBlock {
     ForEachSuccessorFollowing(control, functor);
   }
 
+  // Invokes `f` on every NodeBase in the block: each phi (if any), then each
+  // (non-null) node, then the control node. Avoids repeating the
+  // phi/node/control walk at call sites. The block must not be dead.
+  template <typename Func>
+  void ForEachNodeAndControl(Func&& f) {
+    if (has_phi()) {
+      for (Phi* phi : *phis()) f(phi);
+    }
+    for (Node* node : nodes()) {
+      if (node != nullptr) f(node);
+    }
+    DCHECK_NOT_NULL(control_node());
+    f(control_node());
+  }
+
   Label* label() {
     // If this fails, jump threading is missing for the node. See
     // MaglevCodeGeneratingNodeProcessor::PatchJumps.
@@ -235,6 +296,7 @@ class BasicBlock {
   bool is_exception_handler_block() const {
     return has_state() && state_->is_exception_handler();
   }
+  bool is_inline() const { return has_state() && state_->is_inline(); }
 
   // If the basic block is an empty (unnecessary) block containing only an
   // unconditional jump to the successor block, return the successor block.
@@ -257,6 +319,24 @@ class BasicBlock {
       current = next;
     }
     return current;
+  }
+
+  void RemovePredecessorFollowing(ControlNode* control) {
+    ForEachSuccessorFollowing(control, [&](BasicBlock* succ) {
+      if (!succ->has_state()) {
+        succ->set_predecessor(nullptr);
+        return;
+      }
+      if (succ->is_loop() && succ->backedge_predecessor() == this) {
+        succ->state()->TurnLoopIntoRegularBlock();
+        return;
+      }
+      for (int i = succ->predecessor_count() - 1; i >= 0; i--) {
+        if (succ->predecessor_at(i) == this) {
+          succ->state()->RemovePredecessorAt(i);
+        }
+      }
+    });
   }
 
   bool is_deferred() const { return deferred_; }
@@ -285,7 +365,7 @@ class BasicBlock {
     }
     bool has_register_merge = false;
 #ifdef V8_ENABLE_MAGLEV
-    if (!state()->register_state().is_initialized()) {
+    if (!state()->has_register_state()) {
       // This can happen when the graph has disconnected blocks; bail out and
       // don't jump thread them.
       return true;
@@ -320,7 +400,6 @@ class BasicBlock {
 
   ZoneVector<Node*> nodes_;
   ControlNode* control_node_;
-  ExceptionHandlerInfo::List exception_handlers_;
 
   union {
     MergePointInterpreterFrameState* state_;

@@ -181,21 +181,38 @@ int InterruptBudgetFor(Isolate* isolate, std::optional<CodeKind> code_kind,
                        Tagged<JSFunction> function,
                        CachedTieringDecision cached_tiering_decision,
                        int bytecode_length) {
-  // Avoid interrupts while we're already tiering.
-  if (function->tiering_in_progress()) return INT_MAX / 2;
-
   const std::optional<CodeKind> existing_request =
       function->GetRequestedOptimizationIfAny(isolate);
-  if (existing_request == CodeKind::TURBOFAN_JS ||
-      (code_kind.has_value() && code_kind.value() == CodeKind::TURBOFAN_JS)) {
-    return v8_flags.invocation_count_for_osr * bytecode_length;
+
+  bool maybe_ml_osr =
+      maglev::IsMaglevOsrEnabled() && existing_request == CodeKind::MAGLEV;
+  bool maybe_tf_osr =
+      v8_flags.use_osr &&
+      (existing_request == CodeKind::TURBOFAN_JS ||
+       (code_kind.has_value() && code_kind.value() == CodeKind::TURBOFAN_JS));
+  bool tiering_in_progress = function->tiering_in_progress();
+  bool osr_tiering_in_progress = function->osr_tiering_in_progress();
+
+  // Avoid interrupts while we're already tiering.
+  if (tiering_in_progress && !osr_tiering_in_progress) {
+    return INT_MAX / 2;
   }
-  if (maglev::IsMaglevOsrEnabled() && existing_request == CodeKind::MAGLEV) {
-    return v8_flags.invocation_count_for_maglev_osr * bytecode_length;
+
+  // Stretch loop interrupts while tiering is already in progress.
+  double osr_factor =
+      osr_tiering_in_progress
+          ? v8_flags.invocation_count_for_osr_factor_while_tiering_in_progress
+          : 1;
+  if (maybe_tf_osr) {
+    return osr_factor * v8_flags.invocation_count_for_osr * bytecode_length;
+  }
+  if (maybe_ml_osr) {
+    return osr_factor * v8_flags.invocation_count_for_maglev_osr *
+           bytecode_length;
   }
 
   if (TiersUpToMaglev(code_kind) &&
-      !function->IsTieringRequestedOrInProgress()) {
+      !function->IsTieringRequestedOrInProgress(isolate)) {
     if (v8_flags.profile_guided_optimization) {
       switch (cached_tiering_decision) {
         case CachedTieringDecision::kDelayMaglev:
@@ -215,7 +232,7 @@ int InterruptBudgetFor(Isolate* isolate, std::optional<CodeKind> code_kind,
       // The enum value is coming from inside the sandbox and while the switch
       // is exhaustive, it's not guaranteed that value is one of the declared
       // values.
-      SBXCHECK(false);
+      UNREACHABLE();
     }
     return v8_flags.invocation_count_for_maglev * bytecode_length;
   }
@@ -321,7 +338,7 @@ void TieringManager::MaybeOptimizeFrame(Tagged<JSFunction> function,
     return;
   }
 
-  if (V8_UNLIKELY(v8_flags.testing_d8_test_runner) &&
+  if (V8_UNLIKELY(v8_flags.allow_natives_syntax) &&
       ManualOptimizationTable::IsMarkedForManualOptimization(isolate_,
                                                              function)) {
     TraceHeuristicOptimizationDisallowed(function);
@@ -351,7 +368,7 @@ void TieringManager::MaybeOptimizeFrame(Tagged<JSFunction> function,
   if (function->IsOptimizationRequested(isolate_) || waiting_for_tierup) {
     if (V8_UNLIKELY(maglev_osr && current_code_kind == CodeKind::MAGLEV &&
                     (!v8_flags.osr_from_maglev ||
-                     isolate_->EfficiencyModeEnabledForTiering() ||
+                     isolate_->EfficiencyModeEnabled() ||
                      isolate_->BatterySaverModeEnabled()))) {
       return;
     }
@@ -374,7 +391,7 @@ void TieringManager::MaybeOptimizeFrame(Tagged<JSFunction> function,
   // We might be stuck in a baseline frame that wants to tier up to Maglev, but
   // is in a loop, and can't OSR, because Maglev doesn't have OSR. Allow it to
   // skip over Maglev by re-checking ShouldOptimize as if we were in Maglev.
-  if (V8_UNLIKELY(!isolate_->EfficiencyModeEnabledForTiering() && !maglev_osr &&
+  if (V8_UNLIKELY(!isolate_->EfficiencyModeEnabled() && !maglev_osr &&
                   d.should_optimize() && d.code_kind == CodeKind::MAGLEV)) {
     bool is_marked_for_maglev_optimization =
         existing_request == CodeKind::MAGLEV ||
@@ -384,7 +401,7 @@ void TieringManager::MaybeOptimizeFrame(Tagged<JSFunction> function,
     }
   }
 
-  if (V8_UNLIKELY(isolate_->EfficiencyModeEnabledForTiering() &&
+  if (V8_UNLIKELY(isolate_->EfficiencyModeEnabled() &&
                   d.code_kind != CodeKind::TURBOFAN_JS)) {
     d.concurrency_mode = ConcurrencyMode::kSynchronous;
   }
@@ -413,15 +430,16 @@ OptimizationDecision TieringManager::ShouldOptimize(
   if (V8_UNLIKELY(!v8_flags.turbofan ||
                   !shared->PassesFilter(v8_flags.turbo_filter) ||
                   (v8_flags.efficiency_mode_disable_turbofan &&
-                   isolate_->EfficiencyModeEnabledForTiering()) ||
+                   isolate_->EfficiencyModeEnabled()) ||
                   isolate_->BatterySaverModeEnabled())) {
     return OptimizationDecision::DoNotOptimize();
   }
 
-  if (isolate_->EfficiencyModeEnabledForTiering() &&
-      v8_flags.efficiency_mode_delay_turbofan &&
+  if (isolate_->EfficiencyModeEnabled() &&
+      v8_flags.efficiency_mode_delay_turbofan_multiply &&
       feedback_vector->invocation_count() <
-          v8_flags.efficiency_mode_delay_turbofan) {
+          v8_flags.invocation_count_for_turbofan *
+              v8_flags.efficiency_mode_delay_turbofan_multiply) {
     return OptimizationDecision::DoNotOptimize();
   }
 
@@ -449,7 +467,7 @@ bool ShouldResetInterruptBudgetByICChange(
   }
   // The enum value is coming from inside the sandbox and while the switch is
   // exhaustive, it's not guaranteed that value is one of the declared values.
-  SBXCHECK(false);
+  UNREACHABLE();
 }
 
 }  // namespace
@@ -458,13 +476,6 @@ void TieringManager::NotifyICChanged(Tagged<FeedbackVector> vector) {
   CodeKind code_kind = vector->shared_function_info()->HasBaselineCode()
                            ? CodeKind::BASELINE
                            : CodeKind::INTERPRETED_FUNCTION;
-
-#ifndef V8_ENABLE_LEAPTIERING
-  if (vector->has_optimized_code()) {
-    code_kind = vector->optimized_code(isolate_)->kind();
-  }
-#endif  // !V8_ENABLE_LEAPTIERING
-
   if (code_kind == CodeKind::INTERPRETED_FUNCTION &&
       CanCompileWithBaseline(isolate_, vector->shared_function_info()) &&
       vector->shared_function_info()->cached_tiering_decision() ==
@@ -541,8 +552,8 @@ void TieringManager::NotifyICChanged(Tagged<FeedbackVector> vector) {
 }
 
 TieringManager::OnInterruptTickScope::OnInterruptTickScope() {
-  TRACE_EVENT0(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
-               "V8.MarkCandidatesForOptimization");
+  TRACE_EVENT(TRACE_DISABLED_BY_DEFAULT("v8.compile"),
+              "V8.MarkCandidatesForOptimization");
 }
 
 void TieringManager::OnInterruptTick(DirectHandle<JSFunction> function,

@@ -234,31 +234,28 @@ class CachePage {
 // Representation of memory, with typed getters and setters for access.
 class SimMemory {
  public:
-  template <typename T>
-  static T AddressUntag(T address) {
-    // Cast the address using a C-style cast. A reinterpret_cast would be
-    // appropriate, but it can't cast one integral type to another.
-    uint64_t bits = (uint64_t)address;
-    return (T)(bits & ~kAddressTagMask);
+  template <typename A>
+  static A AddressUntag(A address) {
+    if (!v8_flags.sim_arm64_tbi) return address;
+    uint64_t bits = base::bit_cast<uint64_t>(address);
+    return base::bit_cast<A>(bits & ~kAddressTagMask);
   }
 
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   static T Read(A address) {
     T value;
     address = AddressUntag(address);
-    DCHECK((sizeof(value) == 1) || (sizeof(value) == 2) ||
-           (sizeof(value) == 4) || (sizeof(value) == 8) ||
-           (sizeof(value) == 16));
     memcpy(&value, reinterpret_cast<const char*>(address), sizeof(value));
     return value;
   }
 
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   static void Write(A address, T value) {
     address = AddressUntag(address);
-    DCHECK((sizeof(value) == 1) || (sizeof(value) == 2) ||
-           (sizeof(value) == 4) || (sizeof(value) == 8) ||
-           (sizeof(value) == 16));
     memcpy(reinterpret_cast<char*>(address), &value, sizeof(value));
   }
 };
@@ -784,6 +781,7 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
     pc_modified_ = true;
   }
   Instruction* pc() { return pc_; }
+  Instruction* last_instr() { return last_instr_; }
 
   void increment_pc() {
     if (!pc_modified_) {
@@ -910,12 +908,73 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
     }
   }
 
+  // MOPS
+  void VisitCpyP(Instruction* instr);
+  void VisitCpyM(Instruction* instr);
+  void VisitCpyE(Instruction* instr);
+  void VisitSetP(Instruction* instr);
+  void VisitSetM(Instruction* instr);
+  void VisitSetE(Instruction* instr);
+  template <Instruction::MemOp mem_op>
+  void MOPSPHelper(Instruction* instr) {
+    DCHECK(instr->IsConsistentMOPSTriplet<mem_op>());
+
+    int d = instr->Rd();
+    int n = instr->Rn();
+    int s = instr->Rs();
+
+    // Aliased registers and xzr are disallowed for Xd and Xn.
+    if ((d == n) || (d == s) || (n == s) || (d == 31) || (n == 31)) {
+      VisitUnallocated(instr);
+    }
+
+    // Additionally, Xs may not be xzr for cpy.
+    if (mem_op == Instruction::MemOp::kCPY && s == 31) {
+      VisitUnallocated(instr);
+    }
+
+    // Bits 31 and 30 must be zero.
+    if (instr->Bits(31, 30) != 0) {
+      VisitUnallocated(instr);
+    }
+
+    // Saturate copy count.
+    uint64_t xn = xreg(n);
+    constexpr int saturation_bits =
+        mem_op == Instruction::MemOp::kCPY ? 55 : 63;
+    if ((xn >> saturation_bits) != 0) {
+      xn = (UINT64_C(1) << saturation_bits) - 1;
+      set_xreg(n, xn);
+    }
+
+    nzcv().SetN(0);
+    nzcv().SetZ(0);
+    nzcv().SetC(1);  // Indicates "option B" implementation.
+    nzcv().SetV(0);
+  }
+
   void ExecuteInstruction() {
     DCHECK(IsAligned(reinterpret_cast<uintptr_t>(pc_), kInstrSize));
+#ifdef V8_USE_ADDRESS_SANITIZER
+    if (V8_ENABLE_SANDBOX_BOOL) {
+      uintptr_t current_pc = reinterpret_cast<uintptr_t>(pc_);
+      // Check if PC falls into non-canonical address range or kernel range.
+      if (current_pc >= 0x1'0000'0000'0000ULL) [[unlikely]] {
+        // Trigger SEGFAULT by accessing memory exactly at PC address.
+        // This is necessary because regular access to current instruction
+        // below would trigger SEGFAULT at corresponding ASan's shadow memory
+        // address which might produce false positive "sandbox violation"
+        // report if the shadow memory address falls into canonical address
+        // range.
+        NoSanitizeProbeMemory(current_pc);
+      }
+    }
+#endif  // V8_USE_ADDRESS_SANITIZER
     CheckBType();
     ResetBType();
     CheckBreakNext();
     Decode(pc_);
+    last_instr_ = pc_;
     increment_pc();
     LogAllWrittenRegisters();
     CheckBreakpoints();
@@ -1538,28 +1597,24 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   // signal which was then handled by the trap handler (also see
   // {trap_handler::ProbeMemory}). If the access raises a signal which is not
   // handled by the trap handler (e.g. because the current PC is not registered
-  // as a protected instruction), the signal will propagate and make the process
+  // as a trapping instruction), the signal will propagate and make the process
   // crash. If no trap handler is available, this always returns true.
   bool ProbeMemory(uintptr_t address, uintptr_t access_size);
 
   // Memory read helpers.
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   T MemoryRead(A address) {
-    T value;
-    static_assert((sizeof(value) == 1) || (sizeof(value) == 2) ||
-                  (sizeof(value) == 4) || (sizeof(value) == 8) ||
-                  (sizeof(value) == 16));
-    memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
-    return value;
+    return SimMemory::Read<T>(address);
   }
 
   // Memory write helpers.
   template <typename T, typename A>
+    requires(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+             sizeof(T) == 8 || sizeof(T) == 16)
   void MemoryWrite(A address, T value) {
-    static_assert((sizeof(value) == 1) || (sizeof(value) == 2) ||
-                  (sizeof(value) == 4) || (sizeof(value) == 8) ||
-                  (sizeof(value) == 16));
-    memcpy(reinterpret_cast<void*>(address), &value, sizeof(value));
+    SimMemory::Write<T>(address, value);
   }
 
   template <typename T>
@@ -1577,6 +1632,8 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
                                   int lane_size_in_bits) const;
   sim_uint128_t Lsl128(sim_uint128_t x, unsigned shift) const;
   sim_uint128_t Eor128(sim_uint128_t x, sim_uint128_t y) const;
+  void SimulateSignedMinMax(const Instruction* instr);
+  void SimulateUnsignedMinMax(const Instruction* instr);
 
   void ld1(VectorFormat vform, LogicVRegister dst, uint64_t addr);
   void ld1(VectorFormat vform, LogicVRegister dst, int index, uint64_t addr);
@@ -1768,6 +1825,8 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
                         const LogicVRegister& src);
   LogicVRegister uadalp(VectorFormat vform, LogicVRegister dst,
                         const LogicVRegister& src);
+  LogicVRegister ror(VectorFormat vform, LogicVRegister dst,
+                     const LogicVRegister& src, int rotation);
   LogicVRegister ext(VectorFormat vform, LogicVRegister dst,
                      const LogicVRegister& src1, const LogicVRegister& src2,
                      int index);
@@ -2209,6 +2268,10 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   LogicVRegister fmaxnmv(VectorFormat vform, LogicVRegister dst,
                          const LogicVRegister& src);
 
+  LogicVRegister bgrp(VectorFormat vform, LogicVRegister dst,
+                      const LogicVRegister& src1, const LogicVRegister& src2,
+                      bool do_bext = false);
+
   template <typename T>
   T FPRecipSqrtEstimate(T op);
   template <typename T>
@@ -2304,7 +2367,8 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
       0x7ffbad007f8bad00UL;
 
   void CorruptRegisters(CPURegList* list,
-                        uint64_t value = kDefaultCPURegisterCorruptionValue);
+                        uint64_t value = kDefaultCPURegisterCorruptionValue,
+                        int lane = 0);
   void CorruptAllCallerSavedCPURegisters();
 #endif
 
@@ -2378,6 +2442,7 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   // automatically incremented.
   bool pc_modified_;
   Instruction* pc_;
+  Instruction* last_instr_ = nullptr;
 
   // Branch type register, used for branch target identification.
   BType btype_;
@@ -2582,6 +2647,7 @@ class Simulator : public DecoderVisitor, public SimulatorBase {
   // Instruction counter only valid if v8_flags.stop_sim_at isn't 0.
   int icount_for_stop_sim_at_;
   Isolate* isolate_;
+  v8::internal::Builtins builtins_;
 };
 
 template <>

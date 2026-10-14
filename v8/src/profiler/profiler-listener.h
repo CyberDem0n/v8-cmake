@@ -48,7 +48,7 @@ class V8_EXPORT_PRIVATE ProfilerListener : public LogEventListener,
                        int column) override;
 #if V8_ENABLE_WEBASSEMBLY
   void CodeCreateEvent(CodeTag tag, const wasm::WasmCode* code,
-                       wasm::WasmName name, const char* source_url,
+                       wasm::WasmName name, std::string_view source_url,
                        int code_offset, int script_id) override;
 #endif  // V8_ENABLE_WEBASSEMBLY
 
@@ -58,8 +58,8 @@ class V8_EXPORT_PRIVATE ProfilerListener : public LogEventListener,
   void SetterCallbackEvent(DirectHandle<Name> name,
                            Address entry_point) override;
   void RegExpCodeCreateEvent(DirectHandle<AbstractCode> code,
-                             DirectHandle<String> source,
-                             RegExpFlags flags) override;
+                             DirectHandle<String> escaped_source,
+                             regexp::Flags flags) override;
   void CodeMoveEvent(Tagged<InstructionStream> from,
                      Tagged<InstructionStream> to) override;
   void BytecodeMoveEvent(Tagged<BytecodeArray> from,

@@ -35,9 +35,10 @@
 #include "src/heap/marking-worklist.h"
 #include "src/heap/memory-chunk-layout.h"
 #include "src/heap/minor-mark-sweep-inl.h"
-#include "src/heap/mutable-page-metadata.h"
+#include "src/heap/mutable-page.h"
 #include "src/heap/new-spaces.h"
 #include "src/heap/object-stats.h"
+#include "src/heap/pending-allocations.h"
 #include "src/heap/pretenuring-handler.h"
 #include "src/heap/read-only-heap.h"
 #include "src/heap/read-only-spaces.h"
@@ -49,6 +50,7 @@
 #include "src/heap/weak-object-worklists.h"
 #include "src/init/v8.h"
 #include "src/objects/cpp-heap-object-wrapper-inl.h"
+#include "src/objects/heap-object-set-map-inl.h"
 #include "src/objects/js-collection-inl.h"
 #include "src/objects/objects.h"
 #include "src/objects/string-forwarding-table-inl.h"
@@ -73,7 +75,7 @@ class YoungGenerationMarkingVerifier : public MarkingVerifierBase {
       : MarkingVerifierBase(heap),
         marking_state_(heap->non_atomic_marking_state()) {}
 
-  const MarkingBitmap* bitmap(const MutablePageMetadata* chunk) override {
+  const MarkingBitmap* bitmap(const MutablePage* chunk) override {
     return chunk->marking_bitmap();
   }
 
@@ -82,8 +84,8 @@ class YoungGenerationMarkingVerifier : public MarkingVerifierBase {
   }
 
   void Run() override {
-    // VerifyRoots will visit also visit the conservative stack and consider
-    // objects reachable from it, including old objects. This is fine since this
+    // VerifyRoots will also visit the conservative stack and consider objects
+    // reachable from it, including old objects. This is fine since this
     // verifier will only check that young objects are marked.
     VerifyRoots();
     if (v8_flags.sticky_mark_bits) {
@@ -122,7 +124,7 @@ class YoungGenerationMarkingVerifier : public MarkingVerifierBase {
   }
   void VisitEmbeddedPointer(Tagged<InstructionStream> host,
                             RelocInfo* rinfo) override {
-    VerifyHeapObjectImpl(rinfo->target_object(cage_base()));
+    VerifyHeapObjectImpl(rinfo->target_object());
   }
   void VerifyRootPointers(FullObjectSlot start, FullObjectSlot end) override {
     VerifyPointersImpl(start, end);
@@ -182,7 +184,7 @@ YoungGenerationRememberedSetsMarkingWorklist::CollectItems(Heap* heap) {
   int max_remembered_set_count = EstimateMaxNumberOfRemeberedSets(heap);
   items.reserve(max_remembered_set_count);
   OldGenerationMemoryChunkIterator::ForAll(
-      heap, [&items](MutablePageMetadata* chunk) {
+      heap, [&items](MutablePage* chunk) {
         SlotSet* slot_set = chunk->ExtractSlotSet<OLD_TO_NEW>();
         SlotSet* background_slot_set =
             chunk->ExtractSlotSet<OLD_TO_NEW_BACKGROUND>();
@@ -205,17 +207,20 @@ void YoungGenerationRememberedSetsMarkingWorklist::MarkingItem::
     MergeAndDeleteRememberedSets() {
   DCHECK(IsAcquired());
   if (slots_type_ == SlotsType::kRegularSlots) {
-    if (slot_set_)
+    if (slot_set_) {
       RememberedSet<OLD_TO_NEW>::MergeAndDelete(chunk_, std::move(*slot_set_));
-    if (background_slot_set_)
+    }
+    if (background_slot_set_) {
       RememberedSet<OLD_TO_NEW_BACKGROUND>::MergeAndDelete(
           chunk_, std::move(*background_slot_set_));
+    }
   } else {
     DCHECK_EQ(slots_type_, SlotsType::kTypedSlots);
     DCHECK_NULL(background_slot_set_);
-    if (typed_slot_set_)
+    if (typed_slot_set_) {
       RememberedSet<OLD_TO_NEW>::MergeAndDeleteTyped(
           chunk_, std::move(*typed_slot_set_));
+    }
   }
 }
 
@@ -228,8 +233,9 @@ void YoungGenerationRememberedSetsMarkingWorklist::MarkingItem::
   } else {
     DCHECK_EQ(slots_type_, SlotsType::kTypedSlots);
     DCHECK_NULL(background_slot_set_);
-    if (typed_slot_set_)
+    if (typed_slot_set_) {
       RememberedSet<OLD_TO_NEW>::DeleteTyped(std::move(*typed_slot_set_));
+    }
   }
 }
 
@@ -256,7 +262,7 @@ YoungGenerationRememberedSetsMarkingWorklist::
 
 YoungGenerationRememberedSetsMarkingWorklist::
     ~YoungGenerationRememberedSetsMarkingWorklist() {
-  for (MarkingItem item : remembered_sets_marking_items_) {
+  for (MarkingItem& item : remembered_sets_marking_items_) {
     if (v8_flags.sticky_mark_bits) {
       item.DeleteRememberedSets();
     } else {
@@ -295,7 +301,8 @@ void MinorMarkSweepCollector::PerformWrapperTracing() {
 
   TRACE_GC(heap_->tracer(), GCTracer::Scope::MINOR_MS_MARK_EMBEDDER_TRACING);
   local_marking_worklists()->PublishCppHeapObjects();
-  cpp_heap->AdvanceMarking(v8::base::TimeDelta::Max(), SIZE_MAX);
+  cpp_heap->AdvanceMarking(v8::base::TimeDelta::Max(), SIZE_MAX,
+                           StackState::kMayContainHeapPointers);
 }
 
 MinorMarkSweepCollector::~MinorMarkSweepCollector() = default;
@@ -332,7 +339,7 @@ void MinorMarkSweepCollector::FinishConcurrentMarking() {
 template <typename Space>
 static bool ExternalPointerRememberedSetsEmpty(Space* space) {
   for (auto it = space->begin(); it != space->end();) {
-    PageMetadata* p = *(it++);
+    NormalPage* p = *(it++);
     if (p->slot_set<SURVIVOR_TO_EXTERNAL_POINTER>()) {
       return false;
     }
@@ -344,7 +351,7 @@ static bool ExternalPointerRememberedSetsEmpty(Space* space) {
 void MinorMarkSweepCollector::StartMarking(bool force_use_background_threads) {
 #if defined(VERIFY_HEAP) && !V8_ENABLE_STICKY_MARK_BITS_BOOL
   if (v8_flags.verify_heap) {
-    for (PageMetadata* page : *heap_->new_space()) {
+    for (NormalPage* page : *heap_->new_space()) {
       CHECK(page->marking_bitmap()->IsClean());
     }
   }
@@ -421,8 +428,6 @@ void MinorMarkSweepCollector::CollectGarbage() {
   } else {
     DCHECK(sweeper()->IsSweepingDoneForSpace(NEW_SPACE));
   }
-
-  heap_->new_lo_space()->ResetPendingObject();
 
   is_in_atomic_pause_.store(true, std::memory_order_relaxed);
 
@@ -514,19 +519,6 @@ void MinorMarkSweepCollector::ClearNonLiveReferences() {
     forwarding_table_cleaner.ProcessYoungObjects();
   }
 
-  Heap::ExternalStringTable& external_string_table =
-      heap_->external_string_table_;
-  if (external_string_table.HasYoung()) {
-    TRACE_GC(heap_->tracer(), GCTracer::Scope::MINOR_MS_CLEAR_STRING_TABLE);
-    // Internalized strings are always stored in old space, so there is no
-    // need to clean them here.
-    ExternalStringTableCleanerVisitor<
-        ExternalStringTableCleaningMode::kYoungOnly>
-        external_visitor(heap_);
-    external_string_table.IterateYoung(&external_visitor);
-    external_string_table.CleanUpYoung();
-  }
-
   Isolate* isolate = heap_->isolate();
   if (isolate->global_handles()->HasYoung() ||
       isolate->traced_handles()->HasYoung()) {
@@ -586,10 +578,10 @@ void MinorMarkSweepCollector::ClearNonLiveReferences() {
       // There may be old generation entries left in the remembered set as
       // MinorMS only promotes pages after clearing non-live references.
       if (!HeapLayout::InYoungGeneration(key)) {
-        iti = indices.erase(iti);
+        indices.erase(iti++);
       } else if (non_atomic_marking_state_->IsUnmarked(key)) {
         table->RemoveEntry(InternalIndex(*iti));
-        iti = indices.erase(iti);
+        indices.erase(iti++);
       } else {
         ++iti;
       }
@@ -675,9 +667,8 @@ class MinorMSConservativeStackVisitor
   static constexpr bool kOnlyVisitMainV8Cage [[maybe_unused]] = true;
 
   static bool FilterPage(const MemoryChunk* chunk) {
-    return v8_flags.sticky_mark_bits
-               ? !chunk->IsFlagSet(MemoryChunk::CONTAINS_ONLY_OLD)
-               : chunk->IsToPage();
+    return v8_flags.sticky_mark_bits ? !chunk->ContainsOnlyOldObjects()
+                                     : chunk->IsToPage();
   }
   static bool FilterLargeObject(Tagged<HeapObject>, MapWord) { return true; }
   static bool FilterNormalObject(Tagged<HeapObject>, MapWord, MarkingBitmap*) {
@@ -691,13 +682,18 @@ class MinorMSConservativeStackVisitor
 
 void MinorMarkSweepCollector::MarkRootsFromConservativeStack(
     YoungGenerationRootMarkingVisitor& root_visitor) {
-  if (!heap_->IsGCWithStack()) return;
+  const Heap::StackScanMode stack_scan_mode =
+      heap_->ConservativeStackScanningModeForMinorGC();
+  if (stack_scan_mode == Heap::StackScanMode::kNone ||
+      !heap_->IsGCWithStack()) {
+    return;
+  }
+
   TRACE_GC(heap_->tracer(), GCTracer::Scope::CONSERVATIVE_STACK_SCANNING);
 
   MinorMSConservativeStackVisitor stack_visitor(heap_->isolate(), root_visitor);
 
-  heap_->IterateConservativeStackRoots(&stack_visitor,
-                                       Heap::StackScanMode::kFull);
+  heap_->IterateConservativeStackRoots(&stack_visitor, stack_scan_mode);
 }
 
 void MinorMarkSweepCollector::MarkLiveObjects() {
@@ -709,9 +705,10 @@ void MinorMarkSweepCollector::MarkLiveObjects() {
     StartMarking(false);
   } else {
     auto* incremental_marking = heap_->incremental_marking();
-    TRACE_GC_WITH_FLOW(
-        heap_->tracer(), GCTracer::Scope::MINOR_MS_MARK_FINISH_INCREMENTAL,
-        incremental_marking->current_trace_id(), TRACE_EVENT_FLAG_FLOW_IN);
+    TRACE_GC_WITH_FLOW(heap_->tracer(),
+                       GCTracer::Scope::MINOR_MS_MARK_FINISH_INCREMENTAL,
+                       perfetto::TerminatingFlow::ProcessScoped(
+                           incremental_marking->current_trace_id()));
     DCHECK(incremental_marking->IsMinorMarking());
     DCHECK(v8_flags.concurrent_minor_ms_marking);
     incremental_marking->Stop();
@@ -791,7 +788,7 @@ void MinorMarkSweepCollector::DrainMarkingWorklist() {
 
     Tagged<HeapObject> heap_object;
     while (marking_worklists_local->Pop(&heap_object)) {
-      DCHECK(!IsFreeSpaceOrFiller(heap_object, cage_base));
+      DCHECK(!IsFreeSpaceOrFiller(heap_object));
       DCHECK(IsHeapObject(heap_object));
       DCHECK(heap_->Contains(heap_object));
       DCHECK(!marking_state_->IsUnmarked(heap_object));
@@ -801,7 +798,7 @@ void MinorMarkSweepCollector::DrainMarkingWorklist() {
       const auto visited_size = main_marking_visitor_->Visit(map, heap_object);
       if (visited_size) {
         main_marking_visitor_->IncrementLiveBytesCached(
-            MutablePageMetadata::FromHeapObject(heap_object),
+            MutablePage::FromHeapObject(heap_->isolate(), heap_object),
             ALIGN_TO_ALLOCATION_ALIGNMENT(visited_size));
       }
     }
@@ -819,7 +816,7 @@ void MinorMarkSweepCollector::TraceFragmentation() {
   size_t free_bytes_of_class[free_size_class_limits.size()] = {0};
   size_t live_bytes = 0;
   size_t allocatable_bytes = 0;
-  for (PageMetadata* p : *new_space) {
+  for (NormalPage* p : *new_space) {
     Address free_start = p->area_start();
     for (auto [object, size] : LiveObjectRange(p)) {
       Address free_end = object.address();
@@ -833,8 +830,8 @@ void MinorMarkSweepCollector::TraceFragmentation() {
           free_bytes_index++;
         }
       }
-      live_bytes += size;
-      free_start = free_end + size;
+      live_bytes += size.value();
+      free_start = free_end + size.value();
     }
     const Address top = heap_->NewSpaceTop();
     size_t area_end = p->Contains(top) ? top : p->area_end();
@@ -870,12 +867,11 @@ intptr_t NewSpacePageEvacuationThreshold() {
          MemoryChunkLayout::AllocatableMemoryInDataPage() / 100;
 }
 
-bool ShouldMovePage(PageMetadata* p, intptr_t live_bytes,
-                    intptr_t wasted_bytes) {
+bool ShouldMovePage(NormalPage* p, intptr_t live_bytes, intptr_t wasted_bytes) {
   DCHECK(v8_flags.page_promotion);
   DCHECK(!v8_flags.sticky_mark_bits);
   Heap* heap = p->heap();
-  DCHECK(!p->Chunk()->NeverEvacuate());
+  DCHECK(!p->never_evacuate());
   const bool should_move_page =
       ((live_bytes + wasted_bytes) > NewSpacePageEvacuationThreshold() ||
        (p->AllocatedLabSize() == 0)) &&
@@ -895,15 +891,15 @@ bool ShouldMovePage(PageMetadata* p, intptr_t live_bytes,
     // Don't allocate on old pages so that recently allocated objects on the
     // page get a chance to die young. The page will be force promoted on the
     // next GC because `AllocatedLabSize` will be 0.
-    p->Chunk()->SetFlagNonExecutable(MemoryChunk::NEVER_ALLOCATE_ON_PAGE);
+    p->set_never_allocate_on_chunk(true);
   }
   return should_move_page;
 }
 
 }  // namespace
 
-void MinorMarkSweepCollector::EvacuateExternalPointerReferences(
-    MutablePageMetadata* p) {
+void MinorMarkSweepCollector::EvacuateExternalPointerReferencesDuringSweeping(
+    MutablePage* p) {
 #ifdef V8_COMPRESS_POINTERS
   using BasicSlotSet = ::heap::base::BasicSlotSet<kTaggedSize>;
   BasicSlotSet* slots = p->slot_set<SURVIVOR_TO_EXTERNAL_POINTER>();
@@ -915,7 +911,8 @@ void MinorMarkSweepCollector::EvacuateExternalPointerReferences(
     ExternalPointerHandle handle =
         *reinterpret_cast<ExternalPointerHandle*>(handle_location);
     table.Evacuate(young, old, handle, handle_location,
-                   ExternalPointerTable::EvacuateMarkMode::kClearMark);
+                   ExternalPointerTable::EvacuateMarkMode::kClearMark,
+                   kAnyExternalPointerTagRange);
     return KEEP_SLOT;
   };
   auto slot_count = slots->Iterate<BasicSlotSet::AccessMode::NON_ATOMIC>(
@@ -933,13 +930,12 @@ bool MinorMarkSweepCollector::StartSweepNewSpace() {
   PagedSpaceForNewSpace* paged_space = heap_->paged_new_space()->paged_space();
   paged_space->ClearAllocatorState();
 
-  int will_be_swept = 0;
   bool has_promoted_pages = false;
 
   heap_->StartResizeNewSpace();
 
   for (auto it = paged_space->begin(); it != paged_space->end();) {
-    PageMetadata* p = *(it++);
+    NormalPage* p = *(it++);
     DCHECK(p->SweepingDone());
 
     intptr_t live_bytes_on_page = p->live_bytes();
@@ -954,9 +950,10 @@ bool MinorMarkSweepCollector::StartSweepNewSpace() {
     }
 
     if (ShouldMovePage(p, live_bytes_on_page, p->wasted_memory())) {
-      EvacuateExternalPointerReferences(p);
+      EvacuateExternalPointerReferencesDuringSweeping(p);
       // free list categories will be relinked by the sweeper after sweeping is
       // done.
+      p->set_will_be_promoted(true);
       heap_->new_space()->PromotePageToOldSpace(p,
                                                 FreeMode::kDoNotLinkCategory);
       has_promoted_pages = true;
@@ -964,7 +961,6 @@ bool MinorMarkSweepCollector::StartSweepNewSpace() {
     } else {
       // Page is not promoted. Sweep it instead.
       sweeper()->AddNewSpacePage(p);
-      will_be_swept++;
     }
   }
 
@@ -975,12 +971,6 @@ bool MinorMarkSweepCollector::StartSweepNewSpace() {
       heap_->young_external_pointer_space(), heap_->isolate()->counters());
 #endif
 
-  if (v8_flags.gc_verbose) {
-    PrintIsolate(heap_->isolate(),
-                 "sweeping: space=%s initialized_for_sweeping=%d",
-                 ToString(paged_space->identity()), will_be_swept);
-  }
-
   return has_promoted_pages;
 }
 
@@ -989,10 +979,8 @@ void MinorMarkSweepCollector::StartSweepNewSpaceWithStickyBits() {
   PagedSpaceBase* paged_space = heap_->sticky_space();
   paged_space->ClearAllocatorState();
 
-  int will_be_swept = 0;
-
   for (auto it = paged_space->begin(); it != paged_space->end();) {
-    PageMetadata* p = *(it++);
+    NormalPage* p = *(it++);
     DCHECK(p->SweepingDone());
 
     intptr_t live_bytes_on_page = p->live_bytes();
@@ -1005,7 +993,6 @@ void MinorMarkSweepCollector::StartSweepNewSpaceWithStickyBits() {
 
     // TODO(333906585): Fix the promotion counter.
     sweeper()->AddPage(OLD_SPACE, p);
-    will_be_swept++;
   }
 
   static_cast<StickySpace*>(paged_space)
@@ -1017,27 +1004,19 @@ void MinorMarkSweepCollector::StartSweepNewSpaceWithStickyBits() {
   heap_->isolate()->external_pointer_table().SweepAndCompact(
       heap_->young_external_pointer_space(), heap_->isolate()->counters());
 #endif
-
-  if (v8_flags.gc_verbose) {
-    PrintIsolate(heap_->isolate(),
-                 "sweeping: space=%s initialized_for_sweeping=%d",
-                 ToString(paged_space->identity()), will_be_swept);
-  }
 }
 
 bool MinorMarkSweepCollector::SweepNewLargeSpace() {
   TRACE_GC(heap_->tracer(), GCTracer::Scope::MINOR_MS_SWEEP_NEW_LO);
   NewLargeObjectSpace* new_lo_space = heap_->new_lo_space();
   DCHECK_NOT_NULL(new_lo_space);
-  DCHECK_EQ(kNullAddress, heap_->new_lo_space()->pending_object());
 
   bool has_promoted_pages = false;
 
   OldLargeObjectSpace* old_lo_space = heap_->lo_space();
 
   for (auto it = new_lo_space->begin(); it != new_lo_space->end();) {
-    LargePageMetadata* current = *it;
-    MemoryChunk* chunk = current->Chunk();
+    LargePage* current = *it;
     it++;
 
     Tagged<HeapObject> object = current->GetObject();
@@ -1048,10 +1027,10 @@ bool MinorMarkSweepCollector::SweepNewLargeSpace() {
                                       current);
       continue;
     }
-    chunk->ClearFlagNonExecutable(MemoryChunk::TO_PAGE);
-    chunk->SetFlagNonExecutable(MemoryChunk::FROM_PAGE);
+    current->ClearFlagNonExecutable(MemoryChunk::TO_PAGE);
+    current->SetFlagNonExecutable(MemoryChunk::FROM_PAGE);
     current->marking_progress_tracker().ResetIfEnabled();
-    EvacuateExternalPointerReferences(current);
+    EvacuateExternalPointerReferencesDuringSweeping(current);
     old_lo_space->PromoteNewLargeObject(current);
     has_promoted_pages = true;
     sweeper()->AddPromotedPage(current);
@@ -1067,29 +1046,16 @@ void MinorMarkSweepCollector::Sweep() {
 
   TRACE_GC_WITH_FLOW(
       heap_->tracer(), GCTracer::Scope::MINOR_MS_SWEEP,
-      sweeper_->GetTraceIdForFlowEvent(GCTracer::Scope::MINOR_MS_SWEEP),
-      TRACE_EVENT_FLAG_FLOW_OUT);
+      perfetto::Flow::ProcessScoped(
+          sweeper_->GetTraceIdForFlowEvent(GCTracer::Scope::MINOR_MS_SWEEP)));
 
-  bool has_promoted_pages = false;
   if (v8_flags.sticky_mark_bits) {
     StartSweepNewSpaceWithStickyBits();
   } else {
-    has_promoted_pages = StartSweepNewSpace();
+    StartSweepNewSpace();
   }
-  if (SweepNewLargeSpace()) has_promoted_pages = true;
 
-  if (v8_flags.verify_heap && has_promoted_pages) {
-    // Update the external string table in preparation for heap verification.
-    // Otherwise, updating the table will happen during the next full GC.
-    TRACE_GC(heap_->tracer(),
-             GCTracer::Scope::MINOR_MS_SWEEP_UPDATE_STRING_TABLE);
-    heap_->UpdateYoungReferencesInExternalStringTable([](Heap* heap,
-                                                         FullObjectSlot p) {
-      DCHECK(
-          !Cast<HeapObject>(*p)->map_word(kRelaxedLoad).IsForwardingAddress());
-      return Cast<String>(*p);
-    });
-  }
+  SweepNewLargeSpace();
 
   sweeper_->StartMinorSweeping();
 
@@ -1115,8 +1081,9 @@ void MinorMarkSweepCollector::Sweep() {
 void MinorMarkSweepCollector::RequestGC() {
   if (is_in_atomic_pause()) return;
   DCHECK(v8_flags.concurrent_minor_ms_marking);
-  if (gc_finalization_requested_.exchange(true, std::memory_order_relaxed))
+  if (gc_finalization_requested_.exchange(true, std::memory_order_relaxed)) {
     return;
+  }
   heap_->isolate()->stack_guard()->RequestGC();
 }
 }  // namespace internal

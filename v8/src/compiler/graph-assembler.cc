@@ -6,6 +6,7 @@
 
 #include <optional>
 
+#include "src/base/bits.h"
 #include "src/base/container-utils.h"
 #include "src/codegen/callable.h"
 #include "src/codegen/machine-type.h"
@@ -154,16 +155,6 @@ Node* GraphAssembler::SetStackPointer(Node* node) {
       graph()->NewNode(machine()->SetStackPointer(), node, effect()));
 }
 #endif
-
-TNode<HeapNumber> JSGraphAssembler::AllocateHeapNumber(Node* value) {
-  AllocationBuilder a(jsgraph(), broker(), effect(), control());
-  a.Allocate(sizeof(HeapNumber), AllocationType::kYoung, Type::OtherInternal());
-  a.Store(AccessBuilder::ForMap(), broker()->heap_number_map());
-  a.Store(AccessBuilder::ForHeapNumberValue(), value);
-  Node* new_heap_number = a.Finish();
-  UpdateEffectControlWith(new_heap_number);
-  return TNode<HeapNumber>::UncheckedCast(new_heap_number);
-}
 
 Node* GraphAssembler::LoadHeapNumberValue(Node* heap_number) {
   return Load(MachineType::Float64(), heap_number,
@@ -370,8 +361,9 @@ Node* GraphAssembler::PackMapWord(TNode<Map> map) {
 #endif
 
 TNode<Map> GraphAssembler::LoadMap(Node* object) {
-  Node* map_word = Load(MachineType::TaggedPointer(), object,
-                        HeapObject::kMapOffset - kHeapObjectTag);
+  Node* map_word =
+      Load(MachineType::TaggedPointer(), object,
+           static_cast<int>(offsetof(HeapObject, map_)) - kHeapObjectTag);
 #ifdef V8_MAP_PACKING
   return UnpackMapWord(map_word);
 #else
@@ -636,8 +628,19 @@ class ArrayBufferViewAccessBuilder {
     // Case 1: Normal (backed by AB/SAB) or non-length tracking backed by GSAB
     // (can't go oob once constructed)
     auto GsabFixedOrNormal = [&]() {
-      return MachineLoadField<UintPtrT>(AccessBuilder::ForJSTypedArrayLength(),
-                                        view, UseInfo::Word());
+      TNode<UintPtrT> byte_length = MachineLoadField<UintPtrT>(
+          AccessBuilder::ForJSArrayBufferViewByteLength(), view,
+          UseInfo::Word());
+      if (auto size_opt = TryComputeStaticElementSize()) {
+        return a.UintPtrDiv(byte_length, a.UintPtrConstant(*size_opt));
+      } else {
+        TNode<Map> typed_array_map = a.LoadField<Map>(
+            AccessBuilder::ForMap(WriteBarrierKind::kNoWriteBarrier), view);
+        TNode<Uint32T> elements_kind = a.LoadElementsKind(typed_array_map);
+        TNode<Uint32T> element_size =
+            a.LookupByteSizeForElementsKind(elements_kind);
+        return a.UintPtrDiv(byte_length, a.ChangeUint32ToUintPtr(element_size));
+      }
     };
 
     // If we statically know we cannot have rab/gsab backed, we can simply
@@ -1020,6 +1023,15 @@ TNode<Uint32T> JSGraphAssembler::LookupByteShiftForElementsKind(
     TNode<Uint32T> elements_kind) {
   TNode<UintPtrT> index = ChangeUint32ToUintPtr(Int32Sub(
       elements_kind, Uint32Constant(FIRST_FIXED_TYPED_ARRAY_ELEMENTS_KIND)));
+#ifdef V8_ENABLE_SANDBOX
+  // Make sure we don't read out of bounds in case the elements_kind value is
+  // not trusted.
+  constexpr size_t table_size =
+      TypedArrayAndRabGsabTypedArrayElementsKindTableSize();
+  static_assert(base::bits::IsPowerOfTwo(table_size));
+  index = TNode<UintPtrT>::UncheckedCast(
+      WordAnd(index, UintPtrConstant(table_size - 1)));
+#endif  // V8_ENABLE_SANDBOX
   TNode<RawPtrT> shift_table = TNode<RawPtrT>::UncheckedCast(ExternalConstant(
       ExternalReference::
           typed_array_and_rab_gsab_typed_array_elements_kind_shifts()));
@@ -1031,6 +1043,15 @@ TNode<Uint32T> JSGraphAssembler::LookupByteSizeForElementsKind(
     TNode<Uint32T> elements_kind) {
   TNode<UintPtrT> index = ChangeUint32ToUintPtr(Int32Sub(
       elements_kind, Uint32Constant(FIRST_FIXED_TYPED_ARRAY_ELEMENTS_KIND)));
+#ifdef V8_ENABLE_SANDBOX
+  // Make sure we don't read out of bounds in case the elements_kind value is
+  // not trusted.
+  constexpr size_t table_size =
+      TypedArrayAndRabGsabTypedArrayElementsKindTableSize();
+  static_assert(base::bits::IsPowerOfTwo(table_size));
+  index = TNode<UintPtrT>::UncheckedCast(
+      WordAnd(index, UintPtrConstant(table_size - 1)));
+#endif  // V8_ENABLE_SANDBOX
   TNode<RawPtrT> size_table = TNode<RawPtrT>::UncheckedCast(ExternalConstant(
       ExternalReference::
           typed_array_and_rab_gsab_typed_array_elements_kind_sizes()));
@@ -1064,12 +1085,6 @@ TNode<Object> JSGraphAssembler::JSCallRuntime2(Runtime::FunctionId function_id,
         graph()->NewNode(javascript()->CallRuntime(function_id, 2), arg0, arg1,
                          context, frame_state, effect(), control()));
   });
-}
-
-Node* JSGraphAssembler::Chained(const Operator* op, Node* input) {
-  DCHECK_EQ(op->ValueInputCount(), 1);
-  return AddNode(
-      graph()->NewNode(common()->Chained(op), input, effect(), control()));
 }
 
 Node* GraphAssembler::TypeGuard(Type type, Node* value) {
@@ -1161,16 +1176,16 @@ Node* GraphAssembler::LoadUnaligned(MachineType type, Node* object,
   return AddNode(graph()->NewNode(op, object, offset, effect(), control()));
 }
 
-Node* GraphAssembler::ProtectedStore(MachineRepresentation rep, Node* object,
-                                     Node* offset, Node* value) {
-  return AddNode(graph()->NewNode(machine()->ProtectedStore(rep), object,
-                                  offset, value, effect(), control()));
+Node* GraphAssembler::TrappingStore(MachineRepresentation rep, Node* object,
+                                    Node* offset, Node* value) {
+  return AddNode(graph()->NewNode(machine()->TrappingStore(rep), object, offset,
+                                  value, effect(), control()));
 }
 
-Node* GraphAssembler::ProtectedLoad(MachineType type, Node* object,
-                                    Node* offset) {
-  return AddNode(graph()->NewNode(machine()->ProtectedLoad(type), object,
-                                  offset, effect(), control()));
+Node* GraphAssembler::TrappingLoad(MachineType type, Node* object,
+                                   Node* offset) {
+  return AddNode(graph()->NewNode(machine()->TrappingLoad(type), object, offset,
+                                  effect(), control()));
 }
 
 Node* GraphAssembler::LoadTrapOnNull(MachineType type, Node* object,
@@ -1287,7 +1302,10 @@ void GraphAssembler::BranchWithCriticalSafetyCheck(
 }
 
 void GraphAssembler::RuntimeAbort(AbortReason reason) {
-  AddNode(graph()->NewNode(simplified()->RuntimeAbort(reason)));
+  // We used to insert a RuntimeAbort operation here, but that code was broken.
+  // As it's currently not much used (and about to be replaced by turboshaft),
+  // we now just insert a DebugBreak here.
+  DebugBreak();
 }
 
 void GraphAssembler::ConnectUnreachableToEnd() {
